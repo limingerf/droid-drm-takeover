@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # 目标架构只有 aarch64（touchdraw 等含 ARM64 汇编，x86 原生全量构建没有意义）
+  aarch64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup multiarch apt sources
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list
+          printf 'deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble main universe\ndeb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-updates main universe\ndeb [arch=amd64] http://security.ubuntu.com/ubuntu noble-security main universe\n' \
+            | sudo tee /etc/apt/sources.list.d/amd64.list
+          printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main universe\ndeb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main universe\n' \
+            | sudo tee /etc/apt/sources.list.d/arm64.list
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config gcc-aarch64-linux-gnu \
+            libdrm-dev:arm64 libwayland-dev:arm64 libudev-dev:arm64
+      - name: Cross build
+        run: |
+          # Makefile 在解析期用 $(shell pkg-config ...)，必须走环境变量而不是 make 命令行变量
+          export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          make -j"$(nproc)" CC=aarch64-linux-gnu-gcc
+          file bin/kwinwrap bin/touchdraw bin/touchtest bin/atomicspy.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tools-aarch64
+          path: bin/

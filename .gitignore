@@ -1,0 +1,18 @@
+# 构建产物与运行态
+bin/
+build/
+takeover.ok
+*.o
+*.so
+
+# 日志与本地数据
+logs/
+*.log
+
+# 凭据绝不入库（真实配置放 /root/desk-wifi.conf）
+desk-wifi.conf
+*.wifi.conf
+
+# 编辑器/工具本地目录
+.qoder/
+.vscode/

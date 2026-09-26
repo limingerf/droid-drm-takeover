@@ -1,0 +1,13 @@
+# desk-wifi.conf.example — 复制到 /root/desk-wifi.conf 并填入真实凭据。
+# 警告：真实文件永远不要放进仓库/日志/聊天记录。
+ctrl_interface=/run/wpa-takeover
+update_config=0
+ap_scan=1
+pmf=1
+sae_pwe=2
+network={
+  ssid="YOUR-SSID"
+  psk="YOUR-PASSWORD"
+  key_mgmt=WPA-PSK
+  proto=RSN
+}
