@@ -103,15 +103,26 @@
 ## 快速开始
 
 ```sh
-# 1) 编译 aarch64 工具（需要交叉工具链，或直接在容器里原生编）
+# 1) 编译 aarch64 工具 —— ★ 必须先做，APK 要把 bin/ 打进 payload
+#    （需要交叉工具链；也可以直接在目标容器里原生 make）
+export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
 make -j"$(nproc)" CC=aarch64-linux-gnu-gcc
+ls bin/          # 应有 24 个 aarch64 产物，其中 bin/kwinwrap 是必需的
 
-# 2) 打 APK
+# 2) 打 APK（会把 bin/ 一起打进 assets/payload/）
 sh android/build.sh
 
 # 3) 装到设备，用「DRM 切换器」进入 Linux
 adb install -r android/build/drmswitch.apk
 ```
+
+> ⚠️ **顺序不能反。** `android/build.sh` 在 `bin/` 不存在时只**警告**、不失败，
+> 于是你会得到一个"脚本齐全、但一个二进制都没有"的 APK —— 装上去点「进入 Linux」
+> 会在拉起会话那一步失败。构建后确认一下：
+>
+> ```sh
+> unzip -l android/build/drmswitch.apk | grep -c 'assets/payload/bin/'   # 应为 24
+> ```
 
 Linux 侧应用（在容器里装）：
 

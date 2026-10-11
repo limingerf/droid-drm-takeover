@@ -200,6 +200,29 @@ copy_tree "$WORK_ROOT/tools"   "$ASSETS/payload/tools"   "tools/"
 copy_tree "$WORK_ROOT/configs" "$ASSETS/payload/configs" "configs/"
 copy_tree "$WORK_ROOT/bin"     "$ASSETS/payload/bin"     "bin/"
 
+# ★ bin/ 是**硬要求**，不能像上面那样"缺了就跳过"。
+#   缺了照样能打出 APK，但里面只有脚本、一个二进制都没有 —— 装到设备上
+#   点「进入 Linux」会在拉起会话那一步失败，现场信息还很间接。
+#   所以这里直接失败，并把补救命令写在错误信息里。
+if [ ! -f "$ASSETS/payload/bin/kwinwrap" ]; then
+    die "APK 里没有 bin/kwinwrap —— 编译产物缺失。
+
+  bin/ 是 payload 的必需部分（kwinwrap 是全项目的 DRM 交接桥）。
+  先编译再打包：
+
+      export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+      make -j\"\$(nproc)\" CC=aarch64-linux-gnu-gcc
+      ls bin/kwinwrap
+
+  或者直接在目标容器里原生 make（容器是 aarch64，不需要交叉编译）。
+  期望 bin/ 里有 24 个产物。"
+fi
+_nbin=$(find "$ASSETS/payload/bin" -type f | wc -l | tr -d ' ')
+log "  payload/bin: $_nbin 个产物"
+if [ "$_nbin" -lt 24 ]; then
+    warn "  ! payload/bin 只有 $_nbin 个（期望 24）—— 可能编到一半失败了"
+fi
+
 # android/ 只带 .sh 包装脚本，不带 app/ 和 build.sh
 mkdir -p "$ASSETS/payload/android"
 for f in "$ANDROID_DIR"/*.sh; do

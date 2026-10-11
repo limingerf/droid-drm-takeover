@@ -124,11 +124,31 @@ jobs:
   # 3) APK
   #    ubuntu runner 自带 Android SDK。构建脚本不用 Gradle（手工走
   #    aapt2 → javac → d8 → zipalign → apksigner），所以只需要 SDK 工具。
+  #
+  #    ★ needs: aarch64 —— APK 要把编译好的 aarch64 工具打进
+  #      assets/payload/bin/。第一次跑这个 workflow 时漏了这层依赖，
+  #      结果 APK 里只有脚本、一个二进制都没有，上设备根本跑不起来。
   # ════════════════════════════════════════════════════════════════════
   apk:
     runs-on: ubuntu-24.04
+    needs: aarch64
     steps:
       - uses: actions/checkout@v4
+
+      - name: 取回 aarch64 工具
+        uses: actions/download-artifact@v4
+        with:
+          name: tools-aarch64
+          path: bin/
+
+      - name: 确认 bin/ 就位
+        run: |
+          set -eu
+          n=$(ls -1 bin/ | wc -l)
+          echo "bin/ 里有 $n 个文件"
+          ls -1 bin/
+          [ "$n" -ge 24 ] || { echo "::error::bin/ 不完整（$n < 24）"; exit 1; }
+          [ -f bin/kwinwrap ] || { echo "::error::缺少 bin/kwinwrap"; exit 1; }
 
       - name: 定位 Android SDK
         run: |
@@ -166,13 +186,20 @@ jobs:
           echo "── 签名 ──"
           "$BT/apksigner" verify --print-certs "$APK"
 
-          echo "── 内容 ──"
-          unzip -l "$APK" | head -30
-          # payload 必须真的打进去了
-          unzip -l "$APK" | grep -q 'assets/payload/core/switch.sh' \
-            || { echo "::error::APK 里没有 assets/payload/core/switch.sh"; exit 1; }
-          unzip -l "$APK" | grep -q 'assets/payload/bin/kwinwrap' \
-            || { echo "::error::APK 里没有 assets/payload/bin/kwinwrap"; exit 1; }
+          echo "── payload ──"
+          unzip -l "$APK" | grep 'assets/payload/' | wc -l
+
+          # payload 必须真的打进去了，而且要包含编译产物
+          for f in core/switch.sh linux/drm-switch.sh linux/session-up.sh \
+                   display/desk-takeover.sh android/enter.sh \
+                   bin/kwinwrap bin/setbright bin/setprop bin/atomicspy.so; do
+            unzip -l "$APK" | grep -q "assets/payload/$f" \
+              || { echo "::error::APK 里没有 assets/payload/$f"; exit 1; }
+          done
+
+          nb=$(unzip -l "$APK" | grep -c 'assets/payload/bin/' || true)
+          echo "payload/bin/ 条目数：$nb"
+          [ "$nb" -ge 24 ] || { echo "::error::payload/bin/ 不完整（$nb < 24）"; exit 1; }
 
           # 对齐
           "$BT/zipalign" -c -v 4 "$APK" >/dev/null && echo "zipalign 4 字节对齐 OK"

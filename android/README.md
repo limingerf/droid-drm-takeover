@@ -153,6 +153,19 @@ adb install -r work/android/build/drmswitch.apk
 `bin/`（存在才带）以及 `android/` 下的三个 `.sh` 包装脚本。
 **`app/` 和 `build.sh` 不会进 APK**。源目录缺失时构建只警告、不失败。
 
+> ⚠️ **`bin/` 缺失是个陷阱。** 它不存在时构建照样"成功"，但你会得到一个
+> 脚本齐全、**一个二进制都没有**的 APK —— 装上去点「进入 Linux」会在拉起会话
+> 那一步失败，而且现场信息很间接。
+>
+> 构建前先跑 `make -j"$(nproc)" CC=aarch64-linux-gnu-gcc`，构建后确认：
+>
+> ```sh
+> unzip -l android/build/drmswitch.apk | grep -c 'assets/payload/bin/'   # 应为 24
+> ```
+>
+> CI 里这条依赖是显式的（`apk` job `needs: aarch64` 并下载 artifact），
+> 本地手工构建没有东西替你保证顺序。
+
 ---
 
 ## 6. 前台服务说明
