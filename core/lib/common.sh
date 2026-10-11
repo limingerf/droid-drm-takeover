@@ -194,6 +194,90 @@ drm_timeout() {
     return 124
 }
 
+# ─────────────────────── 进程查找（纯 /proc）───────────────────────
+#
+# ★ 为什么不用 pgrep / pkill / fuser：
+#
+#   · `fuser` 在安卓的 toybox 里**根本不存在**（实测报
+#     "inaccessible or not found"）。原来 drm_kill_linux_stack 用它做
+#     最后兜底，等于那条兜底路径在设备上是死的。
+#
+#   · `pgrep -f` / `pkill -f` 是按**整条命令行做正则匹配**。这有两个坑：
+#       (a) 会匹配到"命令行里恰好提到这个字符串"的无关进程 ——
+#           包括调用方自己的 shell（项目在 netd 那边踩过这个坑，
+#           当时把 $WIFI_CONF 当 pkill -f 的模式，结果连调用方一起杀）；
+#       (b) 模式里的 `|` 是正则的"或"，不是字面量，容易写出意外的匹配。
+#
+#   · /proc 扫描没有这些歧义，dash 和 mksh 上都能跑，也不依赖任何外部命令。
+#
+# 用法：
+#   drm_pids_by_comm kwin_wayland      → 精确匹配进程名（/proc/PID/comm）
+#   drm_pids_by_cmdline "keepbright"   → 命令行**子串**匹配（非正则，安全）
+
+# 按进程名精确查找（comm 最长 15 字符，这是内核限制）
+drm_pids_by_comm() {
+    _want=$1
+    for _d in /proc/[0-9]*; do
+        _p=${_d#/proc/}
+        [ "$_p" = "$$" ] && continue
+        [ -r "$_d/comm" ] || continue
+        # 不用 $(cat)：某些环境下 cat 也会成为噪声；read 是内建
+        read -r _c <"$_d/comm" 2>/dev/null || continue
+        [ "$_c" = "$_want" ] && printf '%s\n' "$_p"
+    done
+}
+
+# 按命令行子串查找。用 case 做字面量子串匹配，**不是**正则，
+# 所以模式里的 . | * 等字符都不会有特殊含义。
+drm_pids_by_cmdline() {
+    _want=$1
+    [ -n "$_want" ] || return 0
+    for _d in /proc/[0-9]*; do
+        _p=${_d#/proc/}
+        [ "$_p" = "$$" ] && continue
+        [ -r "$_d/cmdline" ] || continue
+        # cmdline 是 NUL 分隔的，转成空格再找子串
+        _cl=$(tr '\0' ' ' <"$_d/cmdline" 2>/dev/null) || continue
+        [ -n "$_cl" ] || continue          # 内核线程的 cmdline 是空的
+        case "$_cl" in
+            *"$_want"*) printf '%s\n' "$_p" ;;
+        esac
+    done
+}
+
+# 合并去重（多个查找结果拼起来后用）
+drm_pids_uniq() {
+    sort -u 2>/dev/null || cat
+}
+
+# 对一组 pid 发信号；空列表是安全的空操作
+drm_kill_pids() {
+    _sig=$1; shift
+    for _p in "$@"; do
+        [ -n "$_p" ] || continue
+        [ "$_p" = "$$" ] && continue
+        kill "-$_sig" "$_p" 2>/dev/null
+    done
+}
+
+# 便捷封装：按进程名精确杀掉（替代 `pkill -x <name>`）
+drm_kill_by_comm() {
+    _sig=$1; _name=$2
+    _pids=$(drm_pids_by_comm "$_name")
+    [ -n "$_pids" ] || return 0
+    # shellcheck disable=SC2086
+    drm_kill_pids "$_sig" $_pids
+}
+
+# 便捷封装：按命令行子串杀掉（替代 `pkill -f <pat>`，但用字面量子串而非正则）
+drm_kill_by_cmdline() {
+    _sig=$1; _pat=$2
+    _pids=$(drm_pids_by_cmdline "$_pat")
+    [ -n "$_pids" ] || return 0
+    # shellcheck disable=SC2086
+    drm_kill_pids "$_sig" $_pids
+}
+
 # ─────────────────────────── 状态文件 ───────────────────────────
 #
 # 重构前唯一的状态是 `takeover.ok` 一个空文件：布尔、无时间戳、无模式、

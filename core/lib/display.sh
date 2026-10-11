@@ -312,38 +312,73 @@ H:seat
 #
 # ★ 顺序要紧：先杀 kwin_wayland_wrapper（KDE 的监督者会补进程），
 #   否则永远杀不干净。
-# ★ 用 `-x` 精确匹配优先，`-f` 只用于命令行特征明确的场景——
-#   重构前 desk-takeover.sh 把 $WIFI_CONF 当 pkill -f 模式，
-#   会连"命令行里提到这个路径"的调用方 shell 一起杀。
+#
+# ★ 不用 pkill / pgrep / fuser（全部换成 /proc 扫描，见 common.sh）：
+#   · fuser 在安卓 toybox 里不存在 —— 原来那条"最后兜底"在设备上是死的
+#   · pgrep -f / pkill -f 按整条命令行做正则匹配，会误伤"命令行里恰好
+#     提到这个字符串"的无关进程（重构前把 $WIFI_CONF 当模式，连调用方
+#     自己的 shell 一起杀了）
 drm_kill_linux_stack() {
     drm_log "杀容器侧 Linux 桌面栈"
-    pkill -9 -f "kwin_wayland_wrapper" 2>/dev/null
-    pkill -9 -f "kwinwrap --out" 2>/dev/null
-    pkill -9 -x kwin_wayland 2>/dev/null
-    pkill -9 -x plasmashell 2>/dev/null
-    pkill -9 -x kactivitymanagerd 2>/dev/null
-    pkill -9 -x plasma-keyboard 2>/dev/null
-    pkill -9 -f "xdg-desktop-portal" 2>/dev/null
-    pkill -9 -f "dmesg-harvester.sh" 2>/dev/null
-    pkill -9 -f "keepbright.sh" 2>/dev/null
+
+    # 第一轮：按命令行特征杀（KDE 监督者必须先死，否则会补进程）
+    for _pat in kwin_wayland_wrapper kwinwrap xdg-desktop-portal \
+                dmesg-harvester.sh keepbright.sh; do
+        _pids=$(drm_pids_by_cmdline "$_pat" | drm_pids_uniq)
+        [ -n "$_pids" ] || continue
+        drm_log "  kill -9 [$_pat] → $(printf '%s' "$_pids" | tr '\n' ' ')"
+        # shellcheck disable=SC2086
+        drm_kill_pids 9 $_pids
+    done
+    # 按精确进程名杀
+    for _name in kwin_wayland plasmashell kactivitymanagerd plasma-keyboard; do
+        _pids=$(drm_pids_by_comm "$_name" | drm_pids_uniq)
+        [ -n "$_pids" ] || continue
+        # shellcheck disable=SC2086
+        drm_kill_pids 9 $_pids
+    done
     sleep 1
 
-    # 三轮"模式 + 验证重试"，最后用 fuser 兜底（谁还占着 card0 就杀谁）
+    # 第二轮：三轮"扫描 + 验证重试"，收掉监督者刚补起来的
     _i=0
     while [ "$_i" -lt 3 ]; do
-        _alive=$(pgrep -f "kwin_wayland|kwinwrap|plasmashell" 2>/dev/null | grep -v "^$$\$")
+        _alive=$(
+            {
+                drm_pids_by_comm kwin_wayland
+                drm_pids_by_comm plasmashell
+                drm_pids_by_cmdline kwinwrap
+            } | drm_pids_uniq
+        )
         [ -z "$_alive" ] && break
-        drm_warn "第 $((_i + 1)) 轮仍有残留：$_alive"
+        drm_warn "第 $((_i + 1)) 轮仍有残留：$(printf '%s' "$_alive" | tr '\n' ' ')"
         # shellcheck disable=SC2086
-        kill -9 $_alive 2>/dev/null
+        drm_kill_pids 9 $_alive
         sleep 1
         _i=$((_i + 1))
     done
-    if [ -n "${_alive:-}" ]; then
-        drm_warn "仍有残留，用 fuser -k $DEV_DRM_CARD 兜底"
-        fuser -k "$DEV_DRM_CARD" 2>/dev/null
+
+    # 第三轮兜底：谁还占着 DRM 节点就杀谁
+    # （原来是 `fuser -k`，安卓上没有这个命令 ⇒ 兜底从未生效）
+    _holders=$(drm_card_fd_holders)
+    if [ -n "$_holders" ]; then
+        drm_warn "仍有进程占着 $DEV_DRM_CARD：$(printf '%s' "$_holders" | tr '\n' ' ')"
+        # shellcheck disable=SC2086
+        drm_kill_pids 9 $_holders
         sleep 2
     fi
+}
+
+# 谁还持有 DRM 节点（本侧 /proc 扫描）。
+#
+# 一次 ls 全部 fd 再 grep 一次 —— 不要写成"每个进程 fork 一次 ls|grep"，
+# 那在 30 秒 × 每 0.5 秒的轮询里会变成上万次 fork。
+drm_card_fd_holders() {
+    _node=${1:-$DEV_DRM_CARD}
+    ls -l /proc/[0-9]*/fd 2>/dev/null \
+        | grep -F -- "-> $_node" \
+        | sed -n 's#^.*/proc/\([0-9][0-9]*\)/fd/.*#\1#p' \
+        | sort -u \
+        | grep -v -x "$$" 2>/dev/null
 }
 
 # ── kwinwrap 交接 ─────────────────────────────────────────
@@ -529,8 +564,9 @@ drm_start_desktop() {
     #   结果连续三轮黑屏靠猜。现在给明确判据。
     _i=0
     while [ "$_i" -lt 15 ]; do
-        if pgrep -x plasmashell >/dev/null 2>&1; then
-            drm_log "PLASMA-UP（plasmashell pid=$(pgrep -x plasmashell | head -1)）"
+        _plpid=$(drm_pids_by_comm plasmashell | head -1)
+        if [ -n "$_plpid" ]; then
+            drm_log "PLASMA-UP（plasmashell pid=$_plpid）"
             drm_state_set PLASMA_OK 1
             break
         fi
@@ -571,7 +607,7 @@ drm_wait_kwin_holds_drm() {
     _i=0
     while [ "$_i" -lt "$_max" ]; do
         _h=""
-        for _p in $(pgrep -x kwin_wayland 2>/dev/null); do
+        for _p in $(drm_pids_by_comm kwin_wayland); do
             ls -l "/proc/$_p/fd" 2>/dev/null | grep -q 'dri/card0' || continue
             _st=$(stat -c %Y "/proc/$_p" 2>/dev/null || echo 0)
             [ "$_st" -ge "$_launch_ts" ] || continue
@@ -606,7 +642,7 @@ drm_input_settle() {
     _i=0
     while [ "$_i" -lt 20 ]; do
         _ok=1
-        for _p in $(pgrep -x kwin_wayland 2>/dev/null); do
+        for _p in $(drm_pids_by_comm kwin_wayland); do
             _fds=$(ls -l "/proc/$_p/fd" 2>/dev/null)
             case "$_fds" in *event*) ;; *) _ok=0 ;; esac
         done

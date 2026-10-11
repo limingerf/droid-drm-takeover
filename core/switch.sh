@@ -185,8 +185,16 @@ cmd_rollback() {
     ds_stop 2>/dev/null || true
 
     # 杀容器侧残留（如果共享目录还挂着）
+    #
+    # ★ 走容器里的 display/kill-desktop.sh，而不是往 ds_exec 里塞一行 pkill：
+    #   · 容器是精简 rootfs，`pkill` 来自 procps，不保证装了（没装就静默失败，
+    #     残留的 kwinwrap 会继续握着 DRM 节点）
+    #   · pkill -f 按正则匹配整条命令行，会误伤
+    #   那个脚本 source boot.sh 后调用 drm_kill_linux_stack，与会话拉起路径
+    #   用的是同一套逻辑（纯 /proc 扫描）。
     if ds_shared_ready 2>/dev/null; then
-        ds_exec 'pkill -9 -f kwinwrap; pkill -9 -x kwin_wayland; pkill -9 -x plasmashell' >/dev/null 2>&1 || true
+        _kd="$(ds_shared_dir)/droid-drm-takeover/display/kill-desktop.sh"
+        ds_exec "sh '$_kd'" >/dev/null 2>&1 || true
     fi
 
     # 起回安卓显示栈
@@ -330,8 +338,8 @@ cmd_status() {
         _h=$(android_card_holders 2>/dev/null)
         printf 'card0持有 : %s\n' "${_h:-无}"
     else
-        printf 'kwin      : %s\n' "$(pgrep -x kwin_wayland 2>/dev/null | tr '\n' ' ')"
-        printf 'plasmashell: %s\n' "$(pgrep -x plasmashell 2>/dev/null | tr '\n' ' ')"
+        printf 'kwin      : %s\n' "$(drm_pids_by_comm kwin_wayland | tr '\n' ' ')"
+        printf 'plasmashell: %s\n' "$(drm_pids_by_comm plasmashell | tr '\n' ' ')"
     fi
     return 0
 }

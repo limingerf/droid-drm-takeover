@@ -131,6 +131,15 @@ jobs:
           done < <(find . -name '*.sh' -not -path './.git/*' | sort)
           exit $fail
 
+      # dash -n 只能证明"语法合法"。它查不出调用了不存在的函数、或者调用了
+      # 目标环境上不存在的命令 —— 而那类错误只会在设备上执行到那一行时才炸，
+      # 且往往炸在接管中（没有回显）或返回安卓的路径上。
+      # 这个检查抓到过 `fuser -k`（安卓 toybox 没有，兜底路径从未生效）。
+      - name: 静态检查（未定义函数 / 缺失命令 / bash 构造）
+        run: |
+          set -eu
+          python3 tools/lint/shell-lint.py
+
   # ════════════════════════════════════════════════════════════════════
   # 3) APK
   #    ubuntu runner 自带 Android SDK。构建脚本不用 Gradle（手工走

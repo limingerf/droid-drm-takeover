@@ -86,7 +86,7 @@ net_start_supplicant() {
         [ -n "$_op" ] && kill -9 "$_op" 2>/dev/null
         rm -f "$NET_WPA_PIDFILE"
     fi
-    pkill -9 -x dhcpcd 2>/dev/null
+    drm_kill_by_comm 9 dhcpcd
 
     mkdir -p "$NET_WPA_CTRL" 2>/dev/null
     "$_wpa" -i "$DEV_WIFI_IF" -c "$_conf" -P "$NET_WPA_PIDFILE" \
@@ -110,7 +110,7 @@ net_start_supplicant() {
 net_start_dhcp() {
     command -v dhcpcd >/dev/null 2>&1 || { drm_warn "没有 dhcpcd"; return 1; }
     dhcpcd -k "$DEV_WIFI_IF" 2>/dev/null
-    pkill -9 -x dhcpcd 2>/dev/null
+    drm_kill_by_comm 9 dhcpcd
     dhcpcd -4 -w -t 20 "$DEV_WIFI_IF" >>"${DRM_LOG_DIR}/dhcpcd.log" 2>&1
     _i=0
     while [ "$_i" -lt 10 ]; do
@@ -239,7 +239,7 @@ net_release() {
         [ -n "$_op" ] && kill -9 "$_op" 2>/dev/null
         rm -f "$NET_WPA_PIDFILE"
     fi
-    pkill -9 -x dhcpcd 2>/dev/null
+    drm_kill_by_comm 9 dhcpcd
     rm -f "$NET_DYN_CONF" 2>/dev/null
     _tbl=${DEV_ROUTE_TABLE:-1042}
     _pref=${DEV_ROUTE_PREF:-31500}

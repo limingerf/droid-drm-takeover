@@ -155,8 +155,8 @@ drm_status_text() {
     printf 'plasmashell: %s\n' "$(drm_state_get PLASMA_OK 2>/dev/null || echo -)"
     printf '网络出口  : %s\n' "$(drm_state_get NET_OK 2>/dev/null || echo -)"
     printf '上次错误  : %s\n' "$(drm_state_get LAST_ERROR 2>/dev/null || echo -)"
-    printf '\n合成器    : %s\n' "$(pgrep -x kwin_wayland 2>/dev/null | tr '\n' ' ' || echo 无)"
-    printf '桌面      : %s\n' "$(pgrep -x plasmashell 2>/dev/null | tr '\n' ' ' || echo 无)"
+    printf '\n合成器    : %s\n' "$(drm_pids_by_comm kwin_wayland | tr '\n' ' ')"
+    printf '桌面      : %s\n' "$(drm_pids_by_comm plasmashell | tr '\n' ' ')"
     printf '安卓守护  : %s\n' "$(if [ -f /root/.drm-watch-alive ]; then echo 在跑; else echo 未确认; fi)"
 }
 
@@ -204,8 +204,8 @@ cmd_exit() {
 
     # 杀掉桌面栈，让画面尽快切走（安卓侧守护会在 1s 内接手）
     ( sleep 1
-      pkill -9 -x plasmashell 2>/dev/null
-      pkill -9 -x kwin_wayland 2>/dev/null
+      drm_kill_by_comm 9 plasmashell
+      drm_kill_by_comm 9 kwin_wayland
     ) &
     return 0
 }
