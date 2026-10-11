@@ -40,6 +40,25 @@ fi
 #   万一将来路径又被改回某个可写目录，那道检查会拦住。
 DRM_ANDROID_PAYLOAD=${DRM_ANDROID_PAYLOAD:-/data/local/drm-takeover}
 
+# ★ 请求会合目录 —— 容器侧与安卓侧之间的**唯一**控制通道。
+#
+#   为什么需要它（三条都是实测出来的，不是设计洁癖）：
+#   1. 容器里没有 adb 能力：Droidspaces v6.6.0 的容器**没有 USB 节点**
+#      （/dev/bus/usb 不存在），adbd 也没监听 TCP ⇒ 容器里 `adb devices`
+#      恒为空。而接管必须停 surfaceflinger 和 composer HAL，那只有能访问
+#      init 属性服务的安卓侧做得到。所以容器只能"请求"，不能"执行"。
+#   2. 容器的 /root 是 0700 root:root，而"进 Linux"是**桌面用户**点出来的
+#      —— 他既读不了 .drm-device（认不出设备），也写不了请求文件。
+#   3. 这个目录在 rootfs 里，所以两侧看到的是**同一个目录**：
+#        安卓侧  <rootfs>/var/lib/droid-drm-takeover
+#        容器侧  /var/lib/droid-drm-takeover
+#      不需要任何 bind mount，也不受容器 /root 权限限制。
+#
+#   权限 1777：两侧都要能建文件；sticky 保证只有属主（或 root）能删。
+#   ★ 请求的**内容不参与任何执行决策**（只看文件在不在），
+#     所以"世界可写"在这里不构成注入面。安卓侧只认文件名。
+DRM_RENDEZVOUS=${DRM_RENDEZVOUS:-/var/lib/$DRM_PROJECT}
+
 # 运行期目录：安卓侧放 payload 下的 run/（重启不丢，便于取证，且同样 root-only）；
 # 容器侧放 /run（tmpfs，容器一重启自然清空，正是我们要的语义）。
 if [ "$DRM_SIDE" = android ]; then
@@ -159,6 +178,30 @@ drm_find() {
     for _d in ${DRM_EXTRA_PATH:-} /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin /system/bin /system/xbin /vendor/bin; do
         [ -n "$_d" ] || continue
         [ -x "$_d/$1" ] && { printf '%s\n' "$_d/$1"; return 0; }
+    done
+    return 1
+}
+
+# 定位仓库内的一个脚本（相对路径，例如 tools/probe/card-holders.sh）。
+#
+# ★ 为什么不直接用 $DRM_ROOT：
+#   DRM_ROOT 由**各入口脚本**自己设 —— common.sh 设不了，因为它被 source
+#   时 $0 是调用方的路径，推不出仓库根（core/switch.sh 要退一级，
+#   tools/verify/*.sh 要退两级，没有统一公式）。
+#   一旦哪个调用方忘了设，"文件不存在"在这里的后果可能是**静默返回空**：
+#   例如"谁持有 card0"返回空 ⇒ 上层读成"composer 已经松手" ⇒
+#   在错误的时刻接管 ⇒ kwin 有 master 但 atomic 报 EACCES。
+#   所以按候选列表找，并且**找不到时返回非零**，让调用方必须处理。
+drm_repo_script() {
+    for _base in "${DRM_ROOT:-}" \
+                 "/root/$DRM_PROJECT" \
+                 "${DRM_ANDROID_PAYLOAD:-/data/local/$DRM_PROJECT}" \
+                 "/opt/$DRM_PROJECT"; do
+        [ -n "$_base" ] || continue
+        if [ -f "$_base/$1" ]; then
+            printf '%s\n' "$_base/$1"
+            return 0
+        fi
     done
     return 1
 }
@@ -329,6 +372,47 @@ drm_state_set() {
 }
 
 drm_state_phase() { drm_state_get PHASE 2>/dev/null || echo unknown; }
+
+# ── 跨侧会话报告（会合目录）──────────────────────────────
+#
+# ★★★ 为什么必须有这个：**状态文件不跨侧共享**。
+#     安卓：DRM_STATE_FILE = $DRM_ANDROID_PAYLOAD/run/state
+#     容器：DRM_STATE_FILE = /run/$DRM_PROJECT/state   ← 容器自己的 tmpfs
+#
+#   而接管流程是**跨侧**的：
+#     「会话拉起」跑在容器里 → 容器 state 写上 KWIN_HOLDS_DRM=1
+#     「验证」   跑在安卓侧 → 读安卓 state → 永远读到**空字符串**
+#
+#   重构前 enter.sh 的 verify 直接 drm_state_get，于是**每一轮接管都被自己的
+#   验证判死**。更毒的是回滚会把安卓 composer 拉回来**抢走 DRM master**，
+#   KWin 之后所有 atomic 提交变成 EACCES(-13) —— 看 kwinatomic.log 就是
+#   「先 ret=0 提交成功，回滚一开始立刻变 -13」，极易误判成"KWin 提交不了"。
+#
+#   现象极具误导性：容器侧日志一路绿（`kwin 持DRM : 1`），安卓侧却报
+#   `kwin 没有持有 /dev/dri/card0（kwin_holds_drm=）` —— 注意那个**空值**，
+#   它才是线索：读到空 = 读错文件了，不是真的没持有。
+#
+#   所以跨侧结论一律走**会合目录**（两侧是同一个目录的两个视角，见
+#   drm_rendezvous_local 的注释）。
+drm_session_report_write() {
+    _d=$(drm_rendezvous_ensure 2>/dev/null) || return 0
+    [ -n "$_d" ] || return 0
+    {
+        printf 'KWIN_HOLDS_DRM=%s\n' "${1:-0}"
+        printf 'PLASMA_OK=%s\n' "${2:-0}"
+        printf 'NET_OK=%s\n' "${3:-0}"
+        printf 'AT=%s\n' "$(drm_ts)"
+    } >"$_d/session.report" 2>/dev/null || return 1
+    chmod 644 "$_d/session.report" 2>/dev/null
+    return 0
+}
+
+# 读回本侧视角下的会话报告；没有就返回 1（调用方保留原值）
+drm_session_report_get() {
+    _d=$(drm_rendezvous_local 2>/dev/null) || return 1
+    [ -n "$_d" ] && [ -r "$_d/session.report" ] || return 1
+    sed -n "s/^${1:-KWIN_HOLDS_DRM}=//p" "$_d/session.report" 2>/dev/null | tail -1
+}
 
 # 打印人类可读状态（Linux app 与 APK 都用它）
 drm_state_show() {

@@ -172,25 +172,73 @@ net_dns() {
 }
 
 net_check_egress() {
-    _i=0
-    while [ "$_i" -lt 5 ]; do
-        if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
-            drm_log "NET-TAKEOVER OK"
+    # ★ 容器里不一定装了 ping（本机 Debian rootfs 就没有）。没有就退到
+    #   DNS 解析判定 —— 能解析出地址至少说明 DNS 通路是活的。
+    #   两个都没有时**不谎报失败**：这属于"测不了"，不是"不通"。
+    if drm_have ping; then
+        _i=0
+        while [ "$_i" -lt 5 ]; do
+            if ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
+                drm_log "NET-TAKEOVER OK"
+                drm_state_set NET_OK 1
+                return 0
+            fi
+            sleep 1
+            _i=$((_i + 1))
+        done
+    elif drm_have getent; then
+        if getent hosts deb.debian.org >/dev/null 2>&1; then
+            drm_log "NET-TAKEOVER OK（无 ping，以 DNS 解析判定）"
             drm_state_set NET_OK 1
             return 0
         fi
-        sleep 1
-        _i=$((_i + 1))
-    done
+    else
+        drm_warn "既没有 ping 也没有 getent —— 无法判定出网，跳过（不谎报失败）"
+        return 0
+    fi
     drm_warn "NET-EGRESS-FAIL：桌面保持不动，仅网络不可用"
     ip -4 route show table all 2>/dev/null | head -n 20 >&2
     drm_state_set NET_OK 0
     return 1
 }
 
+# net_mode=host 下的只读核验：什么都不改，只报告能不能出网。
+#
+# ★ 为什么单独写一条：旧路径是"自己起 wpa_supplicant + DHCP + 兜底路由表"，
+#   那是 net_mode=nat 时代的做法。host 模式下容器用的是安卓的 netns，
+#   再去碰 wlan0 只会把安卓的网弄断（红线：永不 `ip link set wlan0 up`）。
+net_verify_host_net() {
+    _dev=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    if [ -n "$_dev" ]; then
+        drm_log "默认路由走 $_dev（继承自安卓）"
+    else
+        drm_warn "没有 IPv4 默认路由 —— 桌面能用，但出不了网"
+    fi
+
+    if [ -s /etc/resolv.conf ]; then
+        drm_log "DNS: $(tr '\n' ' ' </etc/resolv.conf | head -c 120)"
+    else
+        drm_warn "/etc/resolv.conf 为空 —— 域名解析可能不可用"
+    fi
+
+    net_check_egress || true
+    return 0
+}
+
 # ── 总入口：尽力而为，永不 die ────────────────────────────
 net_takeover_wifi() {
     drm_phase "net"
+
+    # ★ net_mode=host（本机实测）：容器与安卓共享网络命名空间，
+    #   直接继承安卓的 IP/路由/DNS。**绝对不要**再去起 wpa_supplicant /
+    #   DHCP —— 那会去抢安卓已经在用的 wlan0，把好好的网弄断。
+    #   这里只做只读核验。
+    if [ "${DEV_NET_MODE:-}" = "host" ]; then
+        drm_log "net_mode=host —— 容器继承安卓网络，跳过 WiFi 接管"
+        net_verify_host_net
+        return 0
+    fi
+
     if [ "${DRM_NET:-1}" != 1 ]; then
         drm_log "DRM_NET=0，跳过网络接管"
         return 0

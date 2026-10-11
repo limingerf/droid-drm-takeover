@@ -1,11 +1,21 @@
 #!/system/bin/sh
-# android/exit-watch.sh — 安卓侧"返回安卓"守护进程的启动器。
+# android/exit-watch.sh — 安卓侧接管守护的启动器。
 #
-# 容器里的「返回安卓」按钮只会 `touch /root/.drm-exit-request`。
-# 这个守护每秒轮询共享目录，发现请求后停容器并整机重启。
+# ══ 它守的是什么 ══
+# 容器与安卓是两个 PID 命名空间，容器里的进程既停不了安卓的服务、也重启
+# 不了安卓。而**接管必须停 surfaceflinger 和 composer HAL**，返回安卓必须
+# 整机重启 —— 两件事都只有安卓侧做得到。
+# 所以方向反过来：容器写请求文件，这个守护轮询并执行。
 #
-# ★ 为什么需要它常驻：容器与安卓是两个 PID 命名空间，容器里的进程
-#   没法直接让安卓重启。必须有一个安卓侧的东西在听。
+#   容器 → 安卓： enter.request（进 Linux）/ exit.request（回安卓）
+#   安卓 → 容器： enter.result / device / serial / heartbeat
+#
+# 完整协议见 core/lib/request.sh。文件名保留 exit-watch 是历史原因
+# （它最早只管返回安卓），APK、boot-install.sh 与文档都按这个名字引用。
+#
+# ★ 为什么容器不能直接调 adb（实测，不是推测）：
+#   Droidspaces v6.6.0 的容器里 /dev/bus/usb 不存在（没有 USB 节点），
+#   adbd 也没监听 TCP ⇒ 容器里 `adb devices` **恒为空**。
 #
 # 用法:
 #   启动  su -c 'sh .../android/exit-watch.sh start'
@@ -27,15 +37,21 @@ export PATH="/data/adb/ksu/bin:/data/adb/magisk:/system/bin:/system/xbin:/vendor
 DRM_ROOT=$DRM_PAYLOAD
 SW="$DRM_ROOT/core/switch.sh"
 LOG="$DRM_ROOT/logs/exit-watch.log"
-PIDF="$DRM_ROOT/.exit-watch.pid"
 
 [ -f "$SW" ] || { echo "找不到 $SW" >&2; exit 1; }
 mkdir -p "$DRM_ROOT/logs" 2>/dev/null
 
+# ★ 存活判据必须问 switch.sh —— 真正写 pid 文件的是 cmd_watch，
+#   它写的是 $DRM_RUN_DIR/watch.pid。本脚本原来自己查一个
+#   `$DRM_ROOT/.exit-watch.pid`，而**没有任何代码会创建它**，
+#   于是 `start` 永远报"启动失败"（哪怕守护已经正常跑起来了），
+#   而 `stop` 的 kill 分支也永远不执行。
 _alive() {
-    [ -f "$PIDF" ] || return 1
-    _p=$(cat "$PIDF" 2>/dev/null)
-    [ -n "$_p" ] && [ -d "/proc/$_p" ]
+    sh "$SW" watch-status >/dev/null 2>&1
+}
+
+_watcher_pid() {
+    sh "$SW" watch-status 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p'
 }
 
 case "${1:-start}" in
@@ -45,15 +61,14 @@ case "${1:-start}" in
         ;;
     start)
         if _alive; then
-            echo "已在运行（pid=$(cat "$PIDF")）"
+            echo "已在运行（pid=$(_watcher_pid)）"
             exit 0
         fi
-        rm -f "$PIDF" 2>/dev/null
-        echo "启动返回守护…"
+        echo "启动接管守护…"
         setsid nohup sh "$SW" watch >>"$LOG" 2>&1 &
         sleep 2
         if _alive; then
-            echo "已启动（pid=$(cat "$PIDF")）"
+            echo "已启动（pid=$(_watcher_pid)）"
         else
             echo "启动失败，见 $LOG" >&2
             tail -n 20 "$LOG" 2>/dev/null >&2
@@ -62,17 +77,21 @@ case "${1:-start}" in
         ;;
     stop)
         sh "$SW" watch-stop >/dev/null 2>&1
+        sleep 2
         if _alive; then
-            _p=$(cat "$PIDF")
-            kill -9 "$_p" 2>/dev/null
+            _p=$(_watcher_pid)
+            [ -n "$_p" ] && kill -9 "$_p" 2>/dev/null
             sleep 1
         fi
-        rm -f "$PIDF" 2>/dev/null
+        if _alive; then
+            echo "停止失败（仍在跑）" >&2
+            exit 1
+        fi
         echo "已停止"
         ;;
     status)
         if _alive; then
-            echo "running pid=$(cat "$PIDF")"
+            echo "running pid=$(_watcher_pid)"
             exit 0
         fi
         echo "not running"

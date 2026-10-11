@@ -59,12 +59,24 @@ drm_adb_init() {
 # ── ★ 唯一出口 ────────────────────────────────────────────
 # 安卓侧：以 root 执行（调用方保证自己是 root，或由 APK 用 su 起）
 # 容器侧：adb shell su -c '<cmd>'
+#
+# ★ 必须转义命令里的单引号（修掉一个潜伏很久的真 bug）：
+#   容器侧要把命令塞进 `su -c '...'`，而命令自己可能带单引号
+#   （android_card_holders 里就有 'dri/card0'）。不转义的话那个引号会
+#   提前闭合，后面的内容全变成 shell 的普通词 —— 命令静默碎掉。
+#   安卓侧走的是 `sh -c "$1"`，不经过这层，所以这个 bug 只在
+#   **容器侧入口**（display/desk-takeover.sh 那条链）才现形。
+#   POSIX 唯一可靠的转义：把每个 ' 换成 '\''。
+drm_shq_escape() {
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+}
+
 android_exec() {
     if drm_android_side; then
         sh -c "$1"
     else
         drm_timeout "${DRM_ADB_TIMEOUT:-12}" "$DRM_ADB_BIN" -s "$DRM_ADB_SERIAL" \
-            shell "su -c '$1'"
+            shell "su -c '$(drm_shq_escape "$1")'"
     fi
 }
 
@@ -125,27 +137,61 @@ android_stop_framework() {
     drm_log "zygote=$(android_svc_state zygote) SF=$(android_svc_state $DEV_SF_SVC)"
 }
 
-# 谁还持有 card0（安卓侧 /proc 扫描）
+# 谁还持有 card0（安卓侧）
+#
+# ★ 实现抽在 tools/probe/card-holders.sh。这个函数以前是"每个进程
+#   fork 一次 ls | grep"（720 进程 ⇒ 上千次 fork，把 0.5s 的轮询拖成
+#   几十秒），中间一度改成 `sed` 从 `ls -l /proc/*/fd` 里抽 pid ——
+#   那更糟：格式上永远匹配不上，恒返回空，而上层把"空"读成
+#   "composer 已经松手"，于是**在错误的时刻接管**。
+#   详见 tools/probe/card-holders.sh 顶部的说明。
 android_card_holders() {
-    android_exec "for p in /proc/[0-9]*; do ls -l \$p/fd 2>/dev/null | grep -q 'dri/card0' && { echo \"\${p#/proc/} \$(cat \$p/comm 2>/dev/null)\"; }; done" 2>/dev/null | tr -d '\r'
+    if drm_android_side; then
+        _h=$(drm_repo_script tools/probe/card-holders.sh 2>/dev/null) || {
+            # ★ 不能静默返回空：上层会把"空"读成"composer 松手了"
+            drm_warn "找不到 tools/probe/card-holders.sh —— 无法判断谁持有 $DEV_DRM_CARD"
+            return 1
+        }
+        sh "$_h" "$DEV_DRM_CARD" 2>/dev/null
+    else
+        android_exec "sh ${DRM_ANDROID_PAYLOAD:-/data/local/$DRM_PROJECT}/tools/probe/card-holders.sh $DEV_DRM_CARD" 2>/dev/null | tr -d '\r'
+    fi
 }
 
-# 等 composer 真正松手（判据是持有者列表，不是 init.svc）
+# 等 composer 真正松手。
+#
+# ★ 主判据是持有者列表（不是 init.svc）——`stop` 不动 class hal，
+#   composer 属于 class hal，`stop` 之后它仍然攥着 card0。
+#
+# ★ 但"持有者列表为空"**不能单独作为判据**：扫描本身失败时也是空。
+#   本项目就踩过这个坑（sed 从 `ls -l /proc/*/fd` 里抽 pid 恒为空），
+#   上层把"空"读成"已经松手" ⇒ 在错误的时刻接管 ⇒ kwin 拿到 master
+#   但 atomic 提交报 ret=-13(EACCES) ⇒ 有 master、不出画，极难定位。
+#   所以这里加一道**交叉验证**：只有"扫描说没人持有" **且**
+#   "composer 服务状态确实不是 running/restarting" 才认。
+#   反过来（列表非空）永远按"还被持有"处理，是安全的一侧。
 android_wait_composer_release() {
     _max=${1:-15}
     _i=0
+    _h=""
     while [ "$_i" -lt "$_max" ]; do
         _h=$(android_card_holders)
         if [ -z "$_h" ]; then
-            drm_log "card0 已无持有者（等了 $((_i / 2))s）"
-            drm_state_set COMPOSER_RELEASED 1
-            return 0
+            _cs=$(android_svc_state "$DEV_COMPOSER_SVC")
+            case "$_cs" in
+                running|restarting)
+                    drm_warn "持有者扫描为空，但 $DEV_COMPOSER_SVC=$_cs —— 不采信，继续等" ;;
+                *)
+                    drm_log "card0 已无持有者（等了 $((_i / 2))s；composer=$_cs）"
+                    drm_state_set COMPOSER_RELEASED 1
+                    return 0 ;;
+            esac
         fi
         _i=$((_i + 1))
         sleep 0.5 2>/dev/null || sleep 1
     done
-    drm_warn "card0 仍有持有者：$_h"
-    drm_state_set COMPOSER_HOLDERS "$_h"
+    drm_warn "card0 仍有持有者：${_h:-（扫描无结果，且 composer 未停）}"
+    drm_state_set COMPOSER_HOLDERS "${_h:-unknown}"
     return 1
 }
 

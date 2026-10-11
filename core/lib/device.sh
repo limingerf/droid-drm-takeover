@@ -48,6 +48,71 @@ drm_android_prop() {
     fi
 }
 
+# 共享目录的候选列表（容器视角 + host 视角）。
+#
+# ★ 这里存在一个**先有鸡还是先有蛋**，必须显式解开：
+#   容器侧认设备靠读共享目录里的 .drm-device，而共享目录路径 DEV_SHARED
+#   本身**定义在设备适配层里** —— 适配层还没选中，DEV_SHARED 就是空的。
+#   结果容器侧永远读不到 .drm-device ⇒ 退回 generic ⇒ DEV_COMPOSER_SVC
+#   之类全是通用默认值 ⇒ 停错服务。
+#   解法：不依赖 DEV_SHARED，把所有可能的视角都列出来试。
+#   · /root 和 $HOME 是**容器自己的视角** —— 容器的 /root 就是 host 侧的
+#     <rootfs>/root，所以这条在容器里几乎总是命中。
+#   · 后两条是 host 视角，容器里通常看不到，但万一是 bind 进来的就有用。
+drm_shared_candidates() {
+    [ -n "${DEV_SHARED:-}" ] && printf '%s\n' "$DEV_SHARED"
+    [ -n "${HOME:-}" ] && printf '%s\n' "$HOME"
+    printf '%s\n' /root
+    _hn=$(head -1 /etc/hostname 2>/dev/null | tr -d '\r')
+    [ -n "$_hn" ] && printf '%s\n' "/data/local/Droidspaces/Containers/$_hn/rootfs/root"
+    [ -n "${DEV_CONTAINER:-}" ] && printf '%s\n' "/data/local/Droidspaces/Containers/$DEV_CONTAINER/rootfs/root"
+    return 0
+}
+
+# 本侧的共享目录 —— 容器 /root ↔ host 侧 <rootfs>/root，是同一个目录的
+# 两个视角。请求文件协议（.drm-enter-request / .drm-exit-request /
+# .drm-enter-result）靠它落地，两侧必须指到同一个地方。
+drm_shared_local() {
+    if [ "$DRM_SIDE" = android ]; then
+        ds_shared_dir 2>/dev/null && return 0
+        printf '%s\n' "${DEV_SHARED:-}"
+    else
+        for _d in $(drm_shared_candidates); do
+            [ -n "$_d" ] && [ -d "$_d" ] && { printf '%s\n' "$_d"; return 0; }
+        done
+        printf '%s\n' "${HOME:-/root}"
+    fi
+}
+
+# 请求会合目录的**本侧**路径（两侧指向同一个目录的两个视角）。
+#
+# ★ 安卓侧必须用 rootfs 的**根**，不是 ds_shared_dir（那是 `<rootfs>/root`，
+#   即容器的 /root）。用错了会得到容器里的 `/root/var/lib/...`，
+#   与容器侧算出来的 `/var/lib/...` 不是同一个地方 ⇒ 请求永远送不到。
+# 详见 common.sh 里 DRM_RENDEZVOUS 的注释。
+drm_rendezvous_local() {
+    if [ "$DRM_SIDE" = android ]; then
+        _rf=$(ds_rootfs_dir 2>/dev/null) || _rf=""
+        [ -n "$_rf" ] || return 1
+        printf '%s\n' "$_rf/var/lib/$DRM_PROJECT"
+    else
+        printf '%s\n' "$DRM_RENDEZVOUS"
+    fi
+}
+
+# 确保会合目录存在且可写（1777）。两侧都会调，谁先跑谁建。
+drm_rendezvous_ensure() {
+    _d=$(drm_rendezvous_local 2>/dev/null) || return 1
+    [ -n "$_d" ] || return 1
+    if [ ! -d "$_d" ]; then
+        mkdir -p "$_d" 2>/dev/null || return 1
+    fi
+    # 每次都纠正权限：rootfs 可能是别人建的，或者 umask 不对。
+    chmod 1777 "$_d" 2>/dev/null || true
+    [ -d "$_d" ] || return 1
+    printf '%s\n' "$_d"
+}
+
 # 自动识别设备代号
 drm_detect_codename() {
     if [ "$DRM_SIDE" = android ]; then
@@ -56,9 +121,18 @@ drm_detect_codename() {
         _p=$(drm_android_prop ro.product.model)
         [ -n "$_p" ] && { printf '%s\n' "$_p"; return 0; }
     fi
-    # 容器侧：从共享目录里的落盘记录读（安卓侧每次接管会写）
-    if [ -n "${DEV_SHARED:-}" ] && [ -r "$DEV_SHARED/.drm-device" ]; then
-        head -1 "$DEV_SHARED/.drm-device"
+    # 容器侧：从落盘记录读（安卓侧守护会写，见 core/lib/request.sh）
+    for _d in $(drm_shared_candidates); do
+        [ -n "$_d" ] || continue
+        if [ -r "$_d/.drm-device" ]; then
+            head -1 "$_d/.drm-device"
+            return 0
+        fi
+    done
+    # 再试会合目录里的 device（容器侧桌面用户也读得到，权限 1777）
+    _rd=$(drm_rendezvous_local 2>/dev/null) || _rd=""
+    if [ -n "$_rd" ] && [ -r "$_rd/device" ]; then
+        head -1 "$_rd/device"
         return 0
     fi
     return 1

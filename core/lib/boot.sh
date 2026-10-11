@@ -41,5 +41,7 @@ drm_device_load
 . "$DRM_ROOT/core/lib/net.sh"
 # shellcheck source=/dev/null
 . "$DRM_ROOT/core/lib/enter.sh"
+# shellcheck source=/dev/null
+. "$DRM_ROOT/core/lib/request.sh"
 
 drm_state_init

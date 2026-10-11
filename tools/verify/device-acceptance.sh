@@ -34,6 +34,8 @@ drm_device_load
 . "$DRM_ROOT/core/lib/container.sh"
 # shellcheck source=/dev/null
 . "$DRM_ROOT/core/lib/display.sh"
+# shellcheck source=/dev/null
+. "$DRM_ROOT/core/lib/enter.sh"      # 只取 drm_stage_payload_to_container（无顶层副作用）
 
 DO_TAKEOVER=0
 QUIET=0
@@ -173,9 +175,13 @@ else
 fi
 
 # B4 背光
+# ★ drm_backlight_node 返回的是**节点名**（不是路径），要自己拼
+#   /sys/class/backlight/<名>/brightness。
+# ★ `echo ?` 里的 ? 不加引号会被当 glob 展开 —— 安卓根目录下正好有个
+#   叫 `d` 的条目，于是"读不到"时会打印出一个莫名其妙的 d。
 _bl=$(drm_backlight_node 2>/dev/null || true)
 if [ -n "$_bl" ]; then
-    ok "背光节点: $_bl（当前 $(cat "$_bl/brightness" 2>/dev/null || echo ?)）"
+    ok "背光节点: $_bl（当前 $(cat "/sys/class/backlight/$_bl/brightness" 2>/dev/null || echo '?')）"
 elif [ -n "${DEV_BACKLIGHT:-}" ]; then
     bad "DEV_BACKLIGHT=$DEV_BACKLIGHT 但节点不存在" "ls /sys/class/backlight/"
 else
@@ -264,12 +270,24 @@ if ds_available 2>/dev/null; then
     if [ -f "$DS_CFG" ]; then
         ok "容器配置存在: $DS_CFG"
         _cfg=$(cat "$DS_CFG" 2>/dev/null || true)
+        # ★ 这里原来查的是 `bind_mounts=/dev:/dev` —— 那是**旧版假设**。
+        #   Droidspaces v6 里 /dev 是容器自己的 devtmpfs，访问权由
+        #   enable_hw_access 给；Droidspaces 只挑几个节点挂进去
+        #   （实测 renderD128 + kgsl，**没有 card0**，/dev/input 是空的）。
+        #   所以 card0 和输入节点是我们自己 mknod 的，见 display.sh。
         case "$_cfg" in
-            *bind_mounts*) case "$_cfg" in
-                    */dev:/dev*) ok "bind_mounts 含 /dev:/dev（接管必需）" ;;
-                    *) bad "bind_mounts 里没有 /dev:/dev —— 容器看不到 DRM 节点" ;;
+            *enable_hw_access=1*) ok "enable_hw_access=1（/dev 可用）" ;;
+            *bind_mounts=*)
+                case "$_cfg" in
+                    */dev:/dev*) ok "bind_mounts 含 /dev:/dev" ;;
+                    *) warn "有 bind_mounts 但不含 /dev:/dev" ;;
                 esac ;;
-            *) warn "容器配置里没看到 bind_mounts" ;;
+            *) warn "enable_hw_access 不是 1 —— 容器可能拿不到 /dev 节点" ;;
+        esac
+        # renderD128 是 Mesa/Freedreno 的渲染节点，上屏不用它但不能少
+        case "$_cfg" in
+            *enable_gpu_mode=1*) ok "enable_gpu_mode=1（GPU 渲染节点已挂）" ;;
+            *) warn "enable_gpu_mode 不是 1 —— 容器里可能没有 renderD128（Mesa 渲染会退回软渲染）" ;;
         esac
         case "$_cfg" in
             *net_mode*=*host*) ok "net_mode=host" ;;
@@ -287,8 +305,33 @@ if [ -n "$_shared" ]; then
     if [ -d "$_shared" ]; then
         ok "共享目录存在: $_shared"
     else
-        warn "共享目录还不存在: $_shared（容器没起时属正常）"
+        bad "共享目录不存在: $_shared" "DEV_SHARED 配错了？（v6 里 rootfs 是普通目录，不该缺）"
     fi
+fi
+
+# ── 把 payload 摆进容器，供 E 段在容器里跑工具 ─────────────
+#
+# ★ 为什么工具必须在容器里跑：bin/ 下的产物是 **glibc** 链接
+#   （interpreter /lib/ld-linux-aarch64.so.1），而安卓是 bionic。
+#   在安卓侧直接执行只会得到一句 "No such file or directory" ——
+#   极容易误判成"文件没推上去"。（本项目的验收测试就在这栽过一次。）
+CONT_ROOT=""
+if ds_running 2>/dev/null; then
+    ok "容器 $DS_NAME 在运行"
+    if [ -n "$_shared" ] && [ -d "$_shared" ]; then
+        # ★ 总是重新同步（drm_stage_payload_to_container 内部是 rm -rf + cp，
+        #   幂等）。不能"看到已存在就跳过" —— 那会用容器里的**旧** payload
+        #   做验收，测出来的结论对不上当前仓库。
+        if drm_stage_payload_to_container >/dev/null 2>&1; then
+            ok "payload 已同步进容器共享目录"
+        else
+            warn "payload 同步进容器失败 —— 容器侧工具无法验证"
+        fi
+        # ★ 容器内的路径，不是安卓侧的 <rootfs>/root/...
+        [ -d "$_shared/droid-drm-takeover/bin" ] && CONT_ROOT=$(ds_repo_in_container)
+    fi
+else
+    warn "容器 $DS_NAME 没在运行 —— 容器侧工具无法验证（先 droidspaces --name=$DS_NAME start）"
 fi
 
 # ════════════════════════════════════════════════════════════════════
@@ -298,35 +341,86 @@ _kw="$DRM_ROOT/bin/kwinwrap"
 if [ -x "$_kw" ]; then
     _arch=$(file -b "$_kw" 2>/dev/null || echo "")
     case "$_arch" in
-        *aarch64*) ok "kwinwrap 可执行且是 aarch64" ;;
-        *) bad "kwinwrap 架构不对: $_arch" "应该是 ARM aarch64（交叉编译目标错了？）" ;;
+        *aarch64*) ok "kwinwrap 是 ARM aarch64" ;;
+        *) bad "kwinwrap 架构不对: $_arch" "交叉编译目标错了？" ;;
     esac
+    # 链接方式决定"在哪儿跑"：glibc ⇒ 只能进容器
+    case "$_arch" in
+        *ld-linux-aarch64*)
+            ok "kwinwrap 是 glibc 链接 ⇒ 必须在容器里执行（安卓侧会报 No such file or directory）" ;;
+        *)
+            warn "kwinwrap 链接方式存疑: $_arch" "确认它是不是被换成了 bionic 构建" ;;
+    esac
+else
+    bad "$_kw 不存在或不可执行"
+fi
 
-    # ★ split 几何发现 —— 换设备最容易出问题的一项
-    _split=$(drm_timeout 20 "$_kw" --probe-split 2>/dev/null || true)
+# ── 容器侧：工具能不能真跑起来 ────────────────────────────
+if [ -n "$CONT_ROOT" ]; then
+    # E1 split 几何发现 —— 换设备最容易出问题的一项
+    _split=$(ds_exec "$CONT_ROOT/bin/kwinwrap --probe-split" 2>/dev/null || true)
     if [ -n "$_split" ]; then
-        ok "kwinwrap --probe-split 成功:"
+        ok "容器里 kwinwrap --probe-split 成功:"
         [ "$QUIET" = 1 ] || printf '%s\n' "$_split" | sed 's/^/       /'
         case "$_split" in
             *PLANES=*) : ;;
             *) warn "输出里没有 KWINWRAP_SPLIT_PLANES —— plane 自动发现可能失败，需人工指定" ;;
         esac
     else
-        bad "kwinwrap --probe-split 没有输出" "接管时会用编译期兜底几何（piano 的常量），几乎肯定花屏"
+        bad "容器里 kwinwrap --probe-split 没有输出" "接管时会用编译期兜底几何，几乎肯定花屏"
     fi
+
+    # E2 容器里能不能 mknod 出 card0 并读 DRM 拓扑
+    #    （Droidspaces 只把 renderD128 挂进容器，card0 要我们自己造）
+    _maj=${DEV_DRM_MAJOR:-226}
+    _min=${DEV_DRM_MINOR:-0}
+    _kms=$(ds_exec "mknod /dev/dri/card0 c $_maj $_min 2>/dev/null; $CONT_ROOT/bin/kmsdump 2>&1 | head -2" 2>&1 || true)
+    case "$_kms" in
+        *resources:*)
+            ok "容器里 mknod card0(${_maj}:${_min}) 后可读 DRM 拓扑"
+            [ "$QUIET" = 1 ] || printf '%s\n' "$_kms" | sed 's/^/       /' ;;
+        *)
+            bad "容器里 card0 造不出来或读不了" "$_kms" ;;
+    esac
+
+    # E3 容器里触摸节点能不能造出来并打开
+    _tev=$(drm_touch_find_event 2>/dev/null || true)
+    if [ -n "$_tev" ]; then
+        _dn=$(drm_touch_devno "$_tev" 2>/dev/null)
+        _tmaj=$(printf '%s\n' "$_dn" | cut -d' ' -f1)
+        _tmin=$(printf '%s\n' "$_dn" | cut -d' ' -f2)
+        if [ -n "$_tmaj" ] && [ -n "$_tmin" ]; then
+            # evdev 的 read() 在 count < sizeof(struct input_event)(24) 时返回
+            # EINVAL —— 所以必须 bs=24，用 bs=16 会误判成"设备坏了"。
+            _tr=$(ds_exec "mknod /dev/input/$_tev c $_tmaj $_tmin 2>/dev/null; timeout 2 dd if=/dev/input/$_tev of=/dev/null bs=24 count=1 >/dev/null 2>&1; echo rc=\$?" 2>&1 || true)
+            case "$_tr" in
+                *rc=124*) ok "容器里触摸节点 /dev/input/$_tev(${_tmaj}:${_tmin}) 可打开（2s 无事件＝在等）" ;;
+                *rc=0*)   ok "容器里触摸节点 /dev/input/$_tev 可读（读到了事件）" ;;
+                *)        warn "容器里触摸节点读取异常: $_tr" ;;
+            esac
+        fi
+    else
+        warn "安卓侧就没找到触摸设备（DEV_TOUCH_NAME=${DEV_TOUCH_NAME:-未指定}）"
+    fi
+
+    # E4 其余工具在容器里就绪
+    for _t in setbright setprop crtcstate connprops; do
+        if ds_exec "[ -x '$CONT_ROOT/bin/$_t' ]" >/dev/null 2>&1; then
+            ok "容器里 bin/$_t 就绪"
+        else
+            bad "容器里 bin/$_t 不可执行"
+        fi
+    done
 else
-    bad "$_kw 不存在或不可执行"
+    skip "容器侧工具自检（容器没跑或 payload 没同步进去）"
 fi
 
+# 安卓侧只需确认文件在（它们不在这里执行）
 for _t in setbright setprop crtcstate connprops; do
-    if [ -x "$DRM_ROOT/bin/$_t" ]; then
-        ok "bin/$_t 就绪"
-    else
-        bad "bin/$_t 缺失或不可执行"
-    fi
+    [ -x "$DRM_ROOT/bin/$_t" ] || bad "bin/$_t 缺失或不可执行"
 done
 
-# 静态检查（如果容器/python 可用；安卓上没有 python3，跳过）
+# 静态检查（安卓上没有 python3，跳过）
 if command -v python3 >/dev/null 2>&1 && [ -f "$DRM_ROOT/tools/lint/shell-lint.py" ]; then
     if python3 "$DRM_ROOT/tools/lint/shell-lint.py" >/dev/null 2>&1; then
         ok "shell-lint 通过"

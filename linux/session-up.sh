@@ -125,6 +125,12 @@ _kwin_ok=$(drm_state_get KWIN_HOLDS_DRM 2>/dev/null || echo 0)
 _plasma_ok=$(drm_state_get PLASMA_OK 2>/dev/null || echo 0)
 _net_ok=$(drm_state_get NET_OK 2>/dev/null || echo 0)
 
+# ★ 把结论写进**会合目录**：安卓侧那个"验证"阶段读不到容器的 state
+#   （见 common.sh 里 drm_session_report_write 的长注释）。
+#   这一步失败不影响接管本身，只影响安卓侧的判断，所以只告警不退出。
+drm_session_report_write "$_kwin_ok" "$_plasma_ok" "$_net_ok" \
+    || drm_warn "会话报告写入会合目录失败 —— 安卓侧验证会读不到结论"
+
 drm_log "════ 会话汇总 ════"
 drm_log "  kwin 持DRM : $_kwin_ok"
 drm_log "  plasmashell: $_plasma_ok"

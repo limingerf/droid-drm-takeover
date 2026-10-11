@@ -65,9 +65,9 @@ android_wait_composer_release 15 || true
 # ── 3) 容器内跑探针 ───────────────────────────────────────
 drm_phase "diag-probes"
 
-# 容器里的仓库路径（安卓侧看共享目录；容器侧就是本仓库）
+# 容器里的仓库路径（安卓侧要给**容器内**的路径；容器侧就是本仓库）
 if drm_android_side; then
-    _rroot="$(ds_shared_dir)/droid-drm-takeover"
+    _rroot=$(ds_repo_in_container)
 else
     _rroot="$DRM_ROOT"
 fi

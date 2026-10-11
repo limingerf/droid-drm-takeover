@@ -33,17 +33,23 @@ export DRM_SIDE
 # shellcheck source=/dev/null
 . "$DRM_ROOT/core/lib/device.sh"
 drm_device_load 2>/dev/null || true
+# shellcheck source=/dev/null
+. "$DRM_ROOT/core/lib/request.sh"
 
 drm_state_init
 
-# ── 与安卓侧的共享目录 ────────────────────────────────────
-# 容器 /root ←→ 安卓 /mnt/Droidspaces/<容器>/root（唯一可靠共享的目录）
+# ── 与安卓侧的会合目录 ────────────────────────────────────
 #
-# ★ 绝对不要往容器 /data/local/tmp 写：它与安卓的 /data/local/tmp
-#   **不是同一个目录**（参考仓库实测 inode 106504 vs 110）。
-#   第一版就写错在那里 ⇒ 容器内"成功"、安卓侧永远看不见 ⇒ 按钮黑屏但不重启。
-DRM_EXIT_REQ="/root/.drm-exit-request"
-DRM_EXIT_LOG="/root/drm-exit.log"
+# ★ 为什么不是 /root（重构前的写法）：
+#   容器 /root 是 0700 root:root，而本应用是**桌面用户**跑的 ——
+#   他既写不进请求文件，也读不了 .drm-device（于是认不出设备，
+#   退回 generic，DEV_COMPOSER_SVC 之类的键全是错的）。
+#   会合目录放在 rootfs 里、权限 1777，两侧看到的是同一个目录：
+#     容器   /var/lib/droid-drm-takeover
+#     安卓   <rootfs>/var/lib/droid-drm-takeover
+#   完整说明见 core/lib/request.sh 与 common.sh 的 DRM_RENDEZVOUS。
+DRM_RD=$(drm_rendezvous_ensure 2>/dev/null) || DRM_RD=""
+DRM_EXIT_LOG="${DRM_RD:-/tmp}/drm-exit.log"
 
 # ── 通知后端探测 ──────────────────────────────────────────
 GUI=""
@@ -157,7 +163,8 @@ drm_status_text() {
     printf '上次错误  : %s\n' "$(drm_state_get LAST_ERROR 2>/dev/null || echo -)"
     printf '\n合成器    : %s\n' "$(drm_pids_by_comm kwin_wayland | tr '\n' ' ')"
     printf '桌面      : %s\n' "$(drm_pids_by_comm plasmashell | tr '\n' ' ')"
-    printf '安卓守护  : %s\n' "$(if [ -f /root/.drm-watch-alive ]; then echo 在跑; else echo 未确认; fi)"
+    printf '安卓守护  : %s\n' "$(if drm_android_watcher_alive 60; then echo 在跑; else echo '未确认（请求可能没人处理）'; fi)"
+    printf '会合目录  : %s\n' "${DRM_RD:-（建不出来！）}"
 }
 
 # ── 返回安卓 ──────────────────────────────────────────────
@@ -177,17 +184,25 @@ cmd_exit() {
     fi
 
     drm_log "用户请求返回安卓"
-    # 写请求文件（容器 /root ←→ 安卓共享目录）
-    if ! touch "$DRM_EXIT_REQ" 2>/dev/null; then
+
+    if ! drm_request_require_watcher; then
         drm_errbox "无法通知安卓侧" \
-"写不进 $DRM_EXIT_REQ。
+"安卓侧的接管守护没有在跑，请求发出去也没人处理。
+
+请在安卓侧执行一次（或用 APK 里的「启动守护」）：
+  su -c 'sh /data/local/drm-takeover/android/exit-watch.sh start'"
+        return 1
+    fi
+
+    if ! drm_request_send exit; then
+        drm_errbox "无法通知安卓侧" \
+"写不进 ${DRM_RD:-会合目录}/exit.request。
 
 可能原因：
-· 安卓侧的返回守护没有运行
-· 共享目录没挂上
+· 会合目录没挂上（容器与安卓的 rootfs 不是一个）
+· 权限不对（应为 1777）
 
-请在安卓侧执行一次：
-  su -c 'sh /data/local/drm-takeover/android/exit-watch.sh &'"
+应急：长按电源键强制重启，这个逃生阀我们从不拦截。"
         return 1
     fi
 
@@ -210,6 +225,48 @@ cmd_exit() {
     return 0
 }
 
+# ── 进入 Linux（从容器里发起）────────────────────────────
+#
+# 正常路径是"在安卓上点 APK 的进入按钮"。这里保留一个从容器侧发起的
+# 入口，用途只有一个：**在新设备上试接管**（DRM_TRIAL_SECS 到点自动回安卓，
+# 万一触摸不工作也不会被永久卡住）。
+#
+# ★ 容器侧发起时，真正的接管动作仍然是**安卓侧守护**执行的 ——
+#   容器里没有 adb 能力（详见 core/lib/request.sh）。
+cmd_enter_linux() {
+    _secs=${1:-150}
+
+    if ! drm_android_watcher_alive 60; then
+        drm_errbox "安卓侧守护没在跑" \
+"接管请求发出去也没人处理。
+
+请在安卓侧执行：
+  su -c 'sh /data/local/drm-takeover/android/exit-watch.sh start'"
+        return 1
+    fi
+
+    drm_confirm "进入 Linux（试跑 ${_secs}s）" \
+"将停掉安卓的显示栈，把屏幕交给容器里的 KWin。
+
+${_secs} 秒后会自动返回安卓（整机重启）。
+想留下来，就用常驻方式，或到点前点「返回安卓」。
+
+继续？" || { drm_log "用户取消"; return 0; }
+
+    # drm-takeover.sh 自己会 setsid 脱钩；这里再 background 一次是
+    # 为了不让 GUI 卡住（它会 tail 日志直到试跑结束）。
+    ( DRM_TRIAL_SECS="$_secs" sh "$DRM_ROOT/display/drm-takeover.sh" ) >/dev/null 2>&1 &
+
+    drm_msg "已请求接管" \
+"安卓侧守护会在 1 秒内接手。
+
+屏幕会黑一下然后亮起来 —— 那是 KWin 接管面板。
+${_secs} 秒后会自动回到安卓。
+
+日志：$DRM_LOG_DIR"
+    return 0
+}
+
 # ── 主菜单 ────────────────────────────────────────────────
 cmd_menu() {
     drm_gui_detect || drm_log "没有 kdialog/zenity，使用终端菜单"
@@ -219,6 +276,7 @@ cmd_menu() {
             "返回安卓（重启设备）" \
             "查看状态" \
             "环境体检" \
+            "进入 Linux（试跑 150s）" \
             "重启桌面（只重启 KWin，不碰安卓）" \
             "打开日志目录" \
             "退出") || return 0
@@ -234,6 +292,9 @@ cmd_menu() {
             "环境体检")
                 _out=$("$DRM_ROOT/core/switch.sh" doctor 2>&1)
                 drm_msg "环境体检" "$_out"
+                ;;
+            "进入 Linux（试跑 150s）")
+                cmd_enter_linux 150
                 ;;
             "重启桌面（只重启 KWin，不碰安卓）")
                 drm_confirm "重启桌面" "只重启容器侧的 KWin 与桌面，不碰安卓。继续？" || continue
@@ -263,6 +324,7 @@ case "${1:-}" in
     --text)  DRM_FORCE_TEXT=1; shift; cmd_menu ;;
     status)  shift; drm_status_text; exit 0 ;;
     exit)    shift; cmd_exit 0 ;;
+    enter)   shift; cmd_enter_linux "${1:-150}" ;;
     doctor)  shift; exec "$DRM_ROOT/core/switch.sh" doctor "$@" ;;
     menu|--gui|'') cmd_menu ;;
     install) shift; exec sh "$SELF_DIR/install.sh" "$@" ;;

@@ -57,6 +57,19 @@ BASHISMS = [
     (re.compile(r"(?:^|[;&|(])\s*select\s+\w+\s+in\b"), "select"),
 ]
 
+# awk / 通用工具的内建变量名。它们全大写、又不在 shell 里赋值，
+# 会被"用了但从未赋值的变量"这一项误报（实测：card-holders.sh 里的 NF）。
+# 这些名字是 awk 规范的一部分，不是拼写错误。
+BUILTIN_VARS = {
+    # awk
+    "NF", "NR", "FNR", "FS", "OFS", "ORS", "RS", "FILENAME", "SUBSEP",
+    "RSTART", "RLENGTH", "ARGV", "ARGC", "ENVIRON", "CONVFMT", "OFMT",
+    "IGNORECASE", "ERRNO", "RT",
+    # 常见环境变量（由内核/父进程给，脚本里不会赋值）
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "TERM",
+    "LANG", "LC_ALL", "TZ", "HOSTNAME", "IFS", "PPID", "UID", "EUID",
+}
+
 
 def scripts():
     out = []
@@ -154,8 +167,9 @@ def main():
         if name not in defined:
             undef.setdefault(name, []).append((rel, n, line))
     for name, rel, n, line in uses:
-        if name not in defined_vars:
-            undef_vars.setdefault(name, []).append((rel, n, line))
+        if name in defined_vars or name in BUILTIN_VARS:
+            continue
+        undef_vars.setdefault(name, []).append((rel, n, line))
 
     for p in files:
         rel = str(p.relative_to(ROOT))
