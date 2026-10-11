@@ -769,6 +769,26 @@ static long relay_atomic(struct drm_mode_atomic *la) {
 static __u32 s_objs[64], s_cnts[64], s_props[2048], s_props2[2048];
 static __u64 s_vals[2048], s_vals2[2048];
 static __u32 pl_fb, pl_crtc, pl_sx, pl_sy, pl_sw, pl_sh, pl_cx, pl_cy, pl_cw, pl_ch;
+/* ★★ connector DPMS 属性 id + "本次提交里见过 SPLIT_CONN" 标记。
+ *
+ * 为什么必须自己注入 DPMS（实测根因，2026-10-12）：
+ *   pre-disable 提交把 conn.CRTC_ID 置 0（解链接），内核**随即把该 connector
+ *   的 DPMS 置成 Off**。之后 KWin 重新链接时只写 CRTC_ID=SPLIT_CRTC，
+ *   **从不带 DPMS 属性** —— 这个 vendor KMS 不会因为 CRTC_ID 由 0 变非 0
+ *   就自动把 DPMS 改回 On。结果：KWin 提交全部 ret=0、亮度也写对了 2048、
+ *   session.report 全绿，**但面板 DPMS 停在 Off，屏幕纯黑**。
+ *
+ *   而 KWin 是 DRM master（kwinwrap DROP_MASTER 后它按"首开者"规则成为
+ *   master），所以事后再用 setprop/setbright 去救一律 EACCES：
+ *       setprop: set DPMS=0 -> -1 (Permission denied)
+ *       setbright 2048     -> -1 (Permission denied)
+ *   ⇒ drm_force_display_on 是死路。**唯一能写的时间窗就是这里**：
+ *     kwinwrap 正在改写 KWin 的提交、且提交由 KWin 的 master fd 发出。
+ *
+ *   只在 connector 确实链接到 CRTC 时注入：解链接的提交上设 DPMS=On
+ *   有些内核对会直接 EINVAL，那会把整次提交打回 -22，比不设更糟。 */
+static __u32 conn_dpms_prop;
+static int saw_conn, conn_crtc_val;
 /* forensics: last poked scratch, so the exit-stop handler can dump what
  * the kernel actually consumed when a rebuilt commit still fails */
 static pid_t sc_tid = -1;
@@ -816,6 +836,9 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
     if (readmem(t, a.props_ptr, s_props, total * 4) < 0 ||
         readmem(t, a.prop_values_ptr, s_vals, (size_t)total * 8) < 0) return;
 
+    saw_conn = 0;          /* 每帧重置：DPMS 注入只针对**本次**提交里的 connector */
+    conn_crtc_val = -1;
+
     /* Inventory. kwin's choice of plane/crtc varies round to round (it
      * re-probes and falls back to REAL planes 133/141 on REAL crtcs
      * 271/280/298 when a test fails — that raw phase showed black garbage:
@@ -849,6 +872,12 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             continue;
         }
         if (s_objs[o] == SPLIT_CONN) {
+            /* 记下 connector 与它本次被链到的 CRTC，供后面注入 DPMS 判据用。
+             * iconn 只在 CRTC_ID != SPLIT_CRTC 时才置位，而实测 KWin 稳定后
+             * CRTC_ID 恰好 == SPLIT_CRTC ⇒ iconn 一直是 -1，connector 走
+             * 默认路径被原样透传 —— 这就是 DPMS 永远没人设的原因。 */
+            saw_conn = 1;
+            conn_crtc_val = (i_crtc >= 0) ? (int)s_vals[base + i_crtc] : -1;
             if (i_crtc >= 0 && s_vals[base + i_crtc] != SPLIT_CRTC) {
                 iconn = (int)o; iconn_crtc = i_crtc;
             }
@@ -1084,6 +1113,70 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
                 s_objs[no] = SPLIT_CRTC;
                 s_cnts[no] = np - n0;
                 no++;
+            }
+        }
+    }
+
+    /* ★★ 给本次提交里的面板 connector 补一个 DPMS=On。
+     *
+     * ⚠️ 默认**关闭**，因为在本机内核上试过并且**失败**：
+     *   本内核的 DPMS 属性 flags=0x00000008，只有 DRM_MODE_PROP_ENUM，
+     *   **没有 DRM_MODE_PROP_ATOMIC**。往 atomic 提交里塞它会被判 EINVAL，
+     *   把原本 ret=0 的提交打成 -22（实测 23 次 -22 / 4 次 0，KWin 一直重试）。
+     *   ⇒ 本机的 DPMS 只能在 DROP_MASTER 之前用**非原子** ioctl 写一次，
+     *     见下面 "DPMS=On(conn...)" 那段。
+     *
+     * 这段保留是因为它对**支持 atomic DPMS 的内核**（DRM_MODE_PROP_ATOMIC
+     * 置位）是正确且更鲁棒的做法：能在 KWin 每帧提交里持续纠正 DPMS，
+     * 不依赖"只在交接那一刻写一次"的时序。换设备若发现 DPMS 老是被关，
+     * 用 KWINWRAP_DPMS_INJECT=1 打开它。
+     *
+     * 触发条件（两条都必要）：
+     *   · 本次提交里确实有 SPLIT_CONN
+     *   · 它的 CRTC_ID 非 0（真被链上了）。解链接的提交上设 DPMS 有些内核
+     *     直接 EINVAL，那会把整次提交打回 -22，比不设更糟。
+     *
+     * 只做一次属性查找（find_prop 要遍历对象属性，别每帧做）。 */
+    if (getenv("KWINWRAP_DPMS_INJECT") && saw_conn && conn_crtc_val > 0) {
+        if (!conn_dpms_prop)
+            conn_dpms_prop = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR, "DPMS");
+        if (conn_dpms_prop) {
+            int done = 0, o2 = 0;
+            for (__u32 i = 0; i < no && !done; i++) {
+                if (s_objs[i] == SPLIT_CONN) {
+                    unsigned end = (unsigned)o2 + s_cnts[i];
+                    int has = 0;
+                    for (unsigned k = (unsigned)o2; k < end; k++)
+                        if (s_props2[k] == conn_dpms_prop) {
+                            if (s_vals2[k] != 0) s_vals2[k] = 0;
+                            has = 1;
+                            break;
+                        }
+                    if (!has) {
+                        /* 属性数组按对象顺序连续存放，只需在本对象属性末尾插一条，
+                         * 后面对象的属性自然后移。 */
+                        if (np < 2048) {
+                            for (unsigned k = np; k > end; k--) {
+                                s_props2[k] = s_props2[k - 1];
+                                s_vals2[k] = s_vals2[k - 1];
+                            }
+                            s_props2[end] = conn_dpms_prop;
+                            s_vals2[end] = 0;   /* DRM_MODE_DPMS_ON == 0 */
+                            np++;
+                            s_cnts[i]++;
+                        }
+                    }
+                    done = 1;
+                }
+                o2 += s_cnts[i];
+            }
+            static int ndpms;
+            if (ndpms < 4) {
+                ndpms++;
+                fprintf(LOG, "DPMS-INJECT: 注入 DPMS=On 到 conn%u（prop=%u，链接 crtc%u）%s\n",
+                        SPLIT_CONN, conn_dpms_prop, conn_crtc_val,
+                        done ? "" : " [没找到 conn 对象，跳过]");
+                fflush(LOG);
             }
         }
     }
@@ -1542,6 +1635,44 @@ int main(int argc, char **argv) {
             int r = pid_ ? ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &sp) : -1;
             fprintf(LOG, "kwinwrap: brightness %s prop=%u ret=%d %s\n",
                     be, pid_, r, r ? strerror(errno) : "OK");
+            fflush(LOG);
+        }
+
+        /* ★★ 把面板 connector 的 DPMS 拉回 On —— **非原子**写。
+         *
+         * 为什么必须在这里、且必须用非原子 ioctl（实测 2026-10-12）：
+         *
+         *  1) pre-disable 提交把 conn.CRTC_ID 置 0（解链接），内核随即把该
+         *     connector 的 DPMS 置成 Off。KWin 之后虽然把 CRTC_ID 设回 200，
+         *     但**从不提交 DPMS 属性** —— 这个 vendor KMS 不会因为 CRTC_ID
+         *     由 0 变非 0 就自动把 DPMS 改回 On。结果 KWin 提交全 ret=0、
+         *     亮度也写对了 2048、session.report 全绿，**面板 DPMS 停在 Off，
+         *     屏幕纯黑**。
+         *
+         *  2) 为什么不能"往 KWin 的 atomic 提交里注入 DPMS"（试过，失败）：
+         *     本内核的 DPMS 属性 **flags=0x00000008，只有 DRM_MODE_PROP_ENUM，
+         *     没有 DRM_MODE_PROP_ATOMIC**。往 atomic 提交里塞它会被内核判
+         *     EINVAL，反而把原本能成功的提交打成 -22（实测 23 次 -22 / 4 次 0）。
+         *     ⇒ 只能走非原子 DRM_IOCTL_MODE_OBJ_SETPROPERTY，
+         *       这也正是上面 brightness 那行一直在用的接口（实测 ret=0 OK）。
+         *
+         *  3) 为什么现在写有效：此刻 KWin 还没 exec、master 还在我们手里
+         *     （下一段才 DROP_MASTER）。等 KWin 起来再写一律 EACCES ——
+         *     实测 setprop 报 "set DPMS=0 -> -1 (Permission denied)"，
+         *     所以 core/lib/display.sh 里的 drm_force_display_on 救不了黑屏。 */
+        __u32 dpms_prop = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR, "DPMS");
+        if (dpms_prop) {
+            struct drm_mode_obj_set_property dp = {
+                .obj_id = SPLIT_CONN, .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+                .prop_id = dpms_prop, .value = 0,   /* DRM_MODE_DPMS_ON == 0 */
+            };
+            errno = 0;
+            int dr = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &dp);
+            fprintf(LOG, "kwinwrap: DPMS=On(conn%u prop=%u) ret=%d %s\n",
+                    SPLIT_CONN, dpms_prop, dr, dr ? strerror(errno) : "OK");
+            fflush(LOG);
+        } else {
+            fprintf(LOG, "kwinwrap: 找不到 conn%u 的 DPMS 属性\n", SPLIT_CONN);
             fflush(LOG);
         }
     }
