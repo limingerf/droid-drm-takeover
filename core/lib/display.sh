@@ -805,13 +805,20 @@ drm_start_kwin() {
         done <"$_lf"
     done
 
+    # ★ 分屏开关：DEV_KWINWRAP_NO_SPLIT=1 时让 KWin 的原始提交透传，
+    #   不再拆成两个半屏。依据见 core/device/opd2511.sh 里的长注释。
+    _nosplit_env=""
+    [ -n "${DEV_KWINWRAP_NO_SPLIT:-}" ] && _nosplit_env="KWINWRAP_NO_SPLIT=1"
+
     _split_env=$(drm_kwinwrap_split_env 2>/dev/null | head -1)
 
     drm_log "kwinwrap 交接 → kwin_wayland --drm --socket=$_sock（会话 $DRM_SESSION_ID）"
+    [ -n "$_nosplit_env" ] && drm_log "分屏改写已禁用（DEV_KWINWRAP_NO_SPLIT=1）：KWin 原始提交透传"
     # shellcheck disable=SC2086
     env KWINWRAP_HIJACK=1 KWINWRAP_SECCOMP=1 KWINWRAP_FILTER=1 \
         KWINWRAP_UID="$DESKTOP_UID" KWINWRAP_GID="$DESKTOP_GID" \
         KWINWRAP_BRIGHTNESS="$DEV_BRIGHTNESS" \
+        $_nosplit_env \
         $_split_env \
         "$_kw" --out "$_out" -- \
         env -u DISPLAY -u WAYLAND_DISPLAY -u ANLAND -u ANLAND_SOCKET \

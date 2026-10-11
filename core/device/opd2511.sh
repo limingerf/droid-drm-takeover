@@ -15,7 +15,10 @@
 #   ro.build.version.release = 17 (SDK 37)
 #   kernel            = 6.1.177-android14-11-g4056c236e4c84 (aarch64)
 #   SELinux           = Enforcing；root = KernelSU (context u:r:ksu:s0)
-#   panel             = card0-DSI-1 3200x2000@120（另有 144 / 90 模式），dual DSI
+#   panel             = card0-DSI-1 3200x2000（完整宽度**单模式**，120/144/90/60）
+#                       ✔实测 2026-10-12：安卓用**一个** CRTC + 一个 3200 宽平面
+#                       点亮它。之前记的 "dual DSI 需拆两个 1600 半屏" 是错的
+#                       （那是旧参考机 OPD2413 的形态），见下面 DEV_KWINWRAP_NO_SPLIT
 #   touch             = NVTCapacitiveTouchScreen (event5) + NVTCapacitivePen (event6)
 #   backlight         = panel0-backlight（max 4095）
 #   crtc              = sde-crtc-0..5（6 个，drm id 200..205）
@@ -109,6 +112,33 @@ DEV_ROUTE_PREF=31500
 DEV_NEEDS_KSU_XWL_SHIM=1                                 # ✔实测
 DEV_MESA_OVERRIDE=""
 DEV_KWIN_EXTRA_ARGS="--no-lockscreen --xwayland"
+
+# ⚠️⚠️ 保持**置空**！分屏是这台机器的**硬件必需**，不是可选优化。
+#
+# 曾经以为"安卓用完整宽度单模式，所以全宽单平面就行"——**这个判断是错的**，
+# 实测被内核直接打回（2026-10-12）：
+#
+#   把本开关打开（=1，禁用分屏、让 KWin 原始提交透传）后：
+#     · KWin 的提交全部 ret=-7 (E2BIG)，一个都没成功
+#     · kwin_core: Applying output config failed!
+#     · 内核 dmesg 把根因说得很清楚：
+#         [_sde_crtc_check_plane_layout] [sde error]invalid horizontal destination
+#         [sde error]x:0 w:3200 hdisp:1600 layout:1
+#         [_sde_crtc_atomic_check] [sde error]crtc200 failed plane layout check -7
+#       六个 CRTC（200/265/274/283/292/301）各失败 4 次，w:3200 hdisp:1600 共 24 次。
+#
+#   ⇒ SDE 的**每个 CRTC 最大水平显示宽度是 1600**，不是 3200。
+#     面板 3200 宽必须由**两个 1600 半屏**（两个 CRTC/plane）拼出来。
+#
+#   安卓日志里的 `dsi_display_set_mode: hactive=3200` 是**整块面板**的
+#   合成时序参数，不代表单个 CRTC 能吃 3200 宽 —— 我一度按后者理解，
+#   把因果搞反了。
+#
+# 结论：分屏方向是对的，黑屏是**分屏改写的实现问题**（kwinwrap 把 KWin 的
+# nobj=3 真提交改写成只剩 2 个对象，丢了 connector 与 CRTC 的
+# MODE_ID/ACTIVE，内核判 EINVAL），不是"该不该分屏"的问题。
+# 这个开关留着是为了将来换到真·对称单 CRTC 面板时能一键切回来。
+DEV_KWINWRAP_NO_SPLIT=""                                 # ✔实测：必须为空
 
 # ── 安卓稳定性开关（接管期间要解除武装）────────────────────
 # ~推测：本机是 ColorOS 17。实测 `settings list global` 里看不到

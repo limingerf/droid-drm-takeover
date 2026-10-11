@@ -789,6 +789,19 @@ static __u32 pl_fb, pl_crtc, pl_sx, pl_sy, pl_sw, pl_sh, pl_cx, pl_cy, pl_cw, pl
  *   有些内核对会直接 EINVAL，那会把整次提交打回 -22，比不设更糟。 */
 static __u32 conn_dpms_prop;
 static int saw_conn, conn_crtc_val;
+/* 本帧是否为"拆解配置"提交（KWin 周期性发的、自身不自洽的那种）。
+ * 见 split_commit 里的 SKIP-BAD 段：这类提交要改写成空提交，
+ * 让内核返回 0，否则 KWin 会卡在重试死循环里。 */
+static int skip_bad;
+/* ★ 最近一次见到的**有效 MODE_ID blob**（CRTC 的显示模式）。
+ *
+ * 为什么要缓存：KWin 的真·页翻转提交（flags=0x201）是**增量**提交 ——
+ * 它只带变化过的属性，CRTC 那一项可能只有 VRR_ENABLED，
+ * 既没有 ACTIVE 也没有 MODE_ID（因为内核里已经是那个值了，不必重申）。
+ * 但 kwinwrap 必须往 SPLIT_CRTC 上写 ACTIVE=1 + MODE_ID 才能把面板点亮，
+ * 而此时**提交里根本没有 MODE_ID 可取** ⇒ 必须靠之前 TEST_ONLY 提交里
+ * 见过的那个 blob 兜底（实测是 0x13a）。 */
+static __u64 last_mode_blob;
 /* forensics: last poked scratch, so the exit-stop handler can dump what
  * the kernel actually consumed when a rebuilt commit still fails */
 static pid_t sc_tid = -1;
@@ -807,6 +820,14 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
         (a.flags & DRM_MODE_ATOMIC_NONBLOCK)) {
         a.flags = (a.flags | DRM_MODE_ATOMIC_ALLOW_MODESET) &
                   ~DRM_MODE_ATOMIC_NONBLOCK;
+    } else if (!(a.flags & DRM_MODE_ATOMIC_TEST_ONLY) &&
+               (a.flags & DRM_MODE_PAGE_FLIP_EVENT)) {
+        /* ★ 真·页翻转提交（0x201 = NONBLOCK|PAGE_FLIP_EVENT）也必须带
+         *   ALLOW_MODESET：分屏改写会把 SPLIT_CRTC 从 ACTIVE=0 拉成 1
+         *   （把 connector 链上、给 CRTC 装 mode），这是**真正的 modeset**。
+         *   内核规定：提交若需要 modeset 而没带 ALLOW_MODESET，一律 -EINVAL。
+         *   实测就是这一条让每一帧的页翻转都失败、屏幕永远全黑。 */
+        a.flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
     }
     if (a.flags != original_flags) {
         if (writeto(t, uptr, &a, sizeof a)) {
@@ -838,6 +859,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
 
     saw_conn = 0;          /* 每帧重置：DPMS 注入只针对**本次**提交里的 connector */
     conn_crtc_val = -1;
+    skip_bad = 0;          /* 每帧重置：本帧是否为"拆解配置"提交（见下） */
 
     /* Inventory. kwin's choice of plane/crtc varies round to round (it
      * re-probes and falls back to REAL planes 133/141 on REAL crtcs
@@ -862,13 +884,20 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             else if (!strcmp(nm, "CRTC_ID")) i_crtc = (int)i;
             else if (!strcmp(nm, "FB_ID")) i_fb = (int)i;
         }
-        if (s_objs[o] == SPLIT_CRTC && i_act >= 0) {
+        if (s_objs[o] == SPLIT_CRTC) {
+            /* ★ 去掉原来的 `&& i_act >= 0` 限制：KWin 的增量提交里
+             *   SPLIT_CRTC 可能只有 VRR_ENABLED（无 ACTIVE/MODE_ID），
+             *   加了这个限制 i206 就恒为 -1，后面的 ACTIVE/MODE_ID 注入
+             *   整段不执行 —— CRTC 永远激活不了。 */
             i206 = (int)o; i206_act = i_act; i206_mode = i_mode;
+            if (i_mode >= 0 && s_vals[base + i_mode])
+                last_mode_blob = s_vals[base + i_mode];
             continue;
         }
         if (i_act >= 0 && s_vals[base + i_act]) {   /* crtc kwin lights up */
             kact = (int)o; kact_act = i_act; kact_mode = i_mode;
             kblob = i_mode >= 0 ? s_vals[base + i_mode] : 0;
+            if (kblob) last_mode_blob = kblob;
             continue;
         }
         if (s_objs[o] == SPLIT_CONN) {
@@ -883,7 +912,13 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             }
             continue;
         }
-        if (i_fb >= 0 && i_crtc >= 0 && s_vals[base + i_crtc] && areal < 0) {
+        /* ★ 取 fb 的判据放宽：原来是 `i_crtc >= 0 && s_vals[base+i_crtc]`，
+         *   要求 plane 必须已绑 CRTC。但 KWin 的增量提交里那个 3200 全宽
+         *   plane（实测 obj 92）常常**带非零 FB_ID 却没有 CRTC_ID**，
+         *   于是 areal 恒为 -1、fb 恒为 0、do_split=0，整个分屏改写不执行，
+         *   全宽 plane 原样透传给单个 CRTC → SDE 判超宽 EINVAL。
+         *   现在只要 plane 带非零 FB_ID 就认它，CRTC_ID 允许缺失。 */
+        if (i_fb >= 0 && s_vals[base + i_fb] && areal < 0) {
             areal = (int)o; areal_fb = i_fb; areal_crtc = i_crtc;
             fb = s_vals[base + i_fb];
         }
@@ -897,6 +932,134 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             }
     }
     int do_split = fb != 0;
+    /* ★ 增量提交里 CRTC 项可能不带 MODE_ID ⇒ 用缓存的上一个有效 blob 兜底，
+     *   否则往 SPLIT_CRTC 上写 ACTIVE=1 却没有 MODE_ID，内核仍判无效。 */
+    if (!kblob) kblob = last_mode_blob;
+    /* ★★ 识别并跳过 KWin 的"拆解配置"提交。
+     *
+     * 实测根因（2026-10-12，OPD2511）—— KWin 会周期性发一种提交，内容是
+     * **把已有的分屏配置拆掉**，且它自身就不自洽：
+     *
+     *   FBSCAN: nobj=3 fb=0 p97=0 areal=-1 kact=-1 i206=-1 do_split=0
+     *      o=0 obj=143 oc=3  FB_ID=有 CRTC_ID=有   ← 虚拟半屏 plane
+     *      o=1 obj=92  oc=11 FB_ID=有 CRTC_ID=-    ← 全宽 plane：有 fb 却不绑 crtc
+     *      o=2 obj=200 oc=1  (仅 VRR_ENABLED)      ← CRTC 缺 MODE_ID/ACTIVE
+     *
+     * 这种提交有三重问题：
+     *   1) `areal` 要求 plane 的 CRTC_ID 非 0，而 plane 92 的 CRTC_ID 是 0
+     *      ⇒ `fb` 拿不到（fb=0）⇒ `do_split=0`，分屏改写整段不执行；
+     *   2) 于是走 "strip only"，把 plane 92 带着 FB_ID 原样留给一个
+     *      **没有 ACTIVE 的 CRTC** —— 内核判 EINVAL（-22）；
+     *   3) 内核 dmesg 同时报超宽：
+     *        [_sde_crtc_check_plane_layout] invalid horizontal destination
+     *        x:0 w:3200 hdisp:1600  →  crtc200 failed plane layout check -7
+     *      印证 plane 92 是 3200 全宽，而 SDE 每个 CRTC 上限 1600。
+     *
+     * 后果：KWin 卡在 `nobj=4 成功 → nobj=3 失败 → 重试` 的死循环，
+     * CRTC 200 永远激活不了（kmsdump: ACTIVE=0 fb=0），从来没有帧被扫出来，
+     * 屏幕纯黑，kwin.log 一直刷 "atomic commit failed: 无效的参数"。
+     *
+     * 处理：这类提交**没有可用的显示配置**（既没点亮任何 CRTC，也没法
+     * 安全改写），直接改写成**空提交**让内核返回 0 —— KWin 拿到成功就不会
+     * 卡在重试里，能继续走到它后面那些真正带 ACTIVE 的提交
+     * （那些会走正常的分屏改写路径）。
+     *
+     * ⚠️ 判据要害（第一版踩过坑，务必按这个来）：
+     *    **只看"提交里有没有 ACTIVE=1 的 CRTC"**，有就一律放行。
+     *
+     *    第一版判据是"只要存在'有非零 FB_ID 却不绑 CRTC'的 plane 就跳过"，
+     *    结果**误伤了 KWin 的正常页翻转提交**：那种提交里有
+     *        plane 92 FB_ID=0 CRTC_ID=0      ← 合法的空闲 plane
+     *        obj 200  ACTIVE=1 MODE_ID=0x13a ← 真正点亮的 CRTC
+     *    它是完全健康的配置，却因为别的对象被判 bad_plane 而整体改成空提交，
+     *    于是页翻转全失败（20 次 ret=-22），KWin 依然黑屏。
+     *
+     *    改成"没有 ACTIVE=1 的 CRTC 才跳过"后：
+     *      · nobj=2 flags=0x201（有 obj200 ACTIVE=1）→ 放行，正常页翻转 ✅
+     *      · nobj=3 flags=0x300（obj200 只有 VRR_ENABLED，无 ACTIVE）
+     *        → 跳过，正是那个把 KWin 拖进重试死循环的拆解配置 ✅ */
+    {
+        int bad_plane = 0, has_active_crtc = 0;
+        for (__u32 o = 0; o < nobj && !has_active_crtc; o++) {
+            if ((int)o == p97 || (int)o == pdup) continue;
+            unsigned b2 = eoff[o];
+            int f2 = -1, c2 = -1, a2 = -1;
+            for (__u32 i = 0; i < s_cnts[o]; i++) {
+                const char *nm = pname(s_props[b2 + i]);
+                if (!strcmp(nm, "FB_ID")) f2 = (int)i;
+                else if (!strcmp(nm, "CRTC_ID")) c2 = (int)i;
+                else if (!strcmp(nm, "ACTIVE")) a2 = (int)i;
+            }
+            if (a2 >= 0 && s_vals[b2 + a2] == 1) { has_active_crtc = 1; break; }
+            /* plane（有 FB_ID 属性）带非零 fb，却没绑任何 CRTC */
+            if (f2 >= 0 && s_vals[b2 + f2] != 0 &&
+                (c2 < 0 || s_vals[b2 + c2] == 0))
+                bad_plane = 1;
+        }
+        /* ⚠️ 这里**只记录，不再改写**。
+         *   曾经把这类提交改成空提交来绕开重试死循环，但那只是治标：
+         *   真正的病根是 areal 判据太严 + i206 分支被 kact>=0 挡住，
+         *   已在本函数上面修好。现在这类提交会走正常分屏改写路径，
+         *   被正确补上 ACTIVE/MODE_ID 并拆成两个半屏。
+         *   留着这段日志是为了将来换设备时能一眼看出提交形态。 */
+        if (!has_active_crtc) {
+            static int nlogbad;
+            if (++nlogbad <= 5) {
+                fprintf(LOG, "NOACTIVE: 增量提交（本帧无 ACTIVE CRTC，坏plane=%d）"
+                        " nobj=%u flags=0x%x —— 由分屏改写补 ACTIVE/MODE_ID\n",
+                        bad_plane, nobj, a.flags);
+                fflush(LOG);
+            }
+        }
+    }
+    /* ★ 追踪 do_split 的判据：fb 为什么是 0？
+     *   实测 nobj=3 的真提交里 plane 92 明明带 FB_ID=0x13b，但
+     *   SPLIT 行显示 fb=0 / split=0，于是走"strip only"路径、
+     *   全宽 plane 原样透传给单个 CRTC → SDE 判超宽 EINVAL。 */
+    {
+        static int nfs;
+        if (nfs < 30) {
+            nfs++;
+            fprintf(LOG, "FBSCAN: nobj=%u fb=%llu p97=%d pdup=%d areal=%d kact=%d "
+                    "iconn=%d i206=%d do_split=%d\n",
+                    nobj, fb, p97, pdup, areal, kact, iconn, i206, do_split);
+            for (__u32 o = 0; o < nobj && o < 12; o++) {
+                unsigned b2 = eoff[o];
+                int f2 = -1, c2 = -1;
+                for (__u32 i = 0; i < s_cnts[o]; i++) {
+                    const char *nm = pname(s_props[b2 + i]);
+                    if (!strcmp(nm, "FB_ID")) f2 = (int)i;
+                    else if (!strcmp(nm, "CRTC_ID")) c2 = (int)i;
+                }
+                fprintf(LOG, "   o=%u obj=%u oc=%u FB_ID=%s CRTC_ID=%s\n",
+                        o, s_objs[o], s_cnts[o],
+                        f2 >= 0 ? "有" : "-", c2 >= 0 ? "有" : "-");
+            }
+            fflush(LOG);
+        }
+    }
+    /* ★★ KWINWRAP_NO_SPLIT=1：**禁用分屏改写，让 KWin 的原始提交透传**。
+     *
+     * 为什么要这个开关（实测 2026-10-12，OPD2511）：
+     *   安卓侧内核日志显示这块 DSI 面板是**完整宽度单模式**：
+     *       dsi_display_set_mode: hactive=3200, vactive=2000, fps=144
+     *       modes = 3200x2000x{120,144,90,60}vid
+     *   也就是说安卓用一个 CRTC + 一个 3200 宽平面就能点亮它。
+     *   而分屏改写把面板当成两个 1600 宽半屏（SPLIT_W=1600，
+     *   半屏 plane 143/147 各覆盖一半）来驱动 —— 这是历史包袱，
+     *   文件里"一个全宽平面无法驱动该面板"那句注释与安卓实测矛盾。
+     *
+     *   分屏改写的实际后果（kwinatomic.log）：KWin 的 nobj=3 真提交被
+     *   改写成只剩 2 个对象（丢了 connector 和 CRTC 的 MODE_ID/ACTIVE），
+     *   内核判 EINVAL；于是 CRTC 200 永远激活不了（kmsdump: ACTIVE=0 fb=0），
+     *   **从来没有帧被扫描出来**，KWin 一直刷
+     *   "kwin_wayland_drm: atomic commit failed: 无效的参数"。
+     *
+     *   打开这个开关后 kwinwrap 仍然做它必须做的事（pre-disable 清安卓
+     *   遗留状态、写亮度/DPMS、DROP_MASTER、降权、exec kwin），
+     *   只是**不再改写 atomic 提交** —— 让 KWin 按它自己的全宽平面走，
+     *   与安卓一致。 */
+    if (getenv("KWINWRAP_NO_SPLIT")) do_split = 0;
     if (do_split && kact >= 0 && !kblob) {
         __u32 mp = find_prop(SPLIT_CRTC, DRM_MODE_OBJECT_CRTC, "MODE_ID");
         drmModeObjectProperties *cp =
@@ -917,10 +1080,25 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             fprintf(LOG, "\n");
             fflush(LOG);
         }
-        return;
+        /* ★ 例外：如果是被判定的"拆解配置"提交，**不要**在这里返回 ——
+         *   要继续往下走，让构建循环产出一个**空提交**（no=0）写回 child，
+         *   内核收到空提交返回 0，KWin 才不会卡在重试死循环里。
+         *   见上面 SKIP-BAD 段的完整说明。 */
+        if (!skip_bad) return;
     }
     __u32 virt_id = p97 >= 0 ? s_objs[p97] :
                     (areal >= 0 ? s_objs[areal] : 0);
+    if (getenv("KWINWRAP_NO_SPLIT")) {
+        /* ★ 完全不改写，KWin 的原始提交透传（flags 的 ALLOW_MODESET 改写
+         * 已经在函数开头写回 child 了，那一条要保留）。 */
+        static int nopass;
+        if (++nopass <= 3) {
+            fprintf(LOG, "NO-SPLIT: 透传 KWin 原始提交（nobj=%u flags=0x%x）\n",
+                    nobj, a.flags);
+            fflush(LOG);
+        }
+        return;
+    }
     if (!do_split) {
         static int nskip;
         if (++nskip <= 3) {
@@ -1009,11 +1187,23 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             continue;
         }
         if (do_split && (int)o == areal) {
-            /* disable the real full-width plane we took the fb from */
-            s_props2[np] = s_props[off + areal_fb]; s_vals2[np++] = 0;
-            s_props2[np] = s_props[off + areal_crtc]; s_vals2[np++] = 0;
+            /* 把取 fb 的那个全宽 plane 关掉。
+             *
+             * ★★ 关键：**必须显式补 CRTC_ID=0**，不能只置 FB_ID=0。
+             *   实测踩坑：KWin 的增量提交里 plane 92 常常**根本没有 CRTC_ID
+             *   属性**（它没打算改绑定），于是原来的代码只写 FB_ID=0，
+             *   内核那边 plane 92 仍然挂在 CRTC 200 上、且保留着
+             *   CRTC_W=3200 —— `_sde_crtc_check_plane_layout` 照样检查它，
+             *   报 "invalid horizontal destination / x:0 w:3200 hdisp:1600"，
+             *   整个提交 EINVAL。补上 CRTC_ID=0 才是真正解除绑定。 */
+            __u32 nc = 0;
+            s_props2[np] = s_props[off + areal_fb]; s_vals2[np++] = 0; nc++;
+            __u32 cp = (areal_crtc >= 0)
+                           ? s_props[off + areal_crtc]
+                           : find_prop(s_objs[o], DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+            if (cp) { s_props2[np] = cp; s_vals2[np++] = 0; nc++; }
             s_objs[no] = s_objs[o];
-            s_cnts[no] = 2;
+            s_cnts[no] = nc;
             no++;
             off += oc;
             continue;
@@ -1030,13 +1220,22 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             no++;
             continue;
         }
-        if (do_split && (int)o == i206 && kact >= 0) {
+        /* ★ 去掉原来的 `&& kact >= 0` 限制。
+         *   这是黑屏的**最后一环**：KWin 的真·页翻转提交里 CRTC 200 只有
+         *   VRR_ENABLED（增量提交，不重申 ACTIVE/MODE_ID），于是 kact=-1，
+         *   整个分支不执行 ⇒ 面板永远没人把它 ACTIVE 起来。
+         *   现在无条件进入，并在缺属性时**补上** ACTIVE=1 与 MODE_ID。 */
+        if (do_split && (int)o == i206) {
             for (__u32 i = 0; i < oc; i++, off++) {
                 __u64 v = s_vals[off];
                 if ((int)i == i206_act) v = 1;
                 else if (i206_mode >= 0 && (int)i == i206_mode) v = kblob;
                 s_props2[np] = s_props[off];
                 s_vals2[np++] = v;
+            }
+            if (i206_act < 0) {
+                __u32 pa = find_prop(SPLIT_CRTC, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+                if (pa) { s_props2[np] = pa; s_vals2[np++] = 1; oc++; }
             }
             if (i206_mode < 0 && kblob) {
                 __u32 mp = find_prop(SPLIT_CRTC, DRM_MODE_OBJECT_CRTC, "MODE_ID");
@@ -1073,6 +1272,22 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
                            v != 0xffffffffffffffffULL) {
                     planeish = 1; active = 1; break;
                 }
+            }
+            /* ★ 追踪：这条"丢弃 no-op plane"规则到底吃掉了什么对象。
+             *   实测分屏下 KWin 会发 nobj=3 的真提交，改写后只剩 2 个对象、
+             *   内核判 EINVAL，CRTC 永远激活不了（kmsdump: ACTIVE=0 fb=0）。
+             *   这里把被丢弃对象的身份与关键属性记下来，才能确定它是不是 plane。 */
+            static int ndrop;
+            if (ndrop < 30) {
+                ndrop++;
+                fprintf(LOG, "DROP-CAND: obj=%u oc=%u planeish=%d active=%d => %s | props:",
+                        s_objs[o], oc, planeish, active,
+                        (planeish && !active) ? "丢弃" : "保留");
+                for (__u32 i = 0; i < oc && i < 14; i++)
+                    fprintf(LOG, " %s#%u=0x%llx", pname(s_props[off + i]),
+                            s_props[off + i], s_vals[off + i]);
+                fprintf(LOG, "\n");
+                fflush(LOG);
             }
             if (planeish && !active) { off += oc; continue; }
         }
@@ -1673,6 +1888,43 @@ int main(int argc, char **argv) {
             fflush(LOG);
         } else {
             fprintf(LOG, "kwinwrap: 找不到 conn%u 的 DPMS 属性\n", SPLIT_CONN);
+            fflush(LOG);
+        }
+
+        /* ── DSC（Display Stream Compression）开关 ─────────────────────
+         * 本机面板是 **DSC 面板**：
+         *   - 内核 cmdline: msm_drm.dsi_display0=qcom,mdss_dsi_nt36532_wqhd_dual_dsi_dsc_vid
+         *   - conn67 的 topology_name = 13 = sde_quadpipe_dscmerge（只读，驱动定）
+         * 但接管时 conn67 的 dsc_mode 停在 0(none)：DSI 链路按**未压缩**送数据，
+         * 面板却按 DSC 解 → 满屏细密横条纹 + 彩虹色偏（实测照片，看不出任何图形）。
+         *
+         * dsc_mode 与 DPMS 一样 **flags 里没有 DRM_MODE_PROP_ATOMIC**，
+         * 所以只能走非原子 DRM_IOCTL_MODE_OBJ_SETPROPERTY，
+         * 且必须赶在 DROP_MASTER 之前（之后一律 EACCES）。
+         * 时机正好：此刻预关闭提交已把 CRTC 关掉、KWin 还没 exec，
+         * 面板处于熄灭态 ⇒ 先告诉它"要收 DSC"，再由 KWin 的 modeset
+         * 重新初始化 DSI，链路才会按 DSC 建起来。
+         * KWINWRAP_NO_DSC=1 可关掉（对照实验用）。 */
+        if (!getenv("KWINWRAP_NO_DSC")) {
+            __u32 dsc_prop = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR,
+                                       "dsc_mode");
+            if (dsc_prop) {
+                struct drm_mode_obj_set_property dq = {
+                    .obj_id = SPLIT_CONN, .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+                    .prop_id = dsc_prop, .value = 1,   /* dsc_enabled */
+                };
+                errno = 0;
+                int qr = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &dq);
+                fprintf(LOG, "kwinwrap: DSC=dsc_enabled(conn%u prop=%u) ret=%d %s\n",
+                        SPLIT_CONN, dsc_prop, qr, qr ? strerror(errno) : "OK");
+                fflush(LOG);
+            } else {
+                fprintf(LOG, "kwinwrap: 找不到 conn%u 的 dsc_mode 属性\n",
+                        SPLIT_CONN);
+                fflush(LOG);
+            }
+        } else {
+            fprintf(LOG, "kwinwrap: KWINWRAP_NO_DSC=1 —— 跳过 DSC 设置（对照实验）\n");
             fflush(LOG);
         }
     }
