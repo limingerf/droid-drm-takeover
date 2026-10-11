@@ -125,6 +125,10 @@ static int SPLIT_DISCOVERED;               /* 1 = 运行时发现成功 */
  * blend_op/alpha/zpos/rotation 这 4 个非原子属性还没设（alpha=0 全透明），
  * 校验可能只对"不透明层"生效。补上属性后值得重测链路内形式。 */
 static int SPLIT_DST_INTERLEAVE;
+/* 逐帧调试痕迹总开关。默认关：FBSCAN / DROP-CAND / NOACTIVE / EVDROP /
+ * BUILT 这些每帧都会打，正常运行时会把 kwinatomic.log 撑到几十 MB。
+ * 真机上没法接调试器，所以不删掉，改成 KWINWRAP_TRACE=1 按需打开。 */
+static int TRACE;
 
 static unsigned split_dst_x(int i) {
     return SPLIT_DST_INTERLEAVE ? (unsigned)(i % 2) * SPLIT_W
@@ -1125,7 +1129,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
          *   已在本函数上面修好。现在这类提交会走正常分屏改写路径，
          *   被正确补上 ACTIVE/MODE_ID 并拆成两个半屏。
          *   留着这段日志是为了将来换设备时能一眼看出提交形态。 */
-        if (!has_active_crtc) {
+        if (!has_active_crtc && TRACE) {
             static int nlogbad;
             if (++nlogbad <= 5) {
                 fprintf(LOG, "NOACTIVE: 增量提交（本帧无 ACTIVE CRTC，坏plane=%d）"
@@ -1141,7 +1145,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
      *   全宽 plane 原样透传给单个 CRTC → SDE 判超宽 EINVAL。 */
     {
         static int nfs;
-        if (nfs < 30) {
+        if (TRACE && nfs < 30) {
             nfs++;
             fprintf(LOG, "FBSCAN: nobj=%u fb=%llu p97=%d pdup=%d areal=%d kact=%d "
                     "iconn=%d i206=%d do_split=%d\n",
@@ -1279,7 +1283,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             }
             if (is_crtc && !lit) {
                 static int nevd;
-                if (++nevd <= 3) {
+                if (TRACE && ++nevd <= 3) {
                     fprintf(LOG, "EVDROP: off crtc %u stripped from 0x%x (#%d)\n",
                             s_objs[o], a.flags, nevd);
                     fflush(LOG);
@@ -1405,7 +1409,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
              *   内核判 EINVAL，CRTC 永远激活不了（kmsdump: ACTIVE=0 fb=0）。
              *   这里把被丢弃对象的身份与关键属性记下来，才能确定它是不是 plane。 */
             static int ndrop;
-            if (ndrop < 30) {
+            if (TRACE && ndrop < 30) {
                 ndrop++;
                 fprintf(LOG, "DROP-CAND: obj=%u oc=%u planeish=%d active=%d => %s | props:",
                         s_objs[o], oc, planeish, active,
@@ -1524,7 +1528,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
     }
 
     static int ndebug;
-    if (++ndebug <= 12) {
+    if (TRACE && ++ndebug <= 12) {
         fprintf(LOG, "BUILT: flags=0x%x no=%u np=%u total=%u cnts[", a.flags, no, np, total);
         for (__u32 i = 0; i < no; i++)
             fprintf(LOG, "%u,", s_cnts[i]);
@@ -1847,6 +1851,9 @@ int main(int argc, char **argv) {
             KEEP_OBJS[0], KEEP_OBJS[1], KEEP_OBJS[2], NKEEP);
 
     HIJACK = getenv("KWINWRAP_HIJACK") ? 1 : 0;
+    TRACE  = getenv("KWINWRAP_TRACE")  ? 1 : 0;
+    if (TRACE)
+        fprintf(LOG, "kwinwrap: KWINWRAP_TRACE=1 —— 逐帧调试痕迹已开启\n");
     if (HIJACK && DRMFD >= 0) {
         /* The FIRST open of card0 auto-becomes master when master is free
          * (drm_master_open -> drm_new_set_master), so never SET_MASTER on a
