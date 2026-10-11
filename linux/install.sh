@@ -91,9 +91,15 @@ else
     say "  ⚠️ 没有 bin/ —— 请在容器里先 make（否则 kwinwrap 等工具缺失）"
 fi
 
-chmod +x "$PREFIX/core/switch.sh" "$PREFIX/linux/drm-switch.sh" 2>/dev/null
-chmod +x "$PREFIX"/display/*.sh 2>/dev/null
-find "$PREFIX/bin" -type f -exec chmod +x {} \; 2>/dev/null
+# 可执行位：脚本一律 `sh <路径>` 调用，严格说不需要 x 位；
+# 但 bin/ 下的产物是**被直接 exec** 的（kwinwrap / setbright / setprop），
+# 少一个 x 位就会 "Permission denied"。
+# 一次性给全树 .sh 加 x，比逐个目录列举可靠（原来漏了 core/lib、core/device、
+# linux/session-up.sh、android/*.sh）。
+find "$PREFIX" -name '*.sh' -type f -exec chmod 755 {} + 2>/dev/null
+if [ -d "$PREFIX/bin" ]; then
+    find "$PREFIX/bin" -type f -exec chmod 755 {} + 2>/dev/null
+fi
 
 # ── 2) 启动器 wrapper ─────────────────────────────────────
 mkdir -p "$BIN_DIR" 2>/dev/null

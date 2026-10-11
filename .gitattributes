@@ -1,0 +1,45 @@
+# ══════════════════════════════════════════════════════════════════════
+# 行尾统一 LF —— 这不是风格问题，是功能问题。
+#
+# 本项目交付的是 shell 脚本，会被直接投放到安卓（mksh）和容器（dash/bash）
+# 里执行。Windows 上 `core.autocrlf=true`（默认值）会把它们 checkout 成 CRLF，
+# 而 `#!/bin/sh\r` 在 Linux 上会直接 "not found" —— 一个字节就能让整条
+# 接管链失效，而且现象（脚本"不存在"）极具误导性。
+#
+# 显式声明比依赖每个人的 git 配置可靠。
+# ══════════════════════════════════════════════════════════════════════
+
+# 默认：git 判为文本的文件，仓库内存 LF，checkout 也是 LF
+* text=auto eol=lf
+
+# shell 脚本：明确 LF（这是最关键的一类）
+*.sh    text eol=lf
+*.bash  text eol=lf
+
+# 其余文本
+*.c      text eol=lf
+*.h      text eol=lf
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.json   text eol=lf
+*.java   text eol=lf
+*.xml    text eol=lf
+*.conf   text eol=lf
+*.example text eol=lf
+Makefile text eol=lf
+.gitignore    text eol=lf
+.gitattributes text eol=lf
+
+# 二进制：不要碰
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.webp    binary
+*.ico     binary
+*.keystore binary
+*.jks     binary
+*.jar     binary
+*.apk     binary
+*.so      binary
+*.dex     binary

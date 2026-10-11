@@ -36,11 +36,23 @@ final class Payload {
 
     /**
      * 建目录 + 落文件 + 收权限，两个安装方式共用的收尾片段。
-     * 目录给 700（root 独占），整棵树去掉 group/other 写位。
+     *
+     * 两件事都要做，别只做一件：
+     *   · `chmod -R go-w` 去掉 group/other 的写位 —— 这些脚本随后以 root 执行，
+     *     不能让非 root 有机会改它们。
+     *   · `chmod 755` 给 bin/ 和 .sh 补上执行位 —— tar/cp 可能带来 644，
+     *     而 `bin/kwinwrap` 是被直接 exec 的（不是 `sh kwinwrap`）。
+     *     早期版本只做前者，结果二进制不可执行。
      */
     private static final String LOCKDOWN =
             "chmod 700 \"$D\" 2>/dev/null\n"
             + "chmod -R go-w \"$D\" 2>/dev/null\n"
+            // bin/ 下的产物要被直接 exec
+            + "chmod 755 \"$D\"/bin/* 2>/dev/null\n"
+            // 脚本统一用 `sh <路径>` 调用，执行位不是必需，但给上更符合直觉
+            + "chmod 755 \"$D\"/*.sh \"$D\"/core/*.sh \"$D\"/core/lib/*.sh "
+            + "\"$D\"/core/device/*.sh \"$D\"/linux/*.sh \"$D\"/display/*.sh "
+            + "\"$D\"/android/*.sh 2>/dev/null\n"
             + "if [ -f \"$D/" + MARKER + "\" ]; then echo " + OK + "; "
             + "else echo " + BAD + "; exit 1; fi\n";
 
