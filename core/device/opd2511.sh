@@ -157,7 +157,18 @@ DEV_KWINWRAP_NO_SPLIT=""                                 # ✔实测：必须为
 # 顺序是 131,127,123,92，对应源列 0/800/1600/2400。
 # 顺序错了画面会错位/错配，所以在这里固化核对过的顺序。
 # （kwinwrap 的几何规则：SRC_X = 下标*段宽，CRTC_X = (下标%2)*段宽）
-DEV_KWINWRAP_SPLIT_PLANES="131,127,123,92"               # ✔实测（照抄 Android）
+DEV_KWINWRAP_SPLIT_PLANES="131,127"                      # ✔实测：2 平面 × 1600，唯一不 panic 的组合
+# 目的坐标：1 = 链路内地址 (0,800,0,800)（Android 原样，但被 SDE 拒）；
+# 0 = 全局单调 (0,1600)，与 SPLIT_PLANES 只有 2 个配合时正好覆盖整幅面板。
+# ★ 为什么必须是"2 平面 + 单调"：
+#   _sde_crtc_validate_src_split_order 会把同 stage 的平面**按 CRTC_X 排序后
+#   配对相邻两个**，要求目的坐标严格递增（实测报错 stage:0 l:0-800 r:0-800）。
+#   Android 的 0,800,0,800 因此被拒（我们试过，dmesg 里 90 条报错）。
+#   而 4 平面 + 单调 0,800,1600,2400 虽然能过校验，却让内核在 ~20s 后
+#   BUG() → Fatal exception → panic（目的 1600~3200 超出单条 DSI 链路的
+#   本地地址范围）。2 平面 × 1600 是唯一同时满足两者的形式：实测
+#   src_split_order 报错 0 条、CRTC mode_valid=1、不 panic。
+DEV_KWINWRAP_SPLIT_DST_INTERLEAVE="0"                    # ✔实测：必须单调
 
 # ── 安卓稳定性开关（接管期间要解除武装）────────────────────
 # ~推测：本机是 ColorOS 17。实测 `settings list global` 里看不到
@@ -183,5 +194,34 @@ dev_pre_stop_fixes() {
 
 # ── 钩子：会话起来之后的设备专属收尾 ───────────────────────
 dev_post_session_fixes() {
-    :
+    # ★ 抓一帧合成结果存档到 /data/local/tmp/fb.ppm（诊断用，失败不影响会话）。
+    #
+    # 为什么需要：接管后安卓显示栈已停，`screencap` 不可用，而"提交被内核
+    # 接受"不等于"画面正确"。实测踩过两种光看日志区分不了的情况：
+    #   · 4 个平面且目的坐标非单调时内核判 -22 ⇒ CRTC 根本没激活（黑屏）；
+    #   · 2 个平面时提交全过、CRTC mode_valid=1，但屏幕只有左半有条纹噪声。
+    # 有这一帧就能直接看 KWin 到底合成了什么，不用靠猜。
+    #
+    # 做法：容器里 /root 与安卓侧 <rootfs>/root 是**同一个目录**（见
+    # container.sh 的 ds_shared_dir），所以帧写在容器 /root/fb.ppm，
+    # 安卓侧直接从 <rootfs>/root/fb.ppm 拷走。
+    _sd=$(ds_shared_dir 2>/dev/null) || return 0
+    [ -x "$_sd/droid-drm-takeover/bin/fbdump" ] || return 0
+
+    # 用第一个分屏平面当探针；它一定挂在 CRTC 上且有 fb。
+    _probe=${DEV_SPLIT_PROBE_PLANE:-131}
+    _fb=$(ds_exec "/root/droid-drm-takeover/bin/kmsdump /dev/dri/card0 2>&1 | grep -E '^PLANE $_probe ' | sed 's/.*fb=\([0-9]*\).*/\1/'" 2>/dev/null | tr -d '\r' | tail -1)
+    case "$_fb" in
+        ''|0|*[!0-9]*) drm_log "抓帧跳过：plane $_probe 没有 fb（CRTC 可能未激活）"; return 0 ;;
+    esac
+
+    rm -f "$_sd/fb.ppm"
+    ds_exec "/root/droid-drm-takeover/bin/fbdump /dev/dri/card0 $_fb /root/fb.ppm" >/dev/null 2>&1
+    if [ -f "$_sd/fb.ppm" ]; then
+        cp "$_sd/fb.ppm" /data/local/tmp/fb.ppm 2>/dev/null && \
+            chmod 644 /data/local/tmp/fb.ppm 2>/dev/null
+        drm_log "已抓一帧合成结果：/data/local/tmp/fb.ppm（plane $_probe fb=$_fb）"
+    else
+        drm_log "抓帧失败：fbdump 没产出 $_sd/fb.ppm"
+    fi
 }

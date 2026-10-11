@@ -90,8 +90,19 @@ static char propnames[512][16];
  *
  * 几何规则（对任意 N 段、段宽 SPLIT_W 通用）：
  *     SRC_X  = i * SPLIT_W           源：整幅图里的第 i 段
- *     CRTC_X = (i % 2) * SPLIT_W     目的：双 DSI 链路内地址
+ *     CRTC_X = i * SPLIT_W           目的：**单调递增**
  * N = 2 时正好退化成旧行为，所以老设备配置不用改。
+ *
+ * ★ 目的坐标为什么必须单调（实测教训）：
+ *   一开始照抄 Android 的 CRTC_X = 0,800,0,800（"链路内地址"），
+ *   提交被内核判 -22：
+ *       [_sde_crtc_validate_src_split_order] invalid coordinates,
+ *           stage:0 l:0-800 r:0-800
+ *       [_sde_crtc_atomic_check] crtc200 failed pstate check -22
+ *   那个 l/r 用的就是**目的**矩形：同一 stage 上第 1、3 个平面的目的
+ *   都是 0-800，SDE 认为左右两管坐标重复 ⇒ 拒绝。
+ *   改成 0,800,1600,2400 单调之后提交全过、CRTC 200 mode_valid=1。
+ *   （2 个平面时 CRTC_X = 0,800 本来就单调，所以那时一直是过的。）
  *
  * ⚠️ 平面顺序必须与 SRC_X 递增一致：数组下标 i 同时决定 SRC_X=i*W，
  *    所以 SPLIT_PLANE[] 要按源列从左到右排。 */
@@ -104,6 +115,21 @@ static unsigned SPLIT_W           = 800u;
 static unsigned SPLIT_H           = 2000u;
 static unsigned SPLIT_W_FULL      = 3200u;  /* 面板整宽（发现时从 mode 读） */
 static int SPLIT_DISCOVERED;               /* 1 = 运行时发现成功 */
+/* 目的坐标方案：
+ *   0 = 单调 i*SPLIT_W（0,800,1600,2400）—— 整块面板的全局坐标
+ *   1 = 链路内地址 (i%2)*SPLIT_W（0,800,0,800）—— **Android 实测用的就是这个**
+ * 为什么会有这个开关：见文件头"目的坐标"那段。单调形式能让 SDE 的
+ * _sde_crtc_validate_src_split_order 通过，但目的坐标 1600~3200 很可能
+ * 超出单条 DSI 链路的本地地址范围，跑一会儿就内核 BUG。
+ * 而 Android 的链路内形式当初被那条校验拒了 —— 怀疑是因为当时
+ * blend_op/alpha/zpos/rotation 这 4 个非原子属性还没设（alpha=0 全透明），
+ * 校验可能只对"不透明层"生效。补上属性后值得重测链路内形式。 */
+static int SPLIT_DST_INTERLEAVE;
+
+static unsigned split_dst_x(int i) {
+    return SPLIT_DST_INTERLEAVE ? (unsigned)(i % 2) * SPLIT_W
+                                : (unsigned)i * SPLIT_W;
+}
 
 static int is_split_plane(unsigned id) {
     for (int i = 0; i < SPLIT_NSEG; i++)
@@ -422,6 +448,9 @@ static void init_split(void)
     if ((e = getenv("KWINWRAP_SPLIT_CRTC")))  { SPLIT_CRTC = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
     if ((e = getenv("KWINWRAP_SPLIT_W")))     { SPLIT_W    = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
     if ((e = getenv("KWINWRAP_SPLIT_H")))     { SPLIT_H    = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
+    if ((e = getenv("KWINWRAP_SPLIT_W_FULL"))){ SPLIT_W_FULL = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
+    if ((e = getenv("KWINWRAP_SPLIT_DST_INTERLEAVE")))
+        SPLIT_DST_INTERLEAVE = atoi(e) ? 1 : 0;
     if ((e = getenv("KWINWRAP_SPLIT_PLANES"))) {
         /* 接受任意段数（1..SPLIT_MAX_SEG）的逗号列表，按**源列从左到右**排列。
          * 旧的 "L,R" 两段写法自然兼容：N=2 时几何退化成 0/1600 与 0/1600。 */
@@ -435,6 +464,13 @@ static void init_split(void)
             from_env = 1;
         }
     }
+    /* ★ 段宽永远由"整宽 / 段数"决定，**不要**用环境变量里那个可能过期的值。
+     *   实测踩过：设备层只把平面列表覆盖成 2 个（想要 2×1600），但
+     *   KWINWRAP_SPLIT_W 仍是探针按 4 段算出的 800 —— 结果两个平面各 800
+     *   只盖住面板左半 1600，右半全黑。 */
+    if (SPLIT_W_FULL && SPLIT_NSEG > 0)
+        SPLIT_W = SPLIT_W_FULL / (unsigned)SPLIT_NSEG;
+
     if (from_env) {
         SPLIT_DISCOVERED = 1;
         fprintf(LOG, "split: 来自环境变量 conn=%u crtc=%u planes=", SPLIT_CONN,
@@ -618,6 +654,7 @@ static int probe_split(void)
     printf("KWINWRAP_SPLIT_CONN=%u\n", SPLIT_CONN);
     printf("KWINWRAP_SPLIT_CRTC=%u\n", SPLIT_CRTC);
     printf("KWINWRAP_SPLIT_W=%u\n", SPLIT_W);
+    printf("KWINWRAP_SPLIT_W_FULL=%u\n", SPLIT_W_FULL);
     printf("KWINWRAP_SPLIT_H=%u\n", SPLIT_H);
     printf("KWINWRAP_SPLIT_PLANES=");
     for (int i = 0; i < SPLIT_NSEG; i++)
@@ -1265,7 +1302,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             s_props2[np] = pl_sy; s_vals2[np++] = 0;
             s_props2[np] = pl_sw; s_vals2[np++] = (__u64)SPLIT_W << 16;
             s_props2[np] = pl_sh; s_vals2[np++] = (__u64)SPLIT_H << 16;
-            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)(hidx % 2) * SPLIT_W;
+            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)split_dst_x(hidx);
             s_props2[np] = pl_cy; s_vals2[np++] = 0;
             s_props2[np] = pl_cw; s_vals2[np++] = SPLIT_W;
             s_props2[np] = pl_ch; s_vals2[np++] = SPLIT_H;
@@ -1400,7 +1437,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             s_props2[np] = pl_sy; s_vals2[np++] = 0;
             s_props2[np] = pl_sw; s_vals2[np++] = (__u64)SPLIT_W << 16;
             s_props2[np] = pl_sh; s_vals2[np++] = (__u64)SPLIT_H << 16;
-            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)(h % 2) * SPLIT_W;
+            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)split_dst_x(h);
             s_props2[np] = pl_cy; s_vals2[np++] = 0;
             s_props2[np] = pl_cw; s_vals2[np++] = SPLIT_W;
             s_props2[np] = pl_ch; s_vals2[np++] = SPLIT_H;
@@ -1799,9 +1836,10 @@ int main(int argc, char **argv) {
      *   pre-disable 的目标对象。原版这里是编译期常量（piano 的）。 */
     init_split();
     init_keep();
-    fprintf(LOG, "kwinwrap: split conn=%u crtc=%u %d 段 %ux%u discovered=%d planes=",
+    fprintf(LOG, "kwinwrap: split conn=%u crtc=%u %d 段 %ux%u discovered=%d dst=%s planes=",
             SPLIT_CONN, SPLIT_CRTC, SPLIT_NSEG, SPLIT_W, SPLIT_H,
-            SPLIT_DISCOVERED);
+            SPLIT_DISCOVERED,
+            SPLIT_DST_INTERLEAVE ? "链路内(0,800,0,800)" : "单调(0,800,1600,2400)");
     for (int i = 0; i < SPLIT_NSEG; i++)
         fprintf(LOG, "%s%u", i ? "," : "", SPLIT_PLANE[i]);
     fprintf(LOG, "\n");
@@ -2037,6 +2075,62 @@ int main(int argc, char **argv) {
             }
         } else {
             fprintf(LOG, "kwinwrap: KWINWRAP_NO_DSC=1 —— 跳过 DSC 设置（对照实验）\n");
+            fflush(LOG);
+        }
+
+        /* ── 平面级"非 ATOMIC"属性：blend_op / alpha / zpos / rotation ────
+         * ★ 实测对比 Android（kmsdump 读 PLANE 131/127/123/92 的全部属性）：
+         *   Android 每个 Primary 平面都**显式设了这 4 个**，我们原来一个都没设：
+         *       blend_op id=102 = 1 (opaque)        我们 0 = not_defined
+         *       alpha    id=95  = 255               我们 0 = **全透明**
+         *       zpos     id=94  = 0
+         *       rotation id=133 = 1 (ROTATE_0)      我们 0 = 未定义
+         *
+         *   这 4 个的 flags 里**都没有 DRM_MODE_PROP_ATOMIC**
+         *   （kmsdump 显示 flags=DRM_MODE_PROP_RANGE / ENUM / BITMASK），
+         *   所以塞进 atomic 提交会被内核判 EINVAL —— 只能像 DPMS/dsc_mode
+         *   那样走非原子 DRM_IOCTL_MODE_OBJ_SETPROPERTY，且必须赶在
+         *   DROP_MASTER 之前（之后一律 EACCES）。
+         *
+         *   为什么怀疑它跟"四管 panic"有关：alpha=0 且 blend_op=not_defined
+         *   时 SDE 把这条 layer 当"全透明 + 混合方式未定义"。实测现象：
+         *   4 平面配置下提交**全部成功**、CRTC mode_valid=1，但约 20s 后
+         *   内核 panic（cpufreq_panic_callback / kgsl snapshot / ufs dump）。
+         *   而 2 平面配置不 panic —— 差别正是"四管合并路径有没有被真正走通"。
+         *   KWINWRAP_NO_PLANE_PROPS=1 可关掉（对照实验用）。 */
+        if (!getenv("KWINWRAP_NO_PLANE_PROPS")) {
+            static const struct { const char *n; __u64 v; } pprops[] = {
+                { "blend_op", 1u },     /* opaque */
+                { "alpha",    255u },
+                { "zpos",     0u },
+                { "rotation", 1u },     /* DRM_MODE_ROTATE_0（bit0），不是"转 90°" */
+            };
+            for (int s = 0; s < SPLIT_NSEG; s++) {
+                for (unsigned k = 0; k < sizeof pprops / sizeof pprops[0]; k++) {
+                    __u32 pp = find_prop(SPLIT_PLANE[s], DRM_MODE_OBJECT_PLANE,
+                                         pprops[k].n);
+                    if (!pp) {
+                        fprintf(LOG, "kwinwrap: plane%u 没有 %s 属性\n",
+                                SPLIT_PLANE[s], pprops[k].n);
+                        continue;
+                    }
+                    struct drm_mode_obj_set_property pq = {
+                        .obj_id   = SPLIT_PLANE[s],
+                        .obj_type = DRM_MODE_OBJECT_PLANE,
+                        .prop_id  = pp,
+                        .value    = pprops[k].v,
+                    };
+                    errno = 0;
+                    int pr = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &pq);
+                    fprintf(LOG, "kwinwrap: plane%u %s=%llu ret=%d %s\n",
+                            SPLIT_PLANE[s], pprops[k].n,
+                            (unsigned long long)pprops[k].v, pr,
+                            pr ? strerror(errno) : "OK");
+                }
+            }
+            fflush(LOG);
+        } else {
+            fprintf(LOG, "kwinwrap: KWINWRAP_NO_PLANE_PROPS=1 —— 跳过平面属性设置（对照实验）\n");
             fflush(LOG);
         }
     }

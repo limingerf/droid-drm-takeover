@@ -563,6 +563,15 @@ KWINWRAP_SPLIT_PLANES=$DEV_KWINWRAP_SPLIT_PLANES"
         drm_log "split 平面顺序由设备适配层固定：$DEV_KWINWRAP_SPLIT_PLANES"
     fi
 
+    # ★ 目的坐标方案也由设备层定：1 = 链路内地址 (0,800,0,800)，
+    #   与 Android 实测一致；0 = 全局单调 (0,800,1600,2400)。
+    #   取舍理由见 tools/runtime/kwinwrap.c 里 SPLIT_DST_INTERLEAVE 的注释。
+    if [ -n "${DEV_KWINWRAP_SPLIT_DST_INTERLEAVE:-}" ]; then
+        _raw="$_raw
+KWINWRAP_SPLIT_DST_INTERLEAVE=$DEV_KWINWRAP_SPLIT_DST_INTERLEAVE"
+        drm_log "split 目的坐标方案：$DEV_KWINWRAP_SPLIT_DST_INTERLEAVE（1=链路内地址）"
+    fi
+
     drm_log "kwinwrap split 几何（运行时发现）："
     printf '%s\n' "$_raw" | while IFS= read -r _l; do
         [ -n "$_l" ] && drm_log "  $_l"
@@ -772,6 +781,37 @@ drm_start_kwin() {
     if ! drm_logind_session_start; then
         drm_err "拿不到 logind 会话，KWin 无法打开 $DEV_DRM_CARD"
         return 1
+    fi
+
+    # ── 抹掉 KWin 持久化的"合成器已禁用" ─────────────────────────
+    #
+    # ★★ 实测踩到的坑（症状：面板纯黑，但 DRM 侧一切正常）：
+    #   KWin 的 OpenGL 场景一旦初始化失败（日志里那句
+    #       kwin_scene_opengl: couldn't find dev node for drm device
+    #       kwin_core: Failed to open drm node: ""
+    #   ），它会把
+    #       [Compositing]
+    #       Enabled=false
+    #   **写进 $HOME/.config/kwinrc 持久化**。之后哪怕 DRM、EGL、权限
+    #   全都恢复正常，KWin 也永远不再合成 —— 输出缓冲全零。
+    #
+    #   实测证据：CRTC 200 mode_valid=1、两个 Primary 平面都绑上、
+    #   fb=316（3200x2000 AR30），但 fbdump 出来的帧**只有一种颜色**（全黑）；
+    #   同时 kwinrc 里就是 Enabled=false。
+    #
+    #   所以每轮接管前必须把这个残留清掉（整行删掉，KWin 会回到默认=开）。
+    _kwinrc="$DESKTOP_HOME/.config/kwinrc"
+    if [ -f "$_kwinrc" ] && grep -qE '^[[:space:]]*Enabled[[:space:]]*=[[:space:]]*false' "$_kwinrc"; then
+        drm_log "清掉 kwinrc 里残留的 [Compositing] Enabled=false（否则合成器永不启动）"
+        _ktmp=$(mktemp)
+        awk '
+            /^\[/ { sect = $0 }
+            sect == "[Compositing]" && /^[[:space:]]*Enabled[[:space:]]*=/ { next }
+            { print }
+        ' "$_kwinrc" > "$_ktmp" && cat "$_ktmp" > "$_kwinrc"
+        rm -f "$_ktmp"
+        chown "$DESKTOP_UID:$DESKTOP_GID" "$_kwinrc" 2>/dev/null
+        drm_log "  kwinrc 现在的 [Compositing] 段：$(sed -n '/^\[Compositing\]/,/^\[/p' "$_kwinrc" | tr '\n' ' ')"
     fi
 
     # ── kwin 的语言环境 ───────────────────────────────────
