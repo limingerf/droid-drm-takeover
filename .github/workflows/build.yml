@@ -58,17 +58,28 @@ jobs:
           [ "$n" -ge 24 ] || { echo "::error::产物数量异常（$n < 24），可能有目标没编出来"; fail=1; }
           [ "$fail" -eq 0 ] || exit 1
 
+      # ★ 必须在**独立目录**里做，不能用 `make clean && make runtime` 直接跑在
+      #   bin/ 上 —— 那会把刚编好的完整 bin/ 覆盖成 6 个 runtime 工具，
+      #   而下一步的 upload-artifact 就会把这 6 个传出去，APK job 拿到的
+      #   payload/bin 只有 6 个文件。（早期版本正是这么坏的。）
       - name: 校验 runtime 子集可独立构建
         run: |
+          set -eu
           export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
-          make clean
-          make -j"$(nproc)" runtime CC=aarch64-linux-gnu-gcc
+          make -j"$(nproc)" runtime CC=aarch64-linux-gnu-gcc BIN=bin-rt BLD=build-rt
           for t in kwinwrap setbright setprop crtcstate connprops atomicspy.so; do
-            [ -f "bin/$t" ] || { echo "::error::make runtime 缺少 bin/$t"; exit 1; }
+            [ -f "bin-rt/$t" ] || { echo "::error::make runtime 缺少 bin-rt/$t"; exit 1; }
           done
           # runtime 是脚本硬依赖的最小集：多出探针说明分组错了
-          extra=$(ls bin | grep -vE '^(kwinwrap|setbright|setprop|crtcstate|connprops|atomicspy\.so)$' || true)
+          extra=$(ls bin-rt | grep -vE '^(kwinwrap|setbright|setprop|crtcstate|connprops|atomicspy\.so)$' || true)
           [ -z "$extra" ] || { echo "::error::make runtime 混进了非 runtime 目标: $extra"; exit 1; }
+          n=$(ls -1 bin-rt | wc -l)
+          echo "runtime 子集: $n 个"
+          # 顺带确认完整 bin/ 没被动过
+          nfull=$(ls -1 bin | wc -l)
+          echo "完整 bin/: $nfull 个"
+          [ "$nfull" -ge 24 ] || { echo "::error::完整 bin/ 被破坏了（$nfull < 24）"; exit 1; }
+          rm -rf bin-rt build-rt
 
       - uses: actions/upload-artifact@v4
         with:

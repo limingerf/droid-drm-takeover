@@ -34,8 +34,13 @@ WL_LIBS  := $(shell pkg-config --libs wayland-client)
 SRC_RUNTIME  := tools/runtime
 SRC_PROBE    := tools/probe
 SRC_PROTOCOL := tools/protocol
-BIN := bin
-BLD := build
+# 输出目录：用 ?= 以便命令行覆盖。
+#   make BIN=/tmp/b BLD=/tmp/o runtime
+# 这很有用 —— 比如 CI 里单独验证 runtime 子集时，不能把完整的 bin/ 覆盖掉
+# （早期版本就是 `make clean && make runtime` 直接跑在 bin/ 上，结果上传给
+#   APK job 的 artifact 里只剩 6 个 runtime 工具）。
+BIN ?= bin
+BLD ?= build
 
 # ── runtime：脚本硬依赖，缺一个流程就跑不起来 ──
 #   kwinwrap    DRM 交接桥（全项目心脏）

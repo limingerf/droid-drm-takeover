@@ -5,6 +5,15 @@ make              # 全部（24 个产物）
 make runtime      # 只有脚本硬依赖的 6 个 —— 随 APK/容器分发的最小集
 ```
 
+输出目录可以用 `BIN` / `BLD` 覆盖，用于隔离校验：
+
+```sh
+make runtime BIN=bin-rt BLD=build-rt    # 不动完整的 bin/
+```
+
+（CI 就是这样验证 runtime 子集的。早期版本直接 `make clean && make runtime`，
+把完整的 `bin/` 覆盖成 6 个，结果上传给 APK job 的 artifact 里只剩 6 个文件。）
+
 **日常使用不需要手动运行任何一个** —— 状态机和会话脚本会自动调用它们。
 本文面向给新设备做适配、或排查问题的人。
 
