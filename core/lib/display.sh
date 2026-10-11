@@ -18,15 +18,18 @@
 # ── 工具路径 ──────────────────────────────────────────────
 DRM_BIN_DIR=""
 
+# ★ 旧实现第一候选是 `$(dirname "$0")/../bin` —— 错的：被 source 时 $0 是
+#   **调用方**的路径，算出来的是调用方同级目录，不是本仓库的 bin/。
+#   现在以 $DRM_ROOT 为基准（它由 common.sh 在 source 时定好）。
 drm_bin_resolve() {
     [ -n "$DRM_BIN_DIR" ] && return 0
     for _c in \
-        "$(dirname "$0")/../bin" \
+        "${DRM_ROOT:-}/bin" \
         "/root/$DRM_PROJECT/bin" \
         "/opt/$DRM_PROJECT/bin" \
         "/usr/local/lib/$DRM_PROJECT/bin"
     do
-        [ -d "$_c" ] && { DRM_BIN_DIR="$_c"; return 0; }
+        [ -n "$_c" ] && [ -d "$_c" ] && { DRM_BIN_DIR="$_c"; return 0; }
     done
     DRM_BIN_DIR=""
     return 1
@@ -107,6 +110,23 @@ drm_mknod_if_missing() {
     drm_log "重建节点 $_node ($_maj:$_min)"
 }
 
+# 给 mknod 出来的节点定属主/权限。
+#
+# ★ 为什么不直接 chmod 666：容器里有 root 和 Gold 两个账号，666 意味着
+#   任何用户都能读键盘/触摸（输入设备泄的是按键流）。Droidspaces 自己挂
+#   renderD128 时用的是 `root:droidspaces-gpu 660`，我们照抄这个约定：
+#   组对了就 660，组不存在（别的 rootfs/别的运行时）才退回 666。
+drm_node_own() {
+    _node=$1; _grp=${2:-}
+    [ -e "$_node" ] || return 0
+    if [ -n "$_grp" ] && chgrp "$_grp" "$_node" 2>/dev/null; then
+        chmod 660 "$_node" 2>/dev/null
+    else
+        chmod 666 "$_node" 2>/dev/null
+    fi
+    return 0
+}
+
 drm_ensure_drm_nodes() {
     mkdir -p /dev/dri /dev/input 2>/dev/null
 
@@ -121,7 +141,7 @@ drm_ensure_drm_nodes() {
             drm_mknod_if_missing "$DEV_DRM_CARD" "$DEV_DRM_MAJOR" "$DEV_DRM_MINOR"
         fi
     fi
-    chmod 666 "$DEV_DRM_CARD" 2>/dev/null
+    drm_node_own "$DEV_DRM_CARD" "${DEV_DRM_GROUP:-}"
 
     # renderD128：容器里常缺（它不进 kwin 的上屏路径，但 Mesa/EGL 要用）
     if [ ! -c "${DEV_DRM_RENDER}" ]; then
@@ -134,16 +154,18 @@ drm_ensure_drm_nodes() {
             drm_mknod_if_missing "$DEV_DRM_RENDER" "$DEV_DRM_MAJOR" "$DEV_DRM_RENDER_MINOR"
         fi
     fi
-    chmod 666 "$DEV_DRM_RENDER" 2>/dev/null
+    drm_node_own "$DEV_DRM_RENDER" "${DEV_DRM_GROUP:-}"
 
     # GPU 渲染节点（kgsl 路线）
-    [ -e /dev/kgsl-3d0 ] && chmod 666 /dev/kgsl-3d0 2>/dev/null
+    drm_node_own /dev/kgsl-3d0 "${DEV_DRM_GROUP:-}"
 
     # 其它内核 input 设施：容器里通常没有，缺了会静默降级
     drm_mknod_if_missing /dev/uhid    10 239
     drm_mknod_if_missing /dev/uinput  10 223
     drm_mknod_if_missing /dev/rfkill  10 242
-    chmod 666 /dev/uhid /dev/uinput /dev/rfkill 2>/dev/null
+    for _n in /dev/uhid /dev/uinput /dev/rfkill; do
+        drm_node_own "$_n" "${DEV_TOUCH_GROUP:-}"
+    done
 }
 
 # ── 触摸节点 ──────────────────────────────────────────────
@@ -203,7 +225,7 @@ drm_ensure_touch_node() {
         TOUCH_MAJOR=""
         TOUCH_MINOR=""
     fi
-    chmod 666 "$TOUCH_NODE" 2>/dev/null
+    drm_node_own "$TOUCH_NODE" "${DEV_TOUCH_GROUP:-}"
     drm_log "触摸节点：$TOUCH_NODE (${TOUCH_MAJOR:-?}:${TOUCH_MINOR:-?})"
     drm_state_set TOUCH_EVENT "$TOUCH_EVENT"
     return 0
@@ -219,6 +241,42 @@ drm_ensure_touch_node() {
 #   共用 `[ ! -f c226:0 ]` 一个条件——只要 card0 的记录已存在，
 #   renderD128 和触摸的记录就永远不再写。现在三条各自独立判断。
 
+# ★★ 2026-10 血泪根因：记录必须是 systemd **标准 udev db 格式**，否则 logind
+#   的 TakeDevice 直接失败，而 KWin 只会说一句
+#   "failed to open drm device at /dev/dri/card0"——**它自己根本不调 open()**，
+#   所以从 KWin 侧怎么查都查不出来。
+#
+#   链路（systemd 257 logind-session-device.c）：
+#     DrmBackend::addGpu → Session::openRestricted → logind TakeDevice
+#       → session_device_new → session_device_verify
+#         → sd_device_new_from_devnum('c', 226:0)
+#         → manager_process_seat_device()  ← 读 udev db
+#         → hashmap_get(manager->devices, syspath)
+#         查不到就 return -ENODEV（现象：KWin 报 "No such device"）
+#
+#   我们原来的记录是 `Q:100` 打头、标签用 `H:`、**没有 I: 行**，格式不对，
+#   sd_device 读出来是"未初始化"，于是永远 ENODEV。
+#   标准格式：I:(usec_initialized) → E:属性 → G:标签 → Q:当前标签 → V:属性版本。
+#   `I:` 行是**必须**的：它就是 USEC_INITIALIZED。
+#
+#   另外 ID_SEAT 必须和会话的 seat 一致，否则 session_device_verify 返回 -EPERM。
+_drm_udev_usec() {
+    # USEC_INITIALIZED 只要是个非 0 的 usec 值即可
+    _s=$(date +%s 2>/dev/null) || _s=1
+    printf '%s000000' "$_s"
+}
+
+# 从 sysfs 反查真实 DEVPATH（重构前写死 /devices/platform/soc/drm/card0，
+# 换设备后是错的；logind 按 syspath 建索引，写错就查不到）
+_drm_udev_devpath() {
+    _maj=$1; _min=$2; _fallback=$3
+    _p=$(readlink -f "/sys/dev/char/${_maj}:${_min}" 2>/dev/null)
+    case "$_p" in
+        /sys/devices/*) printf '%s' "${_p#/sys}" ;;
+        *) printf '%s' "$_fallback" ;;
+    esac
+}
+
 _drm_write_udev_record() {
     _file=$1; shift
     mkdir -p /run/udev/data 2>/dev/null
@@ -229,6 +287,9 @@ _drm_write_udev_record() {
 
 drm_write_udev_records() {
     mkdir -p /run/udev/data 2>/dev/null
+
+    _usec=$(_drm_udev_usec)
+    _seat=${DRM_SEAT:-seat0}
 
     # kwin 的 Hardware 白名单只收 i915/amdgpu/nouveau/vmwgfx；
     # msm_drm 会被判定为"不支持的驱动"直接拒绝。伪装成 vmwgfx。
@@ -241,55 +302,61 @@ drm_write_udev_records() {
     _dp=${DEV_DRM_DEVPATH:-}
     [ -n "$_dp" ] || _dp="/devices/platform/soc/drm/card0"
 
-    # ① card0
-    if ! grep -q '^E:DRIVER=' "/run/udev/data/c${_card_maj}:${_card_min}" 2>/dev/null; then
-        _dpc=${_dp%renderD*}
-        [ -n "$_dpc" ] || _dpc=$_dp
-        _dpc=${_dpc%card0}
-        _drm_write_udev_record "/run/udev/data/c${_card_maj}:${_card_min}" \
-"Q:100
-E:DEVPATH=${_dpc}card0
+    # ① card0 —— logind 只认 `card*` 节点（renderD128 会被 detect_device_type
+    #    判成 DEVICE_TYPE_UNKNOWN 而 return -ENODEV，这是设计如此，不是 bug）
+    #
+    # ★ 不再用"已存在就跳过"的守卫：记录内容依赖 DEV_*（尤其 DEVPATH /
+    #   ID_SEAT），跳过会留下过期内容；而且下面要打 udev 事件，必须保证
+    #   磁盘上的内容就是本次算出来的。
+    _dpc=$(_drm_udev_devpath "$_card_maj" "$_card_min" "${_dp%card0}card0")
+    _drm_write_udev_record "/run/udev/data/c${_card_maj}:${_card_min}" \
+"I:${_usec}
+E:DEVPATH=${_dpc}
 E:MAJOR=${_card_maj}
 E:MINOR=${_card_min}
 E:SUBSYSTEM=drm
 E:DEVTYPE=drm_minor
 E:DEVNAME=dri/card0
 E:DRIVER=${_drv}
-H:uaccess
-H:seat
+E:ID_SEAT=${_seat}
+E:ID_PATH=platform-drm-card0
+G:seat
+G:uaccess
+Q:1
+V:1
 "
-    fi
 
-    # ② renderD128 —— 独立判断（重构前它挂在 card0 的条件下面）
-    if ! grep -q '^E:DRIVER=' "/run/udev/data/c${_card_maj}:${_rend_min}" 2>/dev/null; then
-        _dpc=${_dp%renderD*}
-        [ -n "$_dpc" ] || _dpc=${_dp%card0}
-        _drm_write_udev_record "/run/udev/data/c${_card_maj}:${_rend_min}" \
-"Q:101
-E:DEVPATH=${_dpc}renderD128
+    # ② renderD128（KWin 用它做渲染，不走 logind）
+    _dpr=$(_drm_udev_devpath "$_card_maj" "$_rend_min" "${_dp%renderD*}renderD128")
+    _drm_write_udev_record "/run/udev/data/c${_card_maj}:${_rend_min}" \
+"I:${_usec}
+E:DEVPATH=${_dpr}
 E:MAJOR=${_card_maj}
 E:MINOR=${_rend_min}
 E:SUBSYSTEM=drm
 E:DEVTYPE=drm_minor
 E:DEVNAME=dri/renderD128
 E:DRIVER=${_drv}
-H:uaccess
-H:seat
+E:ID_SEAT=${_seat}
+E:ID_PATH=platform-drm-renderD128
+G:seat
+G:uaccess
+Q:1
+V:1
 "
-    fi
 
-    # ③ 触摸屏 —— 独立判断，且按**本次发现的** event 名与主次号重写
+    # ③ 触摸屏 —— 按**本次发现的** event 名与主次号写
     if [ -n "${TOUCH_MAJOR:-}" ] && [ -n "${TOUCH_MINOR:-}" ]; then
         _f="/run/udev/data/c${TOUCH_MAJOR}:${TOUCH_MINOR}"
-        if ! grep -q "input/${TOUCH_EVENT}" "$_f" 2>/dev/null; then
-            _grp=${DEV_TOUCH_GROUP:-}
-            [ -n "$_grp" ] || _grp="${TOUCH_MAJOR}/${TOUCH_MINOR}"
-            _cal=""
-            [ -n "${DEV_TOUCH_CALIB:-}" ] && _cal="E:LIBINPUT_CALIBRATION_MATRIX=${DEV_TOUCH_CALIB}
+        _grp=${DEV_TOUCH_GROUP:-}
+        [ -n "$_grp" ] || _grp="${TOUCH_MAJOR}/${TOUCH_MINOR}"
+        _cal=""
+        [ -n "${DEV_TOUCH_CALIB:-}" ] && _cal="E:LIBINPUT_CALIBRATION_MATRIX=${DEV_TOUCH_CALIB}
 "
-            _drm_write_udev_record "$_f" \
-"Q:100
-E:DEVPATH=/devices/virtual/input/${TOUCH_EVENT}
+        _dtp=$(_drm_udev_devpath "$TOUCH_MAJOR" "$TOUCH_MINOR" "/devices/virtual/input/${TOUCH_EVENT}")
+        _drm_write_udev_record "$_f" \
+"I:${_usec}
+E:DEVPATH=${_dtp}
 E:MAJOR=${TOUCH_MAJOR}
 E:MINOR=${TOUCH_MINOR}
 E:SUBSYSTEM=input
@@ -297,15 +364,76 @@ E:DEVNAME=input/${TOUCH_EVENT}
 E:ID_INPUT=1
 E:ID_INPUT_TOUCH=1
 E:ID_INPUT_TOUCHSCREEN=1
+E:ID_SEAT=${_seat}
 E:LIBINPUT_DEVICE_GROUP=${_grp}:${DEV_TOUCH_NAME:-touch}
-${_cal}H:uaccess
-H:seat
+${_cal}G:seat
+G:uaccess
+Q:1
+V:1
 "
-        fi
     fi
 
     chmod -R a+rX /run/udev 2>/dev/null
+
+    # ★★ 关键一步，缺了整个接管必失败：**光写 udev 数据库不够**。
+    #
+    #   logind 是 udev 的**监控客户端**，它的 manager->devices 哈希表由
+    #   **udev 事件**填充（manager_process_seat_device）。只写
+    #   /run/udev/data 而不发事件，logind 的表里就没有这个设备：
+    #       session_device_verify()
+    #         → hashmap_get(m->devices, syspath) == NULL
+    #         → 回退自己 process 一次，仍为 NULL
+    #         → return -ENODEV
+    #   现象是 KWin 报 `Failed to open /dev/dri/card0 device (No such device)`，
+    #   而 `udevadm info` 一切正常 —— 极易误判成"记录格式不对"。
+    #   实测：补上这一条 trigger，同一个错误立刻从 ENODEV 变成 EBUSY
+    #   （EBUSY 说明 logind 已经走到 ioctl(DRM_IOCTL_SET_MASTER)，只是安卓
+    #    composer 还占着 master —— 这正是接管必须先停 composer 的原因）。
+    drm_udev_trigger_add
     drm_log "udev 合成记录就绪（card0 / renderD128 / ${TOUCH_EVENT:-无触摸}）"
+}
+
+# 给 DRM/input 打 udev "add" 事件，逼 logind 等 udev 客户端重新登记设备。
+drm_udev_trigger_add() {
+    if ! command -v udevadm >/dev/null 2>&1; then
+        drm_warn "容器里没有 udevadm —— logind 不会登记 card0，TakeDevice 会 ENODEV"
+        return 1
+    fi
+    udevadm trigger --action=add --subsystem-match=drm >/dev/null 2>&1
+    udevadm trigger --action=add --subsystem-match=input >/dev/null 2>&1
+    udevadm settle --timeout=5 >/dev/null 2>&1
+    sleep 1
+    return 0
+}
+
+# ── 停容器里开机自启的桌面会话单元 ───────────────────────
+#
+# ★ 为什么不能只杀进程（本机实测踩到）：容器里的 desktop-session.service
+#   带 `Restart=on-failure` + `RestartSec=2s`。只 kill 掉 plasmashell/kwin，
+#   systemd 2 秒内就把整个会话原样拉回来 —— 结果是两套合成器抢同一个面板，
+#   现象是"kwin 起来了、master 拿到了、画面闪烁或立刻黑掉"。
+#   必须先把 systemd 单元停掉，进程级清理只是兜底。
+# ★ 只 stop 不 mask：返回安卓 = 重启设备，重启后容器照常自启，
+#   Anland 那套远程桌面还得能用。mask 掉就把用户原来的用法弄坏了。
+drm_stop_container_session() {
+    _svc=${DEV_SESSION_SVC:-}
+    [ -n "$_svc" ] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 0
+
+    if ! systemctl is-active --quiet "$_svc" 2>/dev/null; then
+        drm_log "容器桌面会话单元 $_svc 未在运行（跳过）"
+        return 0
+    fi
+
+    drm_log "停容器桌面会话单元 $_svc（防 systemd 把旧合成器拉回来）"
+    drm_timeout 20 systemctl stop "$_svc" >/dev/null 2>&1
+    sleep 1
+    if systemctl is-active --quiet "$_svc" 2>/dev/null; then
+        drm_warn "$_svc 停不掉（Restart 策略？）—— 交给进程级清理兜底"
+    else
+        drm_log "$_svc 已停"
+    fi
+    return 0
 }
 
 # ── 杀掉容器侧 Linux 桌面栈 ───────────────────────────────
@@ -321,6 +449,9 @@ H:seat
 drm_kill_linux_stack() {
     drm_log "杀容器侧 Linux 桌面栈"
 
+    # 先停 systemd 单元，否则下面杀多少它补多少
+    drm_stop_container_session
+
     # 第一轮：按命令行特征杀（KDE 监督者必须先死，否则会补进程）
     for _pat in kwin_wayland_wrapper kwinwrap xdg-desktop-portal \
                 dmesg-harvester.sh keepbright.sh; do
@@ -330,8 +461,13 @@ drm_kill_linux_stack() {
         # shellcheck disable=SC2086
         drm_kill_pids 9 $_pids
     done
-    # 按精确进程名杀
-    for _name in kwin_wayland plasmashell kactivitymanagerd plasma-keyboard; do
+    # 按精确进程名杀。
+    # ★ startplasma-wayland / plasma_session 是会话领头进程，漏了它们
+    #   KWin 会被重新拉起（本机实测：desktop-session.service 停掉后
+    #   startplasma-wayland 仍在，会重新 exec 一套 kwin）。
+    for _name in kwin_wayland plasmashell kactivitymanagerd plasma-keyboard \
+                 startplasma-wayland plasma_session kded6 ksmserver \
+                 plasma-fallback-session-restore; do
         _pids=$(drm_pids_by_comm "$_name" | drm_pids_uniq)
         [ -n "$_pids" ] || continue
         # shellcheck disable=SC2086
@@ -366,19 +502,26 @@ drm_kill_linux_stack() {
         drm_kill_pids 9 $_holders
         sleep 2
     fi
+
+    # 最后收掉 logind 会话 holder：它只是个 `sleep`，不占 DRM，
+    # 上面三轮都抓不到它；不收掉会残留一个 Gold 会话，
+    # 下次接管时 drm_logind_session_start 会把它当"活着的"复用。
+    drm_logind_session_stop
 }
 
-# 谁还持有 DRM 节点（本侧 /proc 扫描）。
+# 谁还持有 DRM 节点（本侧扫描）。
 #
-# 一次 ls 全部 fd 再 grep 一次 —— 不要写成"每个进程 fork 一次 ls|grep"，
-# 那在 30 秒 × 每 0.5 秒的轮询里会变成上万次 fork。
+# ★ 实现抽在 tools/probe/card-holders.sh —— 见那个文件顶部，那里记着
+#   为什么不能用 `sed` 从 `ls -l /proc/*/fd` 里抽 pid（那样恒为空，
+#   而"空"会被上层读成"composer 松手了"）。
 drm_card_fd_holders() {
     _node=${1:-$DEV_DRM_CARD}
-    ls -l /proc/[0-9]*/fd 2>/dev/null \
-        | grep -F -- "-> $_node" \
-        | sed -n 's#^.*/proc/\([0-9][0-9]*\)/fd/.*#\1#p' \
-        | sort -u \
-        | grep -v -x "$$" 2>/dev/null
+    _h=$(drm_repo_script tools/probe/card-holders.sh 2>/dev/null) || {
+        # ★ 不能静默返回空：上层会把"空"读成"没人持有"（= composer 松手了）
+        drm_warn "找不到 tools/probe/card-holders.sh —— 无法判断谁持有 $_node"
+        return 1
+    }
+    sh "$_h" "$_node" 2>/dev/null | grep -v -x "$$" 2>/dev/null
 }
 
 # ── kwinwrap 交接 ─────────────────────────────────────────
@@ -417,6 +560,178 @@ drm_kwinwrap_split_env() {
     printf '%s' "$(printf '%s' "$_raw" | tr '\n' ' ')"
 }
 
+# ── logind 会话：KWin 能打开 DRM 的**唯一**前提 ─────────────
+#
+# ★★★ 2026-10 血泪根因（这条卡了整整一轮，而且现象极具误导性）：
+#
+#   KWin 6.x 打开 DRM 设备**只有一条路**：
+#       DrmBackend::addGpu() → Session::openRestricted(fileName)
+#   （不是 libc 的 open()！所以拿 LD_PRELOAD 拦 open/openat/stat 会
+#     **一个调用都看不到**，而 KWin 只打印一句
+#     `kwin_wayland_drm: failed to open drm device at "/dev/dri/card0"`
+#     ——"没看到 open"这个负结论会把排查方向彻底带偏。）
+#
+#   Session::create() 按 **Logind → ConsoleKit → Noop** 顺序取
+#   **第一个构造成功的**，而三个实现里：
+#     · LogindSession::create()   要求 logind 里能找到"本进程的会话"，
+#                                 且 Activate + TakeControl 都成功；
+#     · ConsoleKitSession::create() 同理（容器里根本没装 ConsoleKit）；
+#     · NoopSession::openRestricted() **硬编码 return -1**
+#       （Plasma/6.2 与 6.3 都是；不是配置问题，是设计如此）。
+#
+#   容器里的会话默认**绑不上 seat**（logind 靠 TTY 绑，容器 /dev/tty* 是假
+#   节点，CanTTY=no），于是 logind 的 Activate 返回 -ENOTSUP ⇒ Logind 与
+#   ConsoleKit 都返回 nullptr ⇒ **落到 NoopSession ⇒ 永远打不开卡**。
+#
+#   已实测的解法（pam_systemd 认这几个环境变量）：
+#     XDG_SEAT=seat0            → 会话绑到 seat0，Activate 才能成功；
+#     XDG_SESSION_CLASS=user    → logind 的 TakeDevice 只对 user/greeter 类
+#                                 会话放行，否则报
+#                                 "Session class doesn't support taking device control."
+#     **绝对不要设 XDG_VTNR**   → 实测设了之后 su 直接建不出会话。
+#
+#   ★ 重构前用的 `XDG_SESSION_ID=bogus` 是**反效果**：它让 logind 的
+#     GetSession 查不到，反而把 KWin 直接推进 NoopSession。
+#
+#   ★ 会话必须属于桌面用户：logind 的 TakeControl 对"非本会话 uid"要走
+#     polkit，而容器里没有 polkit ⇒ 必须 uid 匹配。所以用 `su -`（它的
+#     PAM 栈里有 pam_systemd；`runuser -u` 的**没有**，实测建不出会话）
+#     以 DESKTOP_USER 建会话，再把会话 id 显式传给以 root 跑的
+#     kwinwrap → kwin_wayland。
+#
+#   ★ 另一个必要条件是 logind 侧的 TakeDevice 要能
+#     `ioctl(DRM_IOCTL_SET_MASTER)` 成功 —— 安卓的 composer 还活着时它会
+#     返回 EBUSY（现象：KWin 报 "Device or resource busy"）。所以**必须
+#     先停掉安卓显示栈**再起 kwin（enter.sh 的顺序就是这个）。
+# ── polkit 规则：让桌面用户能 Activate 自己的 logind 会话 ─────
+#
+# ★★★ 根因（systemd logind + polkit，和"会话"是两件独立的事）：
+#   KWin 的 LogindSession::create() **无条件**调 logind 的 Activate，
+#   该动作是 org.freedesktop.login1.chvt，polkit 默认策略是
+#       allow_any = no / allow_inactive = no / allow_active = yes
+#   polkit 判断"active"靠的是**调用进程所属的 logind 会话**
+#   （logind 按 PID → cgroup 反查 session-*.scope）。
+#   我们的 kwin_wayland 是**安卓侧 watcher 的后代**，不是会话领导 su 的
+#   后代 ⇒ polkit 判成 any ⇒ "Interactive authentication required"，
+#   而容器里没有认证代理 ⇒ Activate 必失败 ⇒ create() 返回 nullptr ⇒
+#   KWin 落到 NoopSession ⇒ openRestricted() 硬编码 return -1 ⇒
+#   现象只有一句 `failed to open drm device`。
+#
+#   ★ 这一条最坑的地方：**同一条命令手工能跑通**——因为手工时是
+#     `su - Gold -c kwin_wayland`，KWin 就在会话里，polkit 判成 active
+#     直接放行。接管流程里 KWin 从安卓侧 watcher 拉起来，就不在会话里了。
+#     所以"手工验证通过"在这里是**假阳性**。
+drm_install_polkit_rules() {
+    _dir=/etc/polkit-1/rules.d
+    [ -d "$_dir" ] || {
+        drm_warn "容器里没有 polkit rules.d —— KWin 的 Activate 会被拒，接管必失败"
+        return 1
+    }
+    [ -n "${DESKTOP_USER:-}" ] || { drm_warn "DESKTOP_USER 为空，跳过 polkit 规则"; return 1; }
+
+    _f="$_dir/49-droid-drm-takeover.rules"
+    _want="polkit.addRule(function(action, subject) {
+    if ((action.id == \"org.freedesktop.login1.chvt\" ||
+         action.id == \"org.freedesktop.login1.manage\") &&
+        subject.user == \"$DESKTOP_USER\") {
+        return polkit.Result.YES;
+    }
+});
+"
+    if [ -r "$_f" ] && [ "$(cat "$_f" 2>/dev/null)" = "$_want" ]; then
+        drm_log "polkit 规则已是最新（$_f）"
+        return 0
+    fi
+
+    printf '%s' "$_want" >"$_f" 2>/dev/null || { drm_warn "写 polkit 规则失败：$_f"; return 1; }
+    chmod 644 "$_f" 2>/dev/null
+
+    # polkitd 在 rules.d 上挂了 inotify，通常几秒内自动重载；
+    # 但接管对时序敏感，直接重启一次拿确定性（此刻桌面栈已被停，无副作用）。
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl try-restart polkit >/dev/null 2>&1
+        sleep 1
+    fi
+    drm_log "已安装 polkit 规则（放行 chvt/manage 给 $DESKTOP_USER）：$_f"
+    return 0
+}
+
+DRM_SESSION_ID=""
+
+drm_logind_session_start() {
+    _sidfile="$DRM_RUN_DIR/drm-session-id"
+    _pidfile="$DRM_RUN_DIR/drm-session.pid"
+    _seat=${DRM_SEAT:-seat0}
+    mkdir -p "$DRM_RUN_DIR" 2>/dev/null
+
+    # 复用仍然活着的 holder，避免重复起
+    _old=$(cat "$_pidfile" 2>/dev/null)
+    if [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && [ -s "$_sidfile" ]; then
+        _reuse=$(cat "$_sidfile" 2>/dev/null)
+        if [ -n "$_reuse" ]; then
+            DRM_SESSION_ID=$_reuse
+            export DRM_SESSION_ID
+            drm_log "复用已有 logind 会话（id=$_reuse pid=$_old）"
+            return 0
+        fi
+    fi
+
+    rm -f "$_sidfile" 2>/dev/null
+    # ★ 这个文件是**以桌面用户身份**写的（su 之后），而 $DRM_RUN_DIR 是
+    #   root:root 755 —— 不预建 + 放开写权限的话 Gold 根本写不进去，
+    #   于是"会话建不出来"，而且失败得很安静（只是文件一直空着）。
+    : >"$_sidfile" 2>/dev/null
+    chmod 666 "$_sidfile" 2>/dev/null
+    # ★ 环境变量必须在 su 之前设好：pam_systemd 在 su 内部读它们
+    env XDG_SEAT="$_seat" XDG_SESSION_CLASS=user XDG_SESSION_TYPE=wayland \
+        su - "$DESKTOP_USER" -c \
+        "printf '%s' \"\${XDG_SESSION_ID:-}\" >'$_sidfile'; exec sleep 86400" \
+        >/dev/null 2>&1 &
+    _holder=$!
+    printf '%s' "$_holder" >"$_pidfile" 2>/dev/null
+
+    _i=0
+    while [ "$_i" -lt 100 ]; do
+        [ -s "$_sidfile" ] && break
+        sleep 0.1
+        _i=$((_i + 1))
+    done
+
+    DRM_SESSION_ID=$(cat "$_sidfile" 2>/dev/null)
+    if [ -z "$DRM_SESSION_ID" ]; then
+        drm_err "建不出 logind 会话（XDG_SEAT=$_seat / XDG_SESSION_CLASS=user）"
+        drm_err "  → KWin 会退到 NoopSession，而它的 openRestricted() 硬编码返回 -1，"
+        drm_err "    症状是 kwin.log 里 'failed to open drm device' 但全程没有 open() 系统调用"
+        kill "$_holder" 2>/dev/null
+        rm -f "$_pidfile" 2>/dev/null
+        return 1
+    fi
+
+    _chk=$(loginctl show-session "$DRM_SESSION_ID" \
+        -p Seat -p Class -p Type -p Active 2>/dev/null | tr '\n' ' ')
+    drm_log "logind 会话就绪：id=$DRM_SESSION_ID  $_chk"
+    case "$_chk" in
+        *"Seat=$_seat"*) ;;
+        *) drm_warn "会话没有绑到 $_seat（$_chk）—— logind 的 Activate 会失败" ;;
+    esac
+    case "$_chk" in
+        *"Class=user"*) ;;
+        *) drm_warn "会话 class 不是 user（$_chk）—— logind 的 TakeDevice 会拒绝" ;;
+    esac
+
+    export DRM_SESSION_ID
+    return 0
+}
+
+drm_logind_session_stop() {
+    _pidfile="$DRM_RUN_DIR/drm-session.pid"
+    _old=$(cat "$_pidfile" 2>/dev/null)
+    [ -n "$_old" ] && kill "$_old" 2>/dev/null
+    rm -f "$_pidfile" "$DRM_RUN_DIR/drm-session-id" 2>/dev/null
+    DRM_SESSION_ID=""
+    return 0
+}
+
 drm_start_kwin() {
     _kw=$(drm_tool kwinwrap 2>/dev/null) || drm_die "找不到 kwinwrap（先 make）"
     _sock=${DRM_WAYLAND_SOCKET:-taketest}
@@ -435,9 +750,64 @@ drm_start_kwin() {
         sleep 1
     fi
 
+    # ★ 两件事缺一不可，否则 KWin 一定退到 NoopSession 而打不开卡：
+    #   ① polkit 放行 chvt/manage —— 否则 Activate 被拒（见上面的长注释）
+    #   ② 一个绑 seat0 的 user 类 logind 会话 —— 否则 TakeDevice 被拒
+    drm_install_polkit_rules || drm_warn "polkit 规则没装上，KWin 的 Activate 很可能失败"
+    if ! drm_logind_session_start; then
+        drm_err "拿不到 logind 会话，KWin 无法打开 $DEV_DRM_CARD"
+        return 1
+    fi
+
+    # ── kwin 的语言环境 ───────────────────────────────────
+    #
+    # 接管轮的 kwin/plasma 由 kwinwrap 拉起，**不过 PAM**，所以 pam_env 灌给常态
+    # 桌面的 /etc/default/locale、/etc/environment 在这里是缺的。缺了最直观的
+    # 现象是界面全变英文（kwin/plasma 报 "Detected locale C ... 不是 UTF-8"）。
+    # 只挑语言/光标/主题三类，**绝不整份照搬** —— 那会把 MESA_* 带进去，见下。
+    # ── ★★★ kwin 的渲染环境：只留 MESA_LOADER_DRIVER_OVERRIDE=kgsl ────
+    #
+    # 输出和渲染是两条独立的链，别混：
+    #   上屏（KMS 提交）= /dev/dri/card0，KWin 的 DRM 后端
+    #   渲染（画像素）  = /dev/kgsl-3d0，Mesa Gallium Freedreno
+    # MESA_LOADER_DRIVER_OVERRIDE 只影响后者，**既不负责拿 DRM master，
+    # 也不替代 KWIN_DRM_DEVICES 的 KMS 输出路径**。
+    #
+    # ★ 实测（本机，两条对照）：
+    #   保留 MESA_LOADER_DRIVER_OVERRIDE=kgsl → Mesa 加载 kgsl_dri.so
+    #     （Gallium 驱动就是 freedreno），KWin 报 freedreno/Adreno 硬件渲染，
+    #     日志里**没有** ZINK 报错。
+    #   把它 unset 掉 → Mesa 找不到匹配的 DRI 驱动，退回 ZINK，
+    #     报 `ZINK: vkEnumeratePhysicalDevices failed (VK_ERROR_INITIALIZATION_FAILED)`
+    #     `ZINK: failed to choose pdev` ⇒ 渲染链直接废掉。
+    #   所以这里**必须显式设上**，不能靠容器环境碰巧继承。
+    #
+    # ★ 但 GALLIUM_DRIVER / FD_FORCE_KGSL 要摘掉：它们是同一件事的**旧写法**，
+    #   和 loader override 同时存在会打架（参考实现记录过
+    #   `kgsl_bo_new_dmabuf: Failed to allocate dma-buf` × 544 帧，
+    #   现象从花屏变成纯黑且无法回滚）。
+    #
+    # ★ 判断 GPU 到底有没有用上，看 KWin 的 OpenGL renderer
+    #   （freedreno/Adreno = 硬件，llvmpipe = 软件），**不要看日志措辞**：
+    #   `kwin_core: Failed to open drm node: ""` 和
+    #   `kwin_scene_opengl: couldn't find dev node for drm device`
+    #   都是**节点发现噪音**，不代表软件渲染，别去追（参考实现已明确记录）。
+    _loc_env=""
+    for _lf in /etc/default/locale /etc/environment; do
+        [ -r "$_lf" ] || continue
+        while IFS= read -r _line; do
+            case "$_line" in ''|\#*) continue ;; esac
+            case "$_line" in *=*) ;; *) continue ;; esac
+            case "$_line" in
+                LANG=*|LC_*=*|XCURSOR_SIZE=*|QT_QPA_PLATFORMTHEME=*)
+                    _loc_env="$_loc_env $_line" ;;
+            esac
+        done <"$_lf"
+    done
+
     _split_env=$(drm_kwinwrap_split_env 2>/dev/null | head -1)
 
-    drm_log "kwinwrap 交接 → kwin_wayland --drm --socket=$_sock"
+    drm_log "kwinwrap 交接 → kwin_wayland --drm --socket=$_sock（会话 $DRM_SESSION_ID）"
     # shellcheck disable=SC2086
     env KWINWRAP_HIJACK=1 KWINWRAP_SECCOMP=1 KWINWRAP_FILTER=1 \
         KWINWRAP_UID="$DESKTOP_UID" KWINWRAP_GID="$DESKTOP_GID" \
@@ -445,12 +815,17 @@ drm_start_kwin() {
         $_split_env \
         "$_kw" --out "$_out" -- \
         env -u DISPLAY -u WAYLAND_DISPLAY -u ANLAND -u ANLAND_SOCKET \
-            -u ANLAND_DRM_DEVICE -u GALLIUM_DRIVER -u FD_FORCE_KGSL \
+            -u ANLAND_DRM_DEVICE \
+            -u GALLIUM_DRIVER -u FD_FORCE_KGSL \
+            -u MESA_DEBUG -u LIBGL_ALWAYS_SOFTWARE -u TU_DEBUG \
+            MESA_LOADER_DRIVER_OVERRIDE=kgsl \
+            QT_LOGGING_RULES="kwin_scene_opengl.debug=true;kwin_drm.debug=true" \
+            $_loc_env \
             HOME="$DESKTOP_HOME" \
             KWIN_DRM_DEVICES="$DEV_DRM_CARD" \
             FD_MESA_DEBUG=noubwc \
             KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
-            XDG_SESSION_ID=bogus \
+            XDG_SESSION_ID="$DRM_SESSION_ID" \
             XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
             kwin_wayland --drm --socket="$_sock" $DEV_KWIN_EXTRA_ARGS \
@@ -474,10 +849,15 @@ drm_wayland_selfcheck() {
         drm_warn "没有 wayland-info，跳过 socket 自检"
         return 0
     fi
-    runuser -u "$DESKTOP_USER" -- env -u DISPLAY \
+    # ★ `drm_timeout` 是 **shell 函数**，不是可执行文件，**不能**写在 `env`/`runuser`
+    #   后面 —— 那样 env 会去找一个叫 drm_timeout 的程序，报
+    #   `env: 'drm_timeout': No such file or directory` 并返回非 0，
+    #   于是自检 100% 必失败、**每次接管都无条件回滚**，哪怕 KWin 已经成功接管
+    #   显示。必须把它套在**整条命令的最外层**。
+    drm_timeout 8 runuser -u "$DESKTOP_USER" -- env -u DISPLAY \
         WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
         XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" QT_QPA_PLATFORM=wayland \
-        drm_timeout 8 wayland-info >"${DRM_LOG_DIR}/wayland-info.log" 2>&1
+        wayland-info >"${DRM_LOG_DIR}/wayland-info.log" 2>&1
     if [ $? -ne 0 ]; then
         drm_err "wayland-info 连不上合成器（socket=$_sock）"
         return 1
@@ -488,9 +868,57 @@ drm_wayland_selfcheck() {
 
 # 强制点亮：stop 时安卓走关机流程会把 connector DPMS 拉 Off 并灭背光，
 # kwin 的新 commit 不一定把它拉回来 ⇒ 现象是"有模式、有提交、屏是黑的"。
+#
+# ★★ 重要限制（实测 2026-10-12）：本函数在 kwinwrap 交接**之后**才跑，
+#    而那时 **KWin 已经是 DRM master**（kwinwrap DROP_MASTER 后它按
+#    "首开者"规则成为 master）。非 master 写 connector 属性一律 EACCES：
+#        setprop: set DPMS=0  -> -1 (Permission denied)
+#        setbright 2048       -> -1 (Permission denied)
+#    所以**别指望这个函数救黑屏** —— 它只是尽力而为的补充。
+#    真正把 DPMS 拉回 On 的地方是 tools/runtime/kwinwrap.c 里对
+#    KWin 提交的 DPMS 注入（见那边的 conn_dpms_prop 注释），
+#    因为那才是唯一"拿着 master fd 写属性"的时间窗。
+#
+#    ⚠️ 原来这里把两个工具的**输出和返回值全丢进 /dev/null**，
+#    失败完全不可见。曾经因此把"权限不足、什么都没写"误读成"已强制点亮"。
+#    现在失败会记进日志。
 drm_force_display_on() {
-    _sp=$(drm_tool setprop 2>/dev/null)  && "$_sp" 0 DPMS >/dev/null 2>&1
-    _sb=$(drm_tool setbright 2>/dev/null) && "$_sb" "$DEV_BRIGHTNESS" >/dev/null 2>&1
+    # ── ① sysfs 背光：这条**不需要 DRM master**，是接管态下唯一有效的路 ──
+    #
+    #   bl_power=4（FB_BLANK_POWERDOWN）是安卓关机流程留下的**硬关背光电源**，
+    #   与 DPMS 是两条独立的路。实测：只写 brightness 无效
+    #   （brightness=2048 而 actual_brightness 仍 0），必须先 bl_power=0。
+    _bl=$(drm_backlight_node 2>/dev/null || true)
+    if [ -n "$_bl" ]; then
+        _bp=/sys/class/backlight/$_bl/bl_power
+        if [ -w "$_bp" ]; then
+            echo 0 >"$_bp" 2>/dev/null && drm_log "背光上电：bl_power=0（$_bl）"
+        fi
+        _bn=/sys/class/backlight/$_bl/brightness
+        if [ -w "$_bn" ]; then
+            echo "$DEV_BRIGHTNESS" >"$_bn" 2>/dev/null && \
+                drm_log "背光设值：brightness=$DEV_BRIGHTNESS（$_bl）"
+        fi
+    else
+        drm_warn "找不到背光节点 —— 无法上电（drm_backlight_node 返回空）"
+    fi
+
+    # ── ② DRM connector 属性：接管态下必然 EACCES，但非接管态有用 ──
+    _sp=$(drm_tool setprop 2>/dev/null) || _sp=""
+    if [ -n "$_sp" ]; then
+        _o=$("$_sp" 0 DPMS 2>&1) || drm_warn "setprop DPMS 失败（KWin 已是 master？）：$_o"
+    else
+        drm_warn "找不到 setprop 工具 —— 无法写 connector DPMS"
+    fi
+
+    _sb=$(drm_tool setbright 2>/dev/null) || _sb=""
+    if [ -n "$_sb" ]; then
+        _o=$("$_sb" "$DEV_BRIGHTNESS" 2>&1) || drm_warn "setbright 失败（KWin 已是 master？）：$_o"
+    else
+        drm_warn "找不到 setbright 工具 —— 无法写面板亮度"
+    fi
+
+    # 这两个只读工具的输出是排障依据，留着
     _cp=$(drm_tool crtcstate 2>/dev/null) && "$_cp" >"${DRM_LOG_DIR}/crtcstate.log" 2>&1
     _cn=$(drm_tool connprops 2>/dev/null) && "$_cn" >"${DRM_LOG_DIR}/connprops.log" 2>&1
     return 0
@@ -642,10 +1070,15 @@ drm_input_settle() {
     _i=0
     while [ "$_i" -lt 20 ]; do
         _ok=1
+        _seen=0
         for _p in $(drm_pids_by_comm kwin_wayland); do
+            _seen=1
             _fds=$(ls -l "/proc/$_p/fd" 2>/dev/null)
             case "$_fds" in *event*) ;; *) _ok=0 ;; esac
         done
+        # ★ 一个 kwin 都没有时，上面的 for 循环体根本不执行、_ok 会一直是 1，
+        #   于是"输入就位"变成无条件成功。必须显式区分"没进程"。
+        [ "$_seen" = 1 ] || _ok=0
         [ "$_ok" = 1 ] && [ "$_i" -gt 2 ] && break
         udevadm trigger --action=change --subsystem-match=input 2>/dev/null
         sleep 1
