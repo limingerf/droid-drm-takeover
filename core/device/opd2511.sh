@@ -128,7 +128,18 @@ DEV_KWIN_EXTRA_ARGS="--no-lockscreen --xwayland"
 #       六个 CRTC（200/265/274/283/292/301）各失败 4 次，w:3200 hdisp:1600 共 24 次。
 #
 #   ⇒ SDE 的**每个 CRTC 最大水平显示宽度是 1600**，不是 3200。
-#     面板 3200 宽必须由**两个 1600 半屏**（两个 CRTC/plane）拼出来。
+#     所以整块 3200 宽面板必须拆成多段分别驱动。
+#
+#   ⚠️ 一度据此推断"两个 1600 半屏"，**这是错的**。真正的形态由
+#      conn67 的 topology_name 决定，本机实测 = 13 = sde_quadpipe_dscmerge
+#      （IMMUTABLE，驱动按面板能力定）⇒ **四管 + DSC 合并**，
+#      必须由 **4 个 Primary(VIG) 平面各 800 宽**驱动同一帧缓冲。
+#      Android 侧实测（容器里 kmsdump 读，不需要 master）：
+#        PLANE 131  CRTC_X=0    SRC_X=0
+#        PLANE 127  CRTC_X=800  SRC_X=800
+#        PLANE 123  CRTC_X=0    SRC_X=1600
+#        PLANE 92   CRTC_X=800  SRC_X=2400
+#      即双 DSI 每条链路 2 管、链路内目的坐标 0/800，源列是整幅图上的真实列。
 #
 #   安卓日志里的 `dsi_display_set_mode: hactive=3200` 是**整块面板**的
 #   合成时序参数，不代表单个 CRTC 能吃 3200 宽 —— 我一度按后者理解，
@@ -139,6 +150,14 @@ DEV_KWIN_EXTRA_ARGS="--no-lockscreen --xwayland"
 # MODE_ID/ACTIVE，内核判 EINVAL），不是"该不该分屏"的问题。
 # 这个开关留着是为了将来换到真·对称单 CRTC 面板时能一键切回来。
 DEV_KWINWRAP_NO_SPLIT=""                                 # ✔实测：必须为空
+
+# ── 分屏平面顺序（✔实测，照抄 Android）─────────────────────
+# 运行时发现只能按 id 升序给出 Primary 平面（92,123,127,131），
+# 但"哪个 VIG 管驱动哪一段"是硬件固定的。上面那条 Android 基线给出的
+# 顺序是 131,127,123,92，对应源列 0/800/1600/2400。
+# 顺序错了画面会错位/错配，所以在这里固化核对过的顺序。
+# （kwinwrap 的几何规则：SRC_X = 下标*段宽，CRTC_X = (下标%2)*段宽）
+DEV_KWINWRAP_SPLIT_PLANES="131,127,123,92"               # ✔实测（照抄 Android）
 
 # ── 安卓稳定性开关（接管期间要解除武装）────────────────────
 # ~推测：本机是 ColorOS 17。实测 `settings list global` 里看不到

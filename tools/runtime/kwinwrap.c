@@ -70,15 +70,51 @@ static char propnames[512][16];
  * 声明放在这里（而不是下面的大段注释处），是因为 keep_prop / init_keep /
  * probe_split 都比它早出现。
  */
-static unsigned SPLIT_PLANE_VIRT  = 92u;   /* 编译期兜底：piano */
-static unsigned SPLIT_PLANE_VIRT2 = 123u;
-static unsigned SPLIT_PLANE_L     = 92u;
-static unsigned SPLIT_PLANE_R     = 123u;
+/* ★★ 分屏改成 N 段（N = SPLIT_NSEG）。
+ *
+ * 为什么不是 2 段 —— 本机面板 conn67 的 topology_name = 13 =
+ * **sde_quadpipe_dscmerge**（IMMUTABLE，驱动按面板能力定），
+ * 即"四管 + DSC 合并"。Android 侧实测（容器里 kmsdump 读，不需要 master）
+ * 它在 CRTC 200 上同时挂 **4 个 Primary 平面**，每个 CRTC_W=800：
+ *
+ *     PLANE 131   CRTC_X=0     SRC_X=0
+ *     PLANE 127   CRTC_X=800   SRC_X=800
+ *     PLANE 123   CRTC_X=0     SRC_X=1600
+ *     PLANE 92    CRTC_X=800   SRC_X=2400
+ *
+ * 也就是双 DSI **每条链路 2 管**，链路内的目的坐标是 0/800；
+ * 而源坐标就是整块 3200 宽帧缓冲上的真实列。
+ *
+ * 之前实现用 2 个 Overlay 平面各 1600 宽 —— 四管里两管拿不到数据，
+ * 屏幕就是细密交织噪声（实测照片：满屏横条纹 + 彩虹色偏，无任何图形）。
+ *
+ * 几何规则（对任意 N 段、段宽 SPLIT_W 通用）：
+ *     SRC_X  = i * SPLIT_W           源：整幅图里的第 i 段
+ *     CRTC_X = (i % 2) * SPLIT_W     目的：双 DSI 链路内地址
+ * N = 2 时正好退化成旧行为，所以老设备配置不用改。
+ *
+ * ⚠️ 平面顺序必须与 SRC_X 递增一致：数组下标 i 同时决定 SRC_X=i*W，
+ *    所以 SPLIT_PLANE[] 要按源列从左到右排。 */
+#define SPLIT_MAX_SEG 4
+static unsigned SPLIT_PLANE[SPLIT_MAX_SEG] = { 131u, 127u, 123u, 92u };
+static int      SPLIT_NSEG        = 4;
 static unsigned SPLIT_CRTC        = 200u;
 static unsigned SPLIT_CONN        = 67u;
-static unsigned SPLIT_W           = 1600u;
+static unsigned SPLIT_W           = 800u;
 static unsigned SPLIT_H           = 2000u;
+static unsigned SPLIT_W_FULL      = 3200u;  /* 面板整宽（发现时从 mode 读） */
 static int SPLIT_DISCOVERED;               /* 1 = 运行时发现成功 */
+
+static int is_split_plane(unsigned id) {
+    for (int i = 0; i < SPLIT_NSEG; i++)
+        if (SPLIT_PLANE[i] == id) return 1;
+    return 0;
+}
+static int split_seg_index(unsigned id) {
+    for (int i = 0; i < SPLIT_NSEG; i++)
+        if (SPLIT_PLANE[i] == id) return i;
+    return -1;
+}
 
 static void init_split(void);
 
@@ -343,7 +379,7 @@ static void init_keep(void) {
         /* 默认保留：真面板 connector + 它的 crtc + kwin 会挑的那个 plane */
         KEEP_OBJS[n++] = SPLIT_CONN;
         KEEP_OBJS[n++] = SPLIT_CRTC;
-        KEEP_OBJS[n++] = SPLIT_PLANE_VIRT;
+        KEEP_OBJS[n++] = SPLIT_PLANE[0];
     }
     NKEEP = n;
 }
@@ -387,16 +423,25 @@ static void init_split(void)
     if ((e = getenv("KWINWRAP_SPLIT_W")))     { SPLIT_W    = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
     if ((e = getenv("KWINWRAP_SPLIT_H")))     { SPLIT_H    = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
     if ((e = getenv("KWINWRAP_SPLIT_PLANES"))) {
-        unsigned v[4]; int n = 0;
-        for (char *s = strtok((char *)e, ","); s && n < 4; s = strtok(NULL, ","))
+        /* 接受任意段数（1..SPLIT_MAX_SEG）的逗号列表，按**源列从左到右**排列。
+         * 旧的 "L,R" 两段写法自然兼容：N=2 时几何退化成 0/1600 与 0/1600。 */
+        unsigned v[SPLIT_MAX_SEG]; int n = 0;
+        for (char *s = strtok((char *)e, ","); s && n < SPLIT_MAX_SEG;
+             s = strtok(NULL, ","))
             v[n++] = (unsigned)strtoul(s, NULL, 0);
-        if (n >= 1) { SPLIT_PLANE_L = SPLIT_PLANE_VIRT = v[0]; from_env = 1; }
-        if (n >= 2) { SPLIT_PLANE_R = SPLIT_PLANE_VIRT2 = v[1]; from_env = 1; }
+        if (n >= 1) {
+            for (int i = 0; i < n; i++) SPLIT_PLANE[i] = v[i];
+            SPLIT_NSEG = n;
+            from_env = 1;
+        }
     }
     if (from_env) {
         SPLIT_DISCOVERED = 1;
-        fprintf(LOG, "split: 来自环境变量 conn=%u crtc=%u planes=%u,%u %ux%u\n",
-                SPLIT_CONN, SPLIT_CRTC, SPLIT_PLANE_L, SPLIT_PLANE_R, SPLIT_W, SPLIT_H);
+        fprintf(LOG, "split: 来自环境变量 conn=%u crtc=%u planes=", SPLIT_CONN,
+                SPLIT_CRTC);
+        for (int i = 0; i < SPLIT_NSEG; i++)
+            fprintf(LOG, "%s%u", i ? "," : "", SPLIT_PLANE[i]);
+        fprintf(LOG, " (%d 段) %ux%u\n", SPLIT_NSEG, SPLIT_W, SPLIT_H);
     }
 
     if (DRMFD < 0) return;
@@ -455,15 +500,16 @@ static void init_split(void)
         }
     }
     if (c->count_modes > 0) {
+        SPLIT_W_FULL = c->modes[0].hdisplay;   /* 面板整宽，供后面按段数等分 */
         if (!(e = getenv("KWINWRAP_SPLIT_H"))) SPLIT_H = c->modes[0].vdisplay;
         if (!(e = getenv("KWINWRAP_SPLIT_W"))) {
-            /* 宽度按 plane 数量等分：两个 plane 就是半宽 */
-            unsigned npl = 2;
-            SPLIT_W = c->modes[0].hdisplay / (npl ? npl : 1);
+            /* 段宽先按当前段数算；平面发现后若段数变了会重算（见下） */
+            SPLIT_W = SPLIT_W_FULL / (SPLIT_NSEG ? (unsigned)SPLIT_NSEG : 1u);
         }
         SPLIT_DISCOVERED = 1;
-        fprintf(LOG, "split: 面板 mode %ux%u → 每段 %ux%u\n",
-                c->modes[0].hdisplay, c->modes[0].vdisplay, SPLIT_W, SPLIT_H);
+        fprintf(LOG, "split: 面板 mode %ux%u → 每段 %ux%u（%d 段）\n",
+                c->modes[0].hdisplay, c->modes[0].vdisplay, SPLIT_W, SPLIT_H,
+                SPLIT_NSEG);
     }
     drmModeFreeConnector(c);
 
@@ -472,6 +518,7 @@ static void init_split(void)
         drmModePlaneRes *pr = drmModeGetPlaneResources(DRMFD);
         if (pr) {
             unsigned cand[64]; int nc = 0;
+            unsigned prim[64]; int nprim = 0;   /* type==Primary 的子集 */
             int crtc_idx = -1;
             for (int i = 0; i < res->count_crtcs; i++)
                 if (res->crtcs[i] == SPLIT_CRTC) { crtc_idx = i; break; }
@@ -479,7 +526,29 @@ static void init_split(void)
                 for (uint32_t i = 0; i < pr->count_planes && nc < 64; i++) {
                     drmModePlane *p = drmModeGetPlane(DRMFD, pr->planes[i]);
                     if (!p) continue;
-                    if (p->possible_crtcs & (1u << crtc_idx)) cand[nc++] = p->plane_id;
+                    if (p->possible_crtcs & (1u << crtc_idx)) {
+                        cand[nc++] = p->plane_id;
+                        /* ★ 只把 type==Primary 的挑出来。
+                         *   实测教训：纯按 id 升序挑前两个，在本机挑到的是
+                         *   Overlay(DMA) 平面 143/147，而面板要的是
+                         *   sde_quadpipe_dscmerge —— 四管必须由 **Primary
+                         *   (VIG)** 平面驱动。挑错类型 → 屏幕是交织噪声。 */
+                        drmModeObjectPropertiesPtr op = drmModeObjectGetProperties(
+                            DRMFD, p->plane_id, DRM_MODE_OBJECT_PLANE);
+                        if (op) {
+                            for (uint32_t k = 0; k < op->count_props; k++) {
+                                drmModePropertyPtr pp = drmModeGetProperty(DRMFD, op->props[k]);
+                                if (pp) {
+                                    if (!strcmp(pp->name, "type") &&
+                                        op->prop_values[k] == DRM_PLANE_TYPE_PRIMARY &&
+                                        nprim < 64)
+                                        prim[nprim++] = p->plane_id;
+                                    drmModeFreeProperty(pp);
+                                }
+                            }
+                            drmModeFreeObjectProperties(op);
+                        }
+                    }
                     drmModeFreePlane(p);
                 }
             }
@@ -487,23 +556,35 @@ static void init_split(void)
             for (int i = 0; i < nc; i++)
                 for (int j = i + 1; j < nc; j++)
                     if (cand[j] < cand[i]) { unsigned t = cand[i]; cand[i] = cand[j]; cand[j] = t; }
+            for (int i = 0; i < nprim; i++)
+                for (int j = i + 1; j < nprim; j++)
+                    if (prim[j] < prim[i]) { unsigned t = prim[i]; prim[i] = prim[j]; prim[j] = t; }
 
             fprintf(LOG, "split: 能驱动 crtc%u 的 plane 候选（%d 个）:", SPLIT_CRTC, nc);
             for (int i = 0; i < nc; i++) fprintf(LOG, " %u", cand[i]);
             fprintf(LOG, "\n");
+            fprintf(LOG, "split: 其中 Primary(VIG) 平面 %d 个:", nprim);
+            for (int i = 0; i < nprim; i++) fprintf(LOG, " %u", prim[i]);
+            fprintf(LOG, "\n");
 
-            if (nc >= 2) {
-                /* 前两个作左右半屏。⚠️ 这只是启发式：真正的左右 plane
-                 * 需要配合 drm-diag-once.sh 的输出人工确认，
-                 * 确认后用 KWINWRAP_SPLIT_PLANES 固定。 */
-                SPLIT_PLANE_L = SPLIT_PLANE_VIRT  = cand[0];
-                SPLIT_PLANE_R = SPLIT_PLANE_VIRT2 = cand[1];
+            /* ★ 优先用 Primary：段数取 min(Primary 数, SPLIT_MAX_SEG)。
+             *   段宽 = 面板宽 / 段数。取不到 Primary 才退回全部候选。 */
+            unsigned *use = nprim >= 2 ? prim : cand;
+            int nu = nprim >= 2 ? nprim : nc;
+            if (nu >= 2) {
+                int nseg = nu > SPLIT_MAX_SEG ? SPLIT_MAX_SEG : nu;
+                for (int i = 0; i < nseg; i++) SPLIT_PLANE[i] = use[i];
+                SPLIT_NSEG = nseg;
+                SPLIT_W = SPLIT_W_FULL / (unsigned)nseg;
                 SPLIT_DISCOVERED = 1;
-                fprintf(LOG, "split: 启发式选中 planes %u,%u —— 请用 --probe-split 核对\n",
-                        cand[0], cand[1]);
+                fprintf(LOG, "split: 选中 %d 段 %s 平面:", nseg,
+                        nprim >= 2 ? "Primary(VIG)" : "（无 Primary，退回候选）");
+                for (int i = 0; i < nseg; i++)
+                    fprintf(LOG, " %u(src_x=%u)", SPLIT_PLANE[i], i * SPLIT_W);
+                fprintf(LOG, "  每段 %ux%u —— 请用 --probe-split 核对\n",
+                        SPLIT_W, SPLIT_H);
             } else {
-                fprintf(LOG, "split: 候选 plane 不足 2 个，保留兜底 planes %u,%u\n",
-                        SPLIT_PLANE_L, SPLIT_PLANE_R);
+                fprintf(LOG, "split: 候选 plane 不足 2 个，保留兜底配置\n");
             }
             drmModeFreePlaneResources(pr);
         }
@@ -514,10 +595,9 @@ static void init_split(void)
     if (!SPLIT_DISCOVERED) {
         fprintf(LOG,
             "split: ⚠️⚠️ 运行时发现失败，正在使用编译期兜底值 "
-            "conn=%u crtc=%u planes=%u,%u %ux%u —— 这些是 piano 的值，"
-            "在本设备上几乎肯定是错的！请跑 `kwinwrap --probe-split` "
+            "conn=%u crtc=%u %ux%u —— 请跑 `kwinwrap --probe-split` "
             "并用 KWINWRAP_SPLIT_* 显式指定。\n",
-            SPLIT_CONN, SPLIT_CRTC, SPLIT_PLANE_L, SPLIT_PLANE_R, SPLIT_W, SPLIT_H);
+            SPLIT_CONN, SPLIT_CRTC, SPLIT_W, SPLIT_H);
     }
 }
 
@@ -530,13 +610,19 @@ static int probe_split(void)
     if (!LOG) LOG = stderr;   /* 发现过程的日志走 stderr，stdout 留给 eval */
     DRMFD = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
     if (DRMFD < 0) { perror("open /dev/dri/card0"); return 1; }
+    /* ★ 必须先设 UNIVERSAL_PLANES，否则看不到 Primary 平面（见 main 里那段） */
+    drmSetClientCap(DRMFD, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    drmSetClientCap(DRMFD, DRM_CLIENT_CAP_ATOMIC, 1);
     init_split();
     /* 发现过程写日志，结果写 stdout（两者分开，方便 eval） */
     printf("KWINWRAP_SPLIT_CONN=%u\n", SPLIT_CONN);
     printf("KWINWRAP_SPLIT_CRTC=%u\n", SPLIT_CRTC);
     printf("KWINWRAP_SPLIT_W=%u\n", SPLIT_W);
     printf("KWINWRAP_SPLIT_H=%u\n", SPLIT_H);
-    printf("KWINWRAP_SPLIT_PLANES=%u,%u\n", SPLIT_PLANE_L, SPLIT_PLANE_R);
+    printf("KWINWRAP_SPLIT_PLANES=");
+    for (int i = 0; i < SPLIT_NSEG; i++)
+        printf("%s%u", i ? "," : "", SPLIT_PLANE[i]);
+    printf("\n");
     /* ⚠️ card0 的"首个打开者自动成为 master"规则意味着上面这次 open
      * 可能已经把 master 拿走了。显式 DROP 掉，别让一次探针影响随后
      * 真正的交接时序（关 fd 也会释放，但显式更确定）。 */
@@ -847,7 +933,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
     unsigned total = 0, eoff[64];
     for (__u32 i = 0; i < nobj; i++) {
         eoff[i] = total;
-        if (s_objs[i] == SPLIT_PLANE_VIRT || s_objs[i] == SPLIT_PLANE_VIRT2) {
+        if (is_split_plane(s_objs[i])) {
             if (p97 < 0) p97 = (int)i;
             else if (pdup < 0) pdup = (int)i;
         }
@@ -1109,17 +1195,17 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
     }
     if (do_split) {
         if (!pl_crtc) {
-            pl_crtc = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
-            pl_fb = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "FB_ID");
-            if (!pl_fb) pl_fb = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "FB");
-            pl_sx = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "SRC_X");
-            pl_sy = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "SRC_Y");
-            pl_sw = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "SRC_W");
-            pl_sh = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "SRC_H");
-            pl_cx = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "CRTC_X");
-            pl_cy = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
-            pl_cw = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "CRTC_W");
-            pl_ch = find_prop(SPLIT_PLANE_L, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+            pl_crtc = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+            pl_fb = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "FB_ID");
+            if (!pl_fb) pl_fb = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "FB");
+            pl_sx = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "SRC_X");
+            pl_sy = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "SRC_Y");
+            pl_sw = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "SRC_W");
+            pl_sh = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "SRC_H");
+            pl_cx = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "CRTC_X");
+            pl_cy = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+            pl_cw = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "CRTC_W");
+            pl_ch = find_prop(SPLIT_PLANE[0], DRM_MODE_OBJECT_PLANE, "CRTC_H");
             fprintf(LOG, "SPLIT: prop ids fb=%u crtc=%u src=%u/%u/%u/%u dst=%u/%u/%u/%u\n",
                     pl_fb, pl_crtc, pl_sx, pl_sy, pl_sw, pl_sh, pl_cx, pl_cy, pl_cw, pl_ch);
             fflush(LOG);
@@ -1133,8 +1219,8 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
      * garbage -> check failure / E2BIG). */
     __u32 no = 0, np = 0;
     unsigned off = 0;
-    int hfound[2] = {0, 0};
-    const __u32 halves[2] = { SPLIT_PLANE_L, SPLIT_PLANE_R };
+    int hfound[SPLIT_MAX_SEG];
+    memset(hfound, 0, sizeof hfound);
     /* dmesg-proven: on a real commit carrying PAGE_FLIP_EVENT the kernel
      * creates a vblank event for EVERY crtc state in the commit; an event on
      * an off pipe fails drm_atomic_crtc_check ("requesting event but off",
@@ -1165,17 +1251,21 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
                 continue;
             }
         }
-        int hidx = (s_objs[o] == halves[0]) ? 0 :
-                   (s_objs[o] == halves[1]) ? 1 : -1;
+        int hidx = split_seg_index(s_objs[o]);
         if (do_split && hidx >= 0) {
             __u32 n0 = np;
             s_props2[np] = pl_crtc; s_vals2[np++] = SPLIT_CRTC;
             s_props2[np] = pl_fb;   s_vals2[np++] = fb;
+            /* 几何规则（与 Android 基线一致）：
+             *   源列 = 段号 * 段宽（整幅 3200 图上的真实列）
+             *   目的 = (段号 % 2) * 段宽（双 DSI 每条链路内的地址 0/800）
+             * Android 实测：131→(0,0) 127→(800,800) 123→(0,1600) 92→(800,2400)
+             * 正是 (crtc_x, src_x)，完全吻合。 */
             s_props2[np] = pl_sx; s_vals2[np++] = (__u64)hidx * SPLIT_W << 16;
             s_props2[np] = pl_sy; s_vals2[np++] = 0;
             s_props2[np] = pl_sw; s_vals2[np++] = (__u64)SPLIT_W << 16;
             s_props2[np] = pl_sh; s_vals2[np++] = (__u64)SPLIT_H << 16;
-            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)hidx * SPLIT_W;
+            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)(hidx % 2) * SPLIT_W;
             s_props2[np] = pl_cy; s_vals2[np++] = 0;
             s_props2[np] = pl_cw; s_vals2[np++] = SPLIT_W;
             s_props2[np] = pl_ch; s_vals2[np++] = SPLIT_H;
@@ -1301,7 +1391,7 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
         }
     }
     if (do_split) {
-        for (int h = 0; h < 2; h++) {
+        for (int h = 0; h < SPLIT_NSEG; h++) {
             if (hfound[h]) continue;
             __u32 n0 = np;
             s_props2[np] = pl_crtc; s_vals2[np++] = SPLIT_CRTC;
@@ -1310,11 +1400,11 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             s_props2[np] = pl_sy; s_vals2[np++] = 0;
             s_props2[np] = pl_sw; s_vals2[np++] = (__u64)SPLIT_W << 16;
             s_props2[np] = pl_sh; s_vals2[np++] = (__u64)SPLIT_H << 16;
-            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)h * SPLIT_W;
+            s_props2[np] = pl_cx; s_vals2[np++] = (__u64)(h % 2) * SPLIT_W;
             s_props2[np] = pl_cy; s_vals2[np++] = 0;
             s_props2[np] = pl_cw; s_vals2[np++] = SPLIT_W;
             s_props2[np] = pl_ch; s_vals2[np++] = SPLIT_H;
-            s_objs[no] = halves[h];
+            s_objs[no] = SPLIT_PLANE[h];
             s_cnts[no] = np - n0;
             no++;
         }
@@ -1686,13 +1776,35 @@ int main(int argc, char **argv) {
       fprintf(LOG, "kwinwrap: %s", caps); fflush(LOG); }
     DRMFD = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
 
+    /* ★★ 这两个能力必须在 init_split() **之前**设。
+     *
+     * 实测（OPD2511，2026-10-12）：不设 DRM_CLIENT_CAP_UNIVERSAL_PLANES 时，
+     * 本机内核的 drmModeGetPlaneResources 只返回 **14 个 Overlay(DMA) 平面**，
+     * 6 个 Primary(VIG) 平面（92/123/127/131/135/139）**完全不出现**。
+     * 于是平面发现只能挑到 Overlay 143/147/151/155 —— 而本面板
+     * topology_name=13=sde_quadpipe_dscmerge，四管必须由 Primary 驱动，
+     * 挑错类型的结果就是屏幕交织噪声。
+     *
+     * kmsdump 一直能列全 20 个平面，就是因为它先调了
+     * drmSetClientCap(UNIVERSAL_PLANES)（见 tools/probe/kmsdump.c）。
+     * 原来这里把两个 setcap 放在 init_split() 之后，发现阶段看到的是
+     * legacy 平面表 —— 一个"看不见 Primary"的静默陷阱。 */
+    int cap_u = -1, cap_a = -1;
+    if (DRMFD >= 0) {
+        cap_u = drmSetClientCap(DRMFD, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+        cap_a = drmSetClientCap(DRMFD, DRM_CLIENT_CAP_ATOMIC, 1);
+    }
+
     /* ★ split 几何必须在拿 master 之前定下来：它决定 KEEP_OBJS 与
      *   pre-disable 的目标对象。原版这里是编译期常量（piano 的）。 */
     init_split();
     init_keep();
-    fprintf(LOG, "kwinwrap: split conn=%u crtc=%u planes=%u,%u %ux%u discovered=%d\n",
-            SPLIT_CONN, SPLIT_CRTC, SPLIT_PLANE_L, SPLIT_PLANE_R, SPLIT_W, SPLIT_H,
+    fprintf(LOG, "kwinwrap: split conn=%u crtc=%u %d 段 %ux%u discovered=%d planes=",
+            SPLIT_CONN, SPLIT_CRTC, SPLIT_NSEG, SPLIT_W, SPLIT_H,
             SPLIT_DISCOVERED);
+    for (int i = 0; i < SPLIT_NSEG; i++)
+        fprintf(LOG, "%s%u", i ? "," : "", SPLIT_PLANE[i]);
+    fprintf(LOG, "\n");
     fprintf(LOG, "kwinwrap: keep=%u,%u,%u (n=%d)\n",
             KEEP_OBJS[0], KEEP_OBJS[1], KEEP_OBJS[2], NKEEP);
 
@@ -1710,9 +1822,9 @@ int main(int argc, char **argv) {
             /* relayed atomics hit file_priv->atomic / universal_planes caps
              * in the kernel handler — enable them on the shared file now,
              * before kwin's first TEST_ONLY commit arrives. */
-            int c1 = drmSetClientCap(DRMFD, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
-            int c2 = drmSetClientCap(DRMFD, DRM_CLIENT_CAP_ATOMIC, 1);
-            fprintf(LOG, "kwinwrap: caps universal=%d atomic=%d\n", c1, c2);
+            /* 能力已在 main 开头（init_split 之前）设过 —— 这里只报结果。
+             * 放在发现之后设会让发现阶段看不到 Primary 平面，见那段注释。 */
+            fprintf(LOG, "kwinwrap: caps universal=%d atomic=%d\n", cap_u, cap_a);
             /* The vendor composer left the panel ON (crtc active, connector
              * linked). Its DSI bridge refuses mode changes on an active
              * panel ("seamless" path -> -22 in atomic check), and kwin's

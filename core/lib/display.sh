@@ -548,6 +548,21 @@ drm_kwinwrap_split_env() {
             ;;
     esac
 
+    # ★ 设备适配层可用 DEV_KWINWRAP_SPLIT_PLANES 覆盖平面列表**与顺序**。
+    #
+    #   为什么必须能覆盖：运行时发现只能按 id 升序给出 Primary 平面
+    #   （本机得到 92,123,127,131），但"哪个 VIG 管驱动哪一段"是硬件固定的。
+    #   Android 侧实测（容器里 kmsdump 读，不需要 master）的顺序是
+    #       131(src0) 127(src800) 123(src1600) 92(src2400)
+    #   —— 与 id 升序**不同**。顺序错了画面会错位/错配。
+    #   所以把核对过的顺序固化在 core/device/<机型>.sh 里。
+    if [ -n "${DEV_KWINWRAP_SPLIT_PLANES:-}" ]; then
+        _raw=$(printf '%s\n' "$_raw" | grep -v '^KWINWRAP_SPLIT_PLANES=')
+        _raw="$_raw
+KWINWRAP_SPLIT_PLANES=$DEV_KWINWRAP_SPLIT_PLANES"
+        drm_log "split 平面顺序由设备适配层固定：$DEV_KWINWRAP_SPLIT_PLANES"
+    fi
+
     drm_log "kwinwrap split 几何（运行时发现）："
     printf '%s\n' "$_raw" | while IFS= read -r _l; do
         [ -n "$_l" ] && drm_log "  $_l"
