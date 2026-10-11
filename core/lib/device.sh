@@ -19,9 +19,17 @@ DRM_DEVICE_DIR=${DRM_DEVICE_DIR:-}
 
 drm_device_dir_resolve() {
     [ -n "$DRM_DEVICE_DIR" ] && return 0
-    # 相对本文件定位，避免依赖调用者的 cwd
+    # ★ 第一项用 DRM_ROOT —— 所有入口（core/switch.sh、core/lib/boot.sh、
+    #   linux/*.sh、tools/verify/*.sh）都会在 source 本文件之前设好它。
+    #
+    #   这里原来是 `$(dirname "$0")/../device`，注释写着"相对本文件定位"，
+    #   但它是错的：POSIX 里被 source 的文件看到的 $0 是**调用方**的路径。
+    #   从 core/switch.sh 调用时算出的是 `core/../device` = `device`，
+    #   根本不存在。设备上之所以还能跑，纯粹是被后面的绝对路径兜底救了 ——
+    #   换句话说换个安装前缀（linux/install.sh --prefix /opt/foo）就会直接 die，
+    #   而在仓库里直接跑任何脚本都会 die。
     for _c in \
-        "$(dirname "$0")/../device" \
+        "$DRM_ROOT/core/device" \
         "/root/$DRM_PROJECT/core/device" \
         "${DRM_ANDROID_PAYLOAD:-/data/local/$DRM_PROJECT}/core/device" \
         "/opt/$DRM_PROJECT/core/device"

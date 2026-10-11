@@ -116,9 +116,9 @@ sh android/build.sh
 adb install -r android/build/drmswitch.apk
 ```
 
-> ⚠️ **顺序不能反。** `android/build.sh` 在 `bin/` 不存在时只**警告**、不失败，
-> 于是你会得到一个"脚本齐全、但一个二进制都没有"的 APK —— 装上去点「进入 Linux」
-> 会在拉起会话那一步失败。构建后确认一下：
+> ⚠️ **顺序不能反。** 缺 `bin/` 时 `android/build.sh` 会直接失败（带补救命令），
+> 因为那样的 APK"脚本齐全、但一个二进制都没有"，装上去点「进入 Linux」会在
+> 拉起会话那一步失败，现场信息还很间接。构建后确认一下：
 >
 > ```sh
 > unzip -l android/build/drmswitch.apk | grep -c 'assets/payload/bin/'   # 应为 24
@@ -131,10 +131,19 @@ sudo sh linux/install.sh          # 装进应用菜单
 sudo sh linux/install.sh --uninstall
 ```
 
-首次上新设备请先跑取证与试跑，别直接常驻：
+### 上真机之前先跑验收
 
 ```sh
-sudo sh display/drm-diag-once.sh                  # 抓 KMS 拓扑
+# 只读检查，不改任何状态、不接管、不重启。
+# 缺 Droidspaces、触摸节点找不到、split 几何发现不了、bin/ 没有执行位
+# —— 这类问题都会在这一步暴露，而不必先接管一次然后黑屏。
+adb shell su -c 'sh /data/local/drm-takeover/tools/verify/device-acceptance.sh'
+```
+
+它逐项给出 ✅/❌/⚠️ 和汇总，退出码 = 失败项数量。全过之后再上新设备：
+
+```sh
+sudo sh display/drm-diag-once.sh                  # 抓 KMS 拓扑（新设备适配用）
 sudo DRM_TRIAL_SECS=150 sh display/drm-takeover.sh  # 试跑 150s 后自动回滚
 ```
 
@@ -170,10 +179,16 @@ display/
   desk-takeover.sh        常驻接管（容器侧入口）
   desk-stop.sh            原地返回安卓（半死状态，慎用）
   drm-stop.sh             兼容入口，转发到 desk-stop.sh
+  kill-desktop.sh         容器侧清理桌面栈（source boot.sh 后用 /proc 扫描）
   kwin-restart.sh         只重启 KWin
   keepbright.sh           背光钉住
   dmesg-harvester.sh      周期收割安卓 dmesg
   drm-diag-once.sh        新设备适配取证
+tools/
+  runtime/                脚本硬依赖的 6 个（kwinwrap 等）
+  probe/                  适配期探针
+  verify/device-acceptance.sh   ★ 真机验收（只读，逐项 ✅/❌）
+  lint/shell-lint.py      静态检查：未定义函数 / 缺失命令 / bash 构造
 tools/
   runtime/                脚本硬依赖的最小集（kwinwrap/setbright/setprop/crtcstate/connprops/atomicspy.so）
   probe/                  设备适配期探针，不参与日常流程
