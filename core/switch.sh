@@ -293,35 +293,67 @@ cmd_exit() {
 # ★ 顺序要害：退出请求文件必须在**停容器之前**删掉——容器一停，
 #   共享目录（容器 /root 的 host 侧挂载）就没了，那时再删就删不掉，
 #   下次开机它还在，会导致一开机就重启。
+# "自己 + 自己的所有后代" 的 pid 集合，形如 " 123 456 789 "（便于 case 匹配）。
+#
+# ★ 为什么需要它：`$( )` 与管道会 fork，而 fork 出来的子 shell **命令行与父进程
+#   一模一样**（都是 `sh .../switch.sh watch`）。原来的实现只跳过 `$$` 和
+#   PPID=$$ 的直接子进程，**漏掉了孙进程** —— `$(drm_watch_pids | tr ...)`
+#   里真正跑函数的那个子 shell，PPID 是 `$( )` 的子 shell，不是 `$$`，
+#   于是被当成"另一个守护"。
+#
+#   实测后果（很隐蔽）：开机时 KernelSU 模块把守护拉起来，守护第一件事就是
+#   查单例，结果扫到自己的孙进程，记一条
+#     "watch 已在跑（pid=2733 2988 2993 3031），退出"
+#   然后立刻自杀。守护没起来、日志里却写着"已在跑"，`status` 又报 not running。
+#   从 adb shell 手动 start 时 fork 层数不同，反而常常能跑起来 —— 所以这个
+#   bug 只在开机自启路径上暴露。
+drm_self_tree() {
+    _t=" $$ "
+    _ch=1
+    while [ "$_ch" = 1 ]; do
+        _ch=0
+        for _d in /proc/[0-9]*; do
+            _q=${_d#/proc/}
+            case "$_t" in *" $_q "*) continue ;; esac
+            _pq=$(sed 's/.*) //' "$_d/stat" 2>/dev/null | awk '{print $2}')
+            [ -n "$_pq" ] || continue
+            case "$_t" in
+                *" $_pq "*) _t="$_t$_q "; _ch=1 ;;
+            esac
+        done
+    done
+    printf '%s' "$_t"
+}
+
 # 所有 watch 守护进程的 pid。
 #
 # ★ 坑一：不能用 drm_pids_by_cmdline "switch.sh watch" —— 它是**子串**匹配，
 #   会把 `switch.sh watch-status` / `watch-stop` 也匹配进来。
-#   这里要求命令行以 `switch.sh watch` 结尾（或后面跟一个空格参数）。
+#   这里要求命令行**以** `switch.sh watch` 结尾，见下面的 case。
 #
-# ★ 坑二（实测踩过，很隐蔽）：必须排除**自己的子进程**。
-#   `$( )` 和管道都会 fork 出子 shell，而 fork 出来的子 shell
-#   **命令行与父进程一模一样**（都是 `sh .../switch.sh watch`）——
-#   于是 `drm_watch_pids` 每次都扫到自己刚才 fork 的那个子 shell，
-#   把它当成"另一个守护"。现象是守护每次启动都立刻记一条
-#   "watch 已在跑（pid=NNN），退出" 然后死掉，而那个 NNN 每次都不一样。
-#   （`$$` 在子 shell 里确实是主 shell 的 pid —— mksh 与 dash 都如此，
-#     所以只跳过 `$$` 是不够的。）
-#   真正的第二个守护是 setsid 出来的，PPID=1，不会被这条误伤。
+# ★ 坑二（实测踩过，很隐蔽）：必须排除**自己整棵后代树**，见 drm_self_tree()。
 drm_watch_pids() {
+    _tree=$(drm_self_tree)
     for _d in /proc/[0-9]*; do
         _p=${_d#/proc/}
-        [ "$_p" = "$$" ] && continue
+        case "$_tree" in *" $_p "*) continue ;; esac
         [ -r "$_d/cmdline" ] || continue
         _cl=$(tr '\0' ' ' <"$_d/cmdline" 2>/dev/null) || continue
         [ -n "$_cl" ] || continue
+        # ★ 必须要求命令行**以** `switch.sh watch` 结尾。
+        #   原来写的是 case "$_cl" in *"switch.sh watch") ...
+        #   —— 那是**子串**匹配，`switch.sh watch-status` / `switch.sh watch-stop`
+        #   一样命中！而 exit-watch.sh 的 _alive() 就是靠调 watch-status 判活的，
+        #   于是"查状态"这个动作本身被当成了"有另一个守护在跑"。
+        #   实测后果：开机时模块把守护拉起来，守护第一件事查单例，
+        #   恰好撞上别处正在跑的 watch-status，于是记一条
+        #     "watch 已在跑（pid=2734 3027 3032），退出"
+        #   然后自杀 —— 守护永远起不来，而日志说"已在跑"。
+        _cl=${_cl% }
         case "$_cl" in
-            *"switch.sh watch"|*"switch.sh watch "*) ;;
+            *"switch.sh watch") ;;
             *) continue ;;
         esac
-        # stat 的第 2 字段 comm 可能含空格与括号，所以先砍到最后一个 ')'
-        _pp=$(sed 's/.*) //' "$_d/stat" 2>/dev/null | awk '{print $2}')
-        [ "$_pp" = "$$" ] && continue
         printf '%s\n' "$_p"
     done
 }
@@ -335,24 +367,59 @@ cmd_watch() {
     #   （start 时先 rm 掉信号文件、再拉起新的，旧守护还没轮到轮询就把
     #    停止信号删了 ⇒ 两个守护并存 ⇒ 一个请求被处理两次）。
     #   进程表不会撒谎。
-    _others=$(drm_watch_pids | tr '\n' ' ')
-    if [ -n "$_others" ]; then
-        drm_log "watch 已在跑（pid=$_others），退出"
+    # ── 单例：原子锁目录 ──
+    #
+    # ★★ 为什么不用"扫 /proc 数进程"当判据（这是本轮最大的坑）★★
+    #   判据曾经是 `drm_watch_pids` 非空就退出。但那个函数靠 fork 记账来
+    #   排除自己（见 drm_self_tree 的注释），而 `$( )` / 管道 / 函数调用
+    #   到底 fork 几层、`$$` 在子 shell 里是不是主 shell 的 pid，
+    #   在不同 shell、不同调用深度下并不一致 —— 记账一旦漏掉一层，
+    #   就把自己的子进程当成"另一个守护"。
+    #
+    #   更致命的是**开机路径**：本机有三个启动器都会跑 `exit-watch.sh run`
+    #     · KernelSU 模块 service.sh（主路径）
+    #     · /data/adb/service.d/ hook（Magisk 兼容路径）
+    #     · APK 的 WatchService 前台服务
+    #   它们几乎同时起来，每个都扫到另外两个 ⇒ **三个全退出**，
+    #   结果一个守护都不剩，而日志里每个都写着"已在跑"。
+    #   手动从 adb shell 起只有一个启动器，所以永远复现不出来。
+    #
+    #   `mkdir` 是原子的，不依赖任何 fork 记账 ⇒ 谁抢到谁跑，确定性的。
+    mkdir -p "$DRM_RUN_DIR" 2>/dev/null
+    _lk="$DRM_RUN_DIR/watch.lock"
+    if [ -d "$_lk" ]; then
+        _op=$(cat "$_lk/pid" 2>/dev/null)
+        if [ -n "$_op" ] && kill -0 "$_op" 2>/dev/null; then
+            drm_log "watch 已在跑（pid=$_op，持锁 $_lk），退出"
+            return 0
+        fi
+        # 陈旧锁（持锁进程已死）——接管它，否则一次异常退出就再也起不来了
+        drm_warn "发现陈旧锁 $_lk（pid=${_op:-空} 已不在），接管"
+        rm -rf "$_lk" 2>/dev/null
+    fi
+    if ! mkdir "$_lk" 2>/dev/null; then
+        drm_log "抢锁失败（$_lk 被并发创建），退出"
         return 0
     fi
-    mkdir -p "$DRM_RUN_DIR" 2>/dev/null
+    printf '%s\n' "$$" >"$_lk/pid" 2>/dev/null
+    # 退出路径必须放锁，否则一次异常退出就留下陈旧锁（虽然有接管逻辑兜底）
+    _unlock() { rm -rf "$_lk" 2>/dev/null; }
+    # 顺带把 /proc 扫到的"别的守护"记下来 —— 只做诊断，不再当判据
+    _others=$(drm_watch_pids | tr '\n' ' ')
+    [ -n "$_others" ] && drm_warn "另有 watch 进程在跑（不阻断）：$_others"
     rm -f "$_stop" 2>/dev/null
 
     _rd=$(drm_rendezvous_ensure 2>/dev/null) || _rd=""
     if [ -z "$_rd" ]; then
         drm_err "建不出会合目录 —— 容器侧将无法发出任何请求"
+        _unlock
         return 1
     fi
     drm_identity_publish
 
     drm_log "watch 启动（pid=$$）：轮询 $_rd（enter.request / exit.request）"
     while :; do
-        [ -f "$_stop" ] && { drm_log "watch 收到停止信号"; return 0; }
+        [ -f "$_stop" ] && { drm_log "watch 收到停止信号"; _unlock; return 0; }
 
         drm_heartbeat_touch
 
@@ -360,6 +427,7 @@ cmd_watch() {
         if [ -f "$_rd/exit.request" ]; then
             drm_log "检测到返回安卓请求"
             rm -f "$_rd/exit.request" 2>/dev/null   # ★ 必须在停容器之前
+            _unlock
             cmd_exit
             return 0
         fi
@@ -392,23 +460,40 @@ cmd_watch_stop() {
     # 等它自己退；超时就用 /proc 扫描兜底（同样不信 pid 文件）
     _i=0
     while [ "$_i" -lt 10 ]; do
-        [ -z "$(drm_watch_pids)" ] && { drm_log "watch 已退出"; return 0; }
+        [ -z "$(drm_watch_pids)" ] && { drm_log "watch 已退出"; break; }
         sleep 1
         _i=$((_i + 1))
     done
     _p=$(drm_watch_pids | tr '\n' ' ')
-    drm_warn "watch 没有响应停止信号，强制结束：$_p"
-    # shellcheck disable=SC2086
-    drm_kill_pids 9 $(drm_watch_pids)
-    sleep 1
-    [ -z "$(drm_watch_pids)" ] || drm_err "仍有 watch 存活"
+    if [ -n "$_p" ]; then
+        drm_warn "watch 没有响应停止信号，强制结束：$_p"
+        # shellcheck disable=SC2086
+        drm_kill_pids 9 $(drm_watch_pids)
+        sleep 1
+        [ -z "$(drm_watch_pids)" ] || drm_err "仍有 watch 存活"
+    fi
+    # ★ 锁一定要放掉：守护被 kill -9 时走不到 _unlock，残留锁会让下次
+    #   watch 以为"已在跑"。cmd_watch 里有陈旧锁接管逻辑兜底，
+    #   但这里主动清掉更干净。
+    rm -rf "$DRM_RUN_DIR/watch.lock" 2>/dev/null
     return 0
 }
 
 cmd_watch_status() {
+    # ★ 判据以锁为准（见 drm_watch_acquire 的注释：/proc 扫描会误判）
+    _lk="$DRM_RUN_DIR/watch.lock"
+    if [ -d "$_lk" ]; then
+        _op=$(cat "$_lk/pid" 2>/dev/null)
+        if [ -n "$_op" ] && kill -0 "$_op" 2>/dev/null; then
+            printf 'watch: running (pid=%s)\n' "$_op"
+            return 0
+        fi
+        printf 'watch: not running (陈旧锁 pid=%s)\n' "${_op:-空}"
+        return 1
+    fi
     _p=$(drm_watch_pids | tr '\n' ' ')
     if [ -n "$_p" ]; then
-        printf 'watch: running (pid=%s)\n' "$_p"
+        printf 'watch: running (pid=%s，无锁)\n' "$_p"
         return 0
     fi
     printf 'watch: not running\n'
