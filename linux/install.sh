@@ -58,7 +58,11 @@ say() { printf '%s\n' "$*"; }
 if [ "$UNINSTALL" = 1 ]; then
     say "卸载："
     rm -f "$APP_DIR/drm-switch.desktop" && say "  删除 $APP_DIR/drm-switch.desktop"
-    rm -f "$ICON_DIR/drm-switch.png"    && say "  删除 $ICON_DIR/drm-switch.png"
+    # ★ 两种扩展名都要删：装进去的是 .svg（自带或生成的），
+    #   而这里原来只删 .png —— 结果卸载后图标永远残留，
+    #   菜单项没了、图标还在，用户下次重装会看到旧的。
+    rm -f "$ICON_DIR/drm-switch.svg" && say "  删除 $ICON_DIR/drm-switch.svg"
+    rm -f "$ICON_DIR/drm-switch.png" && say "  删除 $ICON_DIR/drm-switch.png"
     rm -f "$BIN_DIR/drm-switch"         && say "  删除 $BIN_DIR/drm-switch"
     if [ -d "$PREFIX" ]; then
         rm -rf "$PREFIX" && say "  删除 $PREFIX"
@@ -118,13 +122,15 @@ sed "s|^Exec=.*|Exec=$BIN_DIR/drm-switch|" \
 say "  $APP_DIR/drm-switch.desktop"
 
 # ── 4) 图标 ───────────────────────────────────────────────
-# 没有自带图标文件时生成一个最小的：画一个"返回"箭头。
-# 用纯文本 SVG（不需要任何图形库）。
+# 自带 linux/drm-switch.svg 就用它；没有才生成一个最小的"返回"箭头
+# （纯文本 SVG，不需要任何图形库）。
+#
+# ★ 原来是"先拷自带的、再无条件的用 heredoc 覆盖"—— 那份拷贝是死代码。
 mkdir -p "$ICON_DIR" 2>/dev/null
 if [ -f "$DRM_ROOT/linux/drm-switch.svg" ]; then
-    cp "$DRM_ROOT/linux/drm-switch.svg" "$ICON_DIR/drm-switch.svg" 2>/dev/null
-fi
-cat >"$ICON_DIR/drm-switch.svg" <<'SVG'
+    cp "$DRM_ROOT/linux/drm-switch.svg" "$ICON_DIR/drm-switch.svg" || exit 1
+else
+    cat >"$ICON_DIR/drm-switch.svg" <<'SVG'
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
   <rect width="256" height="256" rx="48" fill="#1b1f2a"/>
@@ -135,6 +141,7 @@ cat >"$ICON_DIR/drm-switch.svg" <<'SVG'
   <circle cx="196" cy="196" r="16" fill="#3ddc84"/>
 </svg>
 SVG
+fi
 say "  $ICON_DIR/drm-switch.svg"
 
 # ── 5) 刷新缓存 ───────────────────────────────────────────
