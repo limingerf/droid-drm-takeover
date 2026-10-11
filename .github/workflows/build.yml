@@ -224,6 +224,18 @@ jobs:
           # 对齐
           "$BT/zipalign" -c -v 4 "$APK" >/dev/null && echo "zipalign 4 字节对齐 OK"
 
+      # 上面那些断言只证明"文件在 APK 里"。这一步证明"到了设备上能用"：
+      # 手写的 USTAR 编码器过一遍真实 tar 往返（toybox tar 要能读）、
+      # LOCKDOWN 落地后权限对不对（bin/kwinwrap 是被直接 exec 的，
+      # 644 就 Permission denied）、换行符有没有被破坏（CRLF 会让
+      # `#!/bin/sh\r` 变成 "not found"）。
+      # 它抓到过一次真问题：LOCKDOWN 逐个目录列举 chmod，新增 tools/ 后漏掉，
+      # device-acceptance.sh 落地是 644 而仓库里是 755。
+      - name: 校验 payload 落地链路（tar 往返 + 权限 + 换行）
+        run: |
+          set -eu
+          sh tools/verify/verify-apk-payload.sh android/build/drmswitch.apk
+
       - uses: actions/upload-artifact@v4
         with:
           name: drmswitch-apk
