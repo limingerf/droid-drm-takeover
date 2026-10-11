@@ -54,18 +54,33 @@ drm_device_load
 . "$DRM_ROOT/core/lib/net.sh"
 # shellcheck source=/dev/null
 . "$DRM_ROOT/core/lib/enter.sh"
+# shellcheck source=/dev/null
+. "$DRM_ROOT/core/lib/request.sh"
 
 drm_state_init
 drm_state_set DEVICE "$DEV_CODENAME"
 drm_state_set SIDE "$DRM_SIDE"
-drm_state_set BOOT_ID "$(drm_boot_id)"
 
-# 重启后旧状态要能自愈：BOOT_ID 变了说明上一轮已经随重启结束
+# 重启后旧状态要能自愈：BOOT_ID 变了说明上一轮已经随重启结束。
+#
+# ★★ 顺序要害（实测踩过）：**必须先把上一次记下的 BOOT_ID 读出来，再写新的**。
+#    原来这里是
+#        drm_state_set BOOT_ID "$(drm_boot_id)"   ← 先写
+#        _bid=$(drm_state_get BOOT_ID)            ← 后读
+#    于是 _bid 读到的**已经是新值**，下面的 `_bid != _cur_bid` 永远为假 ——
+#    自愈从来不会触发。后果很毒：设备重启后 state 里留着上一轮的
+#    `PHASE=linux-active`，而 cmd_enter 的幂等检查只看 PHASE，
+#    于是它直接 return 0 并写 enter.result=ok，**整轮接管根本没跑**，
+#    安卓 SF/composer 还好端端跑着。现象是"接管瞬间就成功、日志停在
+#    设备适配层之后什么都没有"，极易误判成卡住。
 _bid=$(drm_state_get BOOT_ID 2>/dev/null || true)
 _cur_bid=$(drm_boot_id)
+drm_state_set BOOT_ID "$_cur_bid"
+
 if [ -n "$_cur_bid" ] && [ -n "$_bid" ] && [ "$_bid" != "$_cur_bid" ]; then
+    drm_log "BOOT_ID 变化（$_bid → $_cur_bid）—— 判定为重启，状态复位为 android-active"
     drm_state_set PHASE android-active
-    drm_state_set BOOT_ID "$_cur_bid"
+    drm_state_set PHASE_AT "$(drm_ts)"
     drm_state_set LAST_ERROR ""
 fi
 
@@ -193,7 +208,8 @@ cmd_rollback() {
     #   那个脚本 source boot.sh 后调用 drm_kill_linux_stack，与会话拉起路径
     #   用的是同一套逻辑（纯 /proc 扫描）。
     if ds_shared_ready 2>/dev/null; then
-        _kd="$(ds_shared_dir)/droid-drm-takeover/display/kill-desktop.sh"
+        # ★ 必须是**容器内**的路径（/root/...），不是安卓侧的 <rootfs>/root/...
+        _kd="$(ds_repo_in_container)/display/kill-desktop.sh"
         ds_exec "sh '$_kd'" >/dev/null 2>&1 || true
     fi
 
@@ -264,43 +280,108 @@ cmd_exit() {
 }
 
 # ═══════════════════════════════════════════════════════════
-# watch — 安卓侧常驻守护：轮询共享目录里的退出请求
+# watch — 安卓侧常驻守护：轮询会合目录里的请求
 # ═══════════════════════════════════════════════════════════
 #
-# 容器里的「返回安卓」按钮只需要 `touch $SHARED/.drm-exit-request`，
-# 这里 1s 轮询发现后执行 exit。
+# ★ 为什么必须由安卓侧执行（而不是容器里直接调 adb）：
+#   实测 Droidspaces v6.6.0 的容器里**没有 USB 节点**（/dev/bus/usb
+#   不存在）、adbd 也没监听 TCP ⇒ 容器里的 `adb devices` 恒为空。
+#   而接管必须停 surfaceflinger 与 composer HAL，那只有能访问 init
+#   属性服务的安卓侧做得到。所以容器只写请求，这里执行。
+#   完整协议见 core/lib/request.sh。
 #
-# ★ 顺序要害：请求文件必须在**停容器之前**删掉——容器一停，
+# ★ 顺序要害：退出请求文件必须在**停容器之前**删掉——容器一停，
 #   共享目录（容器 /root 的 host 侧挂载）就没了，那时再删就删不掉，
 #   下次开机它还在，会导致一开机就重启。
-cmd_watch() {
-    _sh=$(ds_shared_dir)
-    _req="$_sh/.drm-exit-request"
-    _stop="$DRM_RUN_DIR/.watch-stop"
-    _pidf="$DRM_RUN_DIR/watch.pid"
+# 所有 watch 守护进程的 pid。
+#
+# ★ 坑一：不能用 drm_pids_by_cmdline "switch.sh watch" —— 它是**子串**匹配，
+#   会把 `switch.sh watch-status` / `watch-stop` 也匹配进来。
+#   这里要求命令行以 `switch.sh watch` 结尾（或后面跟一个空格参数）。
+#
+# ★ 坑二（实测踩过，很隐蔽）：必须排除**自己的子进程**。
+#   `$( )` 和管道都会 fork 出子 shell，而 fork 出来的子 shell
+#   **命令行与父进程一模一样**（都是 `sh .../switch.sh watch`）——
+#   于是 `drm_watch_pids` 每次都扫到自己刚才 fork 的那个子 shell，
+#   把它当成"另一个守护"。现象是守护每次启动都立刻记一条
+#   "watch 已在跑（pid=NNN），退出" 然后死掉，而那个 NNN 每次都不一样。
+#   （`$$` 在子 shell 里确实是主 shell 的 pid —— mksh 与 dash 都如此，
+#     所以只跳过 `$$` 是不够的。）
+#   真正的第二个守护是 setsid 出来的，PPID=1，不会被这条误伤。
+drm_watch_pids() {
+    for _d in /proc/[0-9]*; do
+        _p=${_d#/proc/}
+        [ "$_p" = "$$" ] && continue
+        [ -r "$_d/cmdline" ] || continue
+        _cl=$(tr '\0' ' ' <"$_d/cmdline" 2>/dev/null) || continue
+        [ -n "$_cl" ] || continue
+        case "$_cl" in
+            *"switch.sh watch"|*"switch.sh watch "*) ;;
+            *) continue ;;
+        esac
+        # stat 的第 2 字段 comm 可能含空格与括号，所以先砍到最后一个 ')'
+        _pp=$(sed 's/.*) //' "$_d/stat" 2>/dev/null | awk '{print $2}')
+        [ "$_pp" = "$$" ] && continue
+        printf '%s\n' "$_p"
+    done
+}
 
-    # 单例
-    if [ -f "$_pidf" ]; then
-        _op=$(cat "$_pidf" 2>/dev/null)
-        if [ -n "$_op" ] && [ -d "/proc/$_op" ] && [ "$_op" != "$$" ]; then
-            drm_log "watch 已在跑（pid=$_op），退出"
-            return 0
-        fi
+cmd_watch() {
+    _stop="$DRM_RUN_DIR/.watch-stop"
+
+    # ── 单例 ──
+    # ★ 判据是扫 /proc，不是 pid 文件。
+    #   实测踩过：pid 文件写的是一个值，而真正活着的守护可能是另一个
+    #   （start 时先 rm 掉信号文件、再拉起新的，旧守护还没轮到轮询就把
+    #    停止信号删了 ⇒ 两个守护并存 ⇒ 一个请求被处理两次）。
+    #   进程表不会撒谎。
+    _others=$(drm_watch_pids | tr '\n' ' ')
+    if [ -n "$_others" ]; then
+        drm_log "watch 已在跑（pid=$_others），退出"
+        return 0
     fi
     mkdir -p "$DRM_RUN_DIR" 2>/dev/null
-    printf '%s\n' "$$" >"$_pidf"
     rm -f "$_stop" 2>/dev/null
 
-    drm_log "watch 启动：轮询 $_req"
+    _rd=$(drm_rendezvous_ensure 2>/dev/null) || _rd=""
+    if [ -z "$_rd" ]; then
+        drm_err "建不出会合目录 —— 容器侧将无法发出任何请求"
+        return 1
+    fi
+    drm_identity_publish
+
+    drm_log "watch 启动（pid=$$）：轮询 $_rd（enter.request / exit.request）"
     while :; do
-        [ -f "$_stop" ] && { drm_log "watch 收到停止信号"; rm -f "$_pidf"; return 0; }
-        if [ -f "$_req" ]; then
-            drm_log "检测到退出请求"
-            rm -f "$_req" 2>/dev/null      # ★ 必须在停容器之前
-            rm -f "$_pidf"
+        [ -f "$_stop" ] && { drm_log "watch 收到停止信号"; return 0; }
+
+        drm_heartbeat_touch
+
+        # ── 返回安卓 ──
+        if [ -f "$_rd/exit.request" ]; then
+            drm_log "检测到返回安卓请求"
+            rm -f "$_rd/exit.request" 2>/dev/null   # ★ 必须在停容器之前
             cmd_exit
             return 0
         fi
+
+        # ── 进入 Linux ──
+        #
+        # ★ 身份信息要在接管**之前**再发一次：容器启动后 rootfs 里的
+        #   路径才真正可写，而且设备可能换过。
+        if [ -f "$_rd/enter.request" ]; then
+            drm_log "检测到进入 Linux 请求"
+            rm -f "$_rd/enter.request" "$_rd/enter.result" 2>/dev/null
+            drm_identity_publish
+            if cmd_enter; then
+                printf 'ok\n' >"$_rd/enter.result" 2>/dev/null
+            else
+                printf 'fail 接管失败，详见 %s\n' "$DRM_JOURNAL" >"$_rd/enter.result" 2>/dev/null
+            fi
+            chmod 644 "$_rd/enter.result" 2>/dev/null
+            # 接管成功后本进程所在的框架/显示栈已被改动，继续轮询即可；
+            # 失败则原地回滚已由 cmd_enter → drm_do_enter 完成。
+        fi
+
         sleep 1
     done
 }
@@ -308,16 +389,27 @@ cmd_watch() {
 cmd_watch_stop() {
     touch "$DRM_RUN_DIR/.watch-stop" 2>/dev/null
     drm_log "已请求 watch 停止"
+    # 等它自己退；超时就用 /proc 扫描兜底（同样不信 pid 文件）
+    _i=0
+    while [ "$_i" -lt 10 ]; do
+        [ -z "$(drm_watch_pids)" ] && { drm_log "watch 已退出"; return 0; }
+        sleep 1
+        _i=$((_i + 1))
+    done
+    _p=$(drm_watch_pids | tr '\n' ' ')
+    drm_warn "watch 没有响应停止信号，强制结束：$_p"
+    # shellcheck disable=SC2086
+    drm_kill_pids 9 $(drm_watch_pids)
+    sleep 1
+    [ -z "$(drm_watch_pids)" ] || drm_err "仍有 watch 存活"
+    return 0
 }
 
 cmd_watch_status() {
-    _pidf="$DRM_RUN_DIR/watch.pid"
-    if [ -f "$_pidf" ]; then
-        _op=$(cat "$_pidf" 2>/dev/null)
-        if [ -n "$_op" ] && [ -d "/proc/$_op" ]; then
-            printf 'watch: running (pid=%s)\n' "$_op"
-            return 0
-        fi
+    _p=$(drm_watch_pids | tr '\n' ' ')
+    if [ -n "$_p" ]; then
+        printf 'watch: running (pid=%s)\n' "$_p"
+        return 0
     fi
     printf 'watch: not running\n'
     return 1
