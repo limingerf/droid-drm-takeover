@@ -169,6 +169,12 @@ DEV_KWINWRAP_SPLIT_PLANES="131,127"                      # ✔实测：2 平面 
 #   本地地址范围）。2 平面 × 1600 是唯一同时满足两者的形式：实测
 #   src_split_order 报错 0 条、CRTC mode_valid=1、不 panic。
 DEV_KWINWRAP_SPLIT_DST_INTERLEAVE="0"                    # ✔实测：必须单调
+# 给 kwin 进程注入的环境变量（空格分隔）。空 = 不注入。
+# 对照实验用，例如强制软件合成：DEV_KWIN_ENV="KWIN_COMPOSE=Q"
+DEV_KWIN_ENV="KWIN_COMPOSE=Q"                            # ✔实测：kgsl GL 输出是竖条噪声，必须软件合成
+# 同理 plasmashell 自己也要 GL，失败会弹"Plasma 启动失败"然后退出；
+# display.sh 默认给它 QT_QUICK_BACKEND=software。
+DEV_QT_QUICK_BACKEND="software"
 
 # ── 安卓稳定性开关（接管期间要解除武装）────────────────────
 # ~推测：本机是 ColorOS 17。实测 `settings list global` 里看不到

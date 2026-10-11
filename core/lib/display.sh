@@ -867,6 +867,14 @@ drm_start_kwin() {
 
     _split_env=$(drm_kwinwrap_split_env 2>/dev/null | head -1)
 
+    # 设备适配层可以往 kwin 进程里注入环境变量（空格分隔的 K=V），
+    # 专门留给对照实验用，例如：
+    #   DEV_KWIN_ENV="KWIN_COMPOSE=Q"            强制软件合成
+    #   DEV_KWIN_ENV="MESA_LOADER_DRIVER_OVERRIDE=freedreno"  换 GL 驱动
+    # 注意别把 KWIN_DRM_DEVICES / HOME / XDG_* 覆盖掉。
+    _kwin_env="${DEV_KWIN_ENV:-}"
+    [ -n "$_kwin_env" ] && drm_log "注入 kwin 环境变量：$_kwin_env"
+
     drm_log "kwinwrap 交接 → kwin_wayland --drm --socket=$_sock（会话 $DRM_SESSION_ID）"
     [ -n "$_nosplit_env" ] && drm_log "分屏改写已禁用（DEV_KWINWRAP_NO_SPLIT=1）：KWin 原始提交透传"
     # shellcheck disable=SC2086
@@ -890,6 +898,7 @@ drm_start_kwin() {
             XDG_SESSION_ID="$DRM_SESSION_ID" \
             XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
+            $_kwin_env \
             kwin_wayland --drm --socket="$_sock" $DEV_KWIN_EXTRA_ARGS \
         >>"${DRM_LOG_DIR}/kwin.log" 2>&1 &
     KPID=$!
@@ -1041,6 +1050,12 @@ drm_start_desktop() {
     fi
 
     drm_log "拉起 plasmashell"
+    # ★ Plasma 自己也要 GL：KWin 走软件合成（KWIN_COMPOSE=Q）时它仍会去要
+    #   OpenGL 2，失败就弹"Plasma 启动失败"对话框然后退出。
+    #   QT_QUICK_BACKEND=software 让 Qt Quick 用自带软件渲染器，
+    #   这样整条桌面链路都不依赖 kgsl GL（实测 kgsl 的 GL 输出是竖条噪声）。
+    #   设备层可用 DEV_PLASMA_ENV 追加/覆盖。
+    [ -n "${DEV_PLASMA_ENV:-}" ] && drm_log "注入 plasma 环境变量：$DEV_PLASMA_ENV"
     setsid nohup runuser -u "$DESKTOP_USER" -- \
         env -u DISPLAY -u QT_IM_MODULE -u GTK_IM_MODULE -u SDL_IM_MODULE \
             -u GLFW_IM_MODULE -u XMODIFIERS \
@@ -1048,6 +1063,8 @@ drm_start_desktop() {
             XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
             QT_QPA_PLATFORM=wayland LANG="$_lang" \
+            QT_QUICK_BACKEND="${DEV_QT_QUICK_BACKEND:-software}" \
+            ${DEV_PLASMA_ENV:-} \
         plasmashell --replace >>"${DRM_LOG_DIR}/plasmashell.log" 2>&1 &
 
     # ★ 重构前这里完全没有验证，无论 plasmashell 起没起来都打印 DESKTOP-UP，
