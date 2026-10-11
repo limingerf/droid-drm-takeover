@@ -1,13 +1,28 @@
-# 构建产物与运行态
+# 构建产物
 bin/
 build/
-takeover.ok
+android/build/
 *.o
 *.so
 
 # 日志与本地数据
 logs/
 *.log
+
+# 运行态（状态机与锁）
+# 状态文件在设备上是 $DRM_RUN_DIR/state，容器里是 /run/droid-drm-takeover/state；
+# 但如果有人在仓库目录里跑，别把它提交进去。
+.state
+.state.lock/
+.exit-watch.pid
+.drm-serial
+.drm-device
+
+# 旧版用一个空文件 takeover.ok 当"是否已接管"的标志。
+# 它被 drm-takeover.sh 在结尾无条件 touch（成功失败都 touch），
+# 判据早就失效了 —— 重构后改用 core/switch.sh 的状态机。留着只为
+# 防止老工作区里的残留文件被误提交。
+takeover.ok
 
 # 凭据绝不入库（真实配置放 /root/desk-wifi.conf）
 desk-wifi.conf

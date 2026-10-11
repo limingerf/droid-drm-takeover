@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DRM 切换器 — droid-drm-takeover 的安卓侧控制面板。
+
+  刻意不使用 AndroidX：本工程只用 android.* 框架 API，
+  由 android/build.sh 用原始 SDK 工具链（aapt2 / javac / d8 / zipalign / apksigner）构建。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.limingerf.drmswitch"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk
+        android:minSdkVersion="26"
+        android:targetSdkVersion="35" />
+
+    <!-- 前台服务用来托管「返回安卓」守护；不需要 INTERNET。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light">
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          托管 exit-watch.sh run。specialUse 是 API 34 起的类型；
+          低版本回落到 dataSync。
+        -->
+        <service
+            android:name=".WatchService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Hosts the droid-drm-takeover return-to-Android watcher, which polls the container's shared directory for an exit request and reboots back to Android." />
+        </service>
+    </application>
+
+</manifest>

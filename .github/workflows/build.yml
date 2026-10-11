@@ -3,14 +3,20 @@ name: build
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  # 目标架构只有 aarch64（touchdraw 等含 ARM64 汇编，x86 原生全量构建没有意义）
+  # ════════════════════════════════════════════════════════════════════
+  # 1) 交叉编译 aarch64 工具
+  #    目标架构只有 aarch64：touchdraw.c 含 ARM64 内联汇编（dc civac/dsb sy
+  #    做缓存维护），x86 原生全量构建编得过但上设备 SIGILL，没有意义。
+  # ════════════════════════════════════════════════════════════════════
   aarch64:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Setup multiarch apt sources
+
+      - name: 配置 multiarch apt 源
         run: |
           sudo rm -f /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list
           printf 'deb [arch=amd64] http://archive.ubuntu.com/ubuntu noble main universe\ndeb [arch=amd64] http://archive.ubuntu.com/ubuntu noble-updates main universe\ndeb [arch=amd64] http://security.ubuntu.com/ubuntu noble-security main universe\n' \
@@ -21,13 +27,157 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config gcc-aarch64-linux-gnu \
             libdrm-dev:arm64 libwayland-dev:arm64 libudev-dev:arm64
-      - name: Cross build
+
+      - name: 交叉编译
         run: |
-          # Makefile 在解析期用 $(shell pkg-config ...)，必须走环境变量而不是 make 命令行变量
+          # ★ Makefile 在**解析期**用 $(shell pkg-config ...) 求值，
+          #   所以交叉编译必须走环境变量；`make PKG_CFLAGS=...` 是无效的。
           export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
           make -j"$(nproc)" CC=aarch64-linux-gnu-gcc
-          file bin/kwinwrap bin/touchdraw bin/touchtest bin/atomicspy.so
+
+      - name: 校验每一个产物都是 aarch64
+        run: |
+          set -eu
+          fail=0
+          n=0
+          for f in bin/*; do
+            n=$((n+1))
+            desc=$(file -b "$f")
+            case "$desc" in
+              *"ARM aarch64"*) ;;
+              *) echo "::error file=$f::不是 aarch64: $desc"; fail=1 ;;
+            esac
+            # 共享库要额外确认是 shared object
+            case "$f" in
+              *.so) case "$desc" in *"shared object"*) ;; *)
+                      echo "::error file=$f::应为 shared object: $desc"; fail=1 ;;
+                    esac ;;
+            esac
+          done
+          echo "共校验 $n 个产物"
+          [ "$n" -ge 24 ] || { echo "::error::产物数量异常（$n < 24），可能有目标没编出来"; fail=1; }
+          [ "$fail" -eq 0 ] || exit 1
+
+      - name: 校验 runtime 子集可独立构建
+        run: |
+          export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          make clean
+          make -j"$(nproc)" runtime CC=aarch64-linux-gnu-gcc
+          for t in kwinwrap setbright setprop crtcstate connprops atomicspy.so; do
+            [ -f "bin/$t" ] || { echo "::error::make runtime 缺少 bin/$t"; exit 1; }
+          done
+          # runtime 是脚本硬依赖的最小集：多出探针说明分组错了
+          extra=$(ls bin | grep -vE '^(kwinwrap|setbright|setprop|crtcstate|connprops|atomicspy\.so)$' || true)
+          [ -z "$extra" ] || { echo "::error::make runtime 混进了非 runtime 目标: $extra"; exit 1; }
+
       - uses: actions/upload-artifact@v4
         with:
           name: tools-aarch64
           path: bin/
+
+  # ════════════════════════════════════════════════════════════════════
+  # 2) 脚本门禁
+  #    所有 .sh 都要同时跑在安卓 /system/bin/sh（mksh）和容器 /bin/sh
+  #    （dash/bash）上，所以一律按 POSIX 检查。
+  # ════════════════════════════════════════════════════════════════════
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 dash
+        run: sudo apt-get update && sudo apt-get install -y dash
+
+      - name: dash -n 语法检查
+        run: |
+          set -eu
+          fail=0; n=0
+          for f in $(find . -name '*.sh' -not -path './.git/*' | sort); do
+            n=$((n+1))
+            if out=$(dash -n "$f" 2>&1); then
+              echo "ok   $f"
+            else
+              echo "::error file=$f::$out"
+              fail=1
+            fi
+          done
+          echo "共检查 $n 个脚本"
+          exit $fail
+
+      - name: 扫描非 POSIX 构造
+        run: |
+          set -eu
+          # 这些是真实踩过的坑：数组、[[ ]]、${var//}、$'...'、process substitution。
+          # 注意排除注释行。
+          fail=0
+          while IFS= read -r f; do
+            # 去掉注释行后再扫
+            if grep -vE '^[[:space:]]*#' "$f" | grep -nE '\[\[|\$\{[A-Za-z_][A-Za-z0-9_]*//|\$\x27|declare -|function [a-z]|=~|<\(|>\(' >/dev/null 2>&1; then
+              echo "::error file=$f::含非 POSIX 构造"
+              grep -vE '^[[:space:]]*#' "$f" | grep -nE '\[\[|\$\{[A-Za-z_][A-Za-z0-9_]*//|\$\x27|declare -|function [a-z]|=~|<\(|>\(' || true
+              fail=1
+            fi
+          done < <(find . -name '*.sh' -not -path './.git/*' | sort)
+          exit $fail
+
+  # ════════════════════════════════════════════════════════════════════
+  # 3) APK
+  #    ubuntu runner 自带 Android SDK。构建脚本不用 Gradle（手工走
+  #    aapt2 → javac → d8 → zipalign → apksigner），所以只需要 SDK 工具。
+  # ════════════════════════════════════════════════════════════════════
+  apk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 定位 Android SDK
+        run: |
+          set -eu
+          for c in "$ANDROID_HOME" "$ANDROID_SDK_ROOT" /usr/local/lib/android/sdk; do
+            if [ -n "${c:-}" ] && [ -d "$c/build-tools" ]; then
+              echo "ANDROID_HOME=$c" >> "$GITHUB_ENV"
+              ls "$c/build-tools"
+              ls "$c/platforms" 2>/dev/null || true
+              exit 0
+            fi
+          done
+          echo "::error::runner 上没有可用的 Android SDK"
+          exit 1
+
+      - name: 构建 APK
+        run: |
+          set -eu
+          chmod +x android/build.sh
+          sh android/build.sh
+          ls -l android/build/*.apk
+
+      - name: 校验 APK
+        run: |
+          set -eu
+          APK=android/build/drmswitch.apk
+          [ -f "$APK" ] || { echo "::error::没产出 $APK"; exit 1; }
+
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          echo "build-tools: $BT"
+
+          echo "── badging ──"
+          "$BT/aapt2" dump badging "$APK" | head -20
+
+          echo "── 签名 ──"
+          "$BT/apksigner" verify --print-certs "$APK"
+
+          echo "── 内容 ──"
+          unzip -l "$APK" | head -30
+          # payload 必须真的打进去了
+          unzip -l "$APK" | grep -q 'assets/payload/core/switch.sh' \
+            || { echo "::error::APK 里没有 assets/payload/core/switch.sh"; exit 1; }
+          unzip -l "$APK" | grep -q 'assets/payload/bin/kwinwrap' \
+            || { echo "::error::APK 里没有 assets/payload/bin/kwinwrap"; exit 1; }
+
+          # 对齐
+          "$BT/zipalign" -c -v 4 "$APK" >/dev/null && echo "zipalign 4 字节对齐 OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drmswitch-apk
+          path: android/build/drmswitch.apk

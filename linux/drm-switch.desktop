@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=返回安卓
+Name[en]=Back to Android
+Comment=停止 Linux 桌面并重启设备回到安卓
+Comment[en]=Stop the Linux desktop and reboot the device into Android
+# ★ Exec 用安装器写进去的 wrapper 路径，而不是仓库里的相对路径。
+#   参考仓库的 drm-exit.desktop 写 Exec=/root/drm-exit.sh，且从没有任何
+#   脚本把它 install 到 applications 目录 —— 所以"菜单里点一下回安卓"
+#   在它的自动路径里其实不存在。这里由 install.sh 真正装进菜单。
+Exec=/usr/local/bin/drm-switch
+Icon=drm-switch
+Terminal=false
+Categories=System;Settings;
+Keywords=android;reboot;switch;drm;返回安卓;
+StartupNotify=true
+# 不要 NoDisplay：我们就是要它出现在菜单里
+NoDisplay=false

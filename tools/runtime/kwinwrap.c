@@ -52,6 +52,37 @@ static int LEASE = 0;      /* KWINWRAP_LEASE=1 to enable (default OFF:
                             * relay fd. GetResources rewriting replaced it.) */
 static char propnames[512][16];
 
+/* ══ split 几何（双 DSI 面板的左右半屏）═══════════════════════════════════
+ * ★ 这些原来是编译期 #define，写死的是 piano（小米平板 8 Pro）的值：
+ *     SPLIT_CRTC 200 / SPLIT_CONN 67 / SPLIT_W 1600 / SPLIT_H 2000
+ *   换到任何别的设备上它们全错，而且**不会报错** —— 只会往错误的对象上写，
+ *   现象是"kwin 起来了、也有 master、就是花屏或不出画"，极难定位。
+ *
+ *   现在：优先运行时发现（init_split），结果可被 KWINWRAP_SPLIT_* 覆盖；
+ *   发现失败时**大声告警**而不是静默用错值。
+ *   `kwinwrap --probe-split` 可把结果打印成 shell 可 eval 的形式。
+ *
+ * ⚠️ PLANES 是唯一无法可靠自动发现的一项：需要两个"能驱动该 CRTC 且属于
+ *    同一 SSPP 组"的 plane，纯靠 possible_crtcs 枚举可能挑错。
+ *    上新设备请用 --probe-split 的候选列表配合 display/drm-diag-once.sh
+ *    的输出人工确认，然后用 KWINWRAP_SPLIT_PLANES 固定。
+ *
+ * 声明放在这里（而不是下面的大段注释处），是因为 keep_prop / init_keep /
+ * probe_split 都比它早出现。
+ */
+static unsigned SPLIT_PLANE_VIRT  = 92u;   /* 编译期兜底：piano */
+static unsigned SPLIT_PLANE_VIRT2 = 123u;
+static unsigned SPLIT_PLANE_L     = 92u;
+static unsigned SPLIT_PLANE_R     = 123u;
+static unsigned SPLIT_CRTC        = 200u;
+static unsigned SPLIT_CONN        = 67u;
+static unsigned SPLIT_W           = 1600u;
+static unsigned SPLIT_H           = 2000u;
+static int SPLIT_DISCOVERED;               /* 1 = 运行时发现成功 */
+
+static void init_split(void);
+
+
 static const char *pname(unsigned id) {
     if (id >= 512) return "?";
     if (propnames[id][0]) return propnames[id];
@@ -296,16 +327,25 @@ static int syscall_dir(pid_t t) {
 
 /* ---- rewrite mode: strip kwin's phantom outputs, keep only real panel ---- */
 static int FILTER;
-static unsigned KEEP_OBJS[8] = { 67, 206, 97 };
-static int NKEEP = 3;
+/* ★ 原默认值是 { 67, 206, 97 }（piano 的 conn/crtc/virtual-plane）。
+ *   现在留空，由 init_keep() 在 init_split() 之后用**发现出来的**值填。 */
+static unsigned KEEP_OBJS[8];
+static int NKEEP;
 
 static void init_keep(void) {
     char *e = getenv("KWINWRAP_KEEP");
-    if (!e) return;
     int n = 0;
-    for (char *s = strtok(e, ","); s && n < 8; s = strtok(NULL, ","))
-        KEEP_OBJS[n++] = (unsigned)strtoul(s, NULL, 0);
-    if (n) NKEEP = n;
+    if (e) {
+        for (char *s = strtok(e, ","); s && n < 8; s = strtok(NULL, ","))
+            KEEP_OBJS[n++] = (unsigned)strtoul(s, NULL, 0);
+    }
+    if (!n) {
+        /* 默认保留：真面板 connector + 它的 crtc + kwin 会挑的那个 plane */
+        KEEP_OBJS[n++] = SPLIT_CONN;
+        KEEP_OBJS[n++] = SPLIT_CRTC;
+        KEEP_OBJS[n++] = SPLIT_PLANE_VIRT;
+    }
+    NKEEP = n;
 }
 
 static int keep_obj(unsigned id) {
@@ -315,9 +355,195 @@ static int keep_obj(unsigned id) {
 }
 
 static int keep_prop(unsigned obj, const char *name) {
-    if (obj == 67)  return !strcmp(name, "CRTC_ID");   /* link-status kills it */
-    if (obj == 206) return !strcmp(name, "MODE_ID") || !strcmp(name, "ACTIVE");
-    return 1;  /* plane 97: pass through */
+    /* ★ 原来这里写死 67 / 206（piano 的 connector 与 crtc id）。
+     *   换设备后这两个分支永远不命中，属性过滤行为静默改变。 */
+    if (obj == SPLIT_CONN) return !strcmp(name, "CRTC_ID");   /* link-status kills it */
+    if (obj == SPLIT_CRTC) return !strcmp(name, "MODE_ID") || !strcmp(name, "ACTIVE");
+    return 1;  /* plane: pass through */
+}
+
+/* ---- 运行时 split 几何发现 ----------------------------------------------
+ * 必须在 DRMFD 打开之后、HIJACK 块之前调用。
+ *
+ * 发现顺序：
+ *   1. 环境变量 KWINWRAP_SPLIT_* （最高优先级，设备适配层用 --probe-split 固化）
+ *   2. 从 DRM 现读：
+ *        CONN   = 已连接、有 modes、且非 VIRTUAL/WRITEBACK 的 connector
+ *        CRTC   = 该 connector 当前链到的 crtc；没有就取 encoder 的
+ *                 possible_crtcs 里最低位对应的 crtc
+ *        W/H    = 该 connector 首选 mode 的 hdisplay/vdisplay，
+ *                 再按 PLANES 数量等分宽度
+ *        PLANES = 能驱动该 CRTC 的 plane，按 id 升序取前两个
+ *   3. 都失败 → 保留编译期兜底值，并把 SPLIT_DISCOVERED 留 0，
+ *      调用方据此**大声告警**（绝不再静默使用 piano 常量）
+ */
+static void init_split(void)
+{
+    const char *e;
+    int from_env = 0;
+
+    if ((e = getenv("KWINWRAP_SPLIT_CONN")))  { SPLIT_CONN = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
+    if ((e = getenv("KWINWRAP_SPLIT_CRTC")))  { SPLIT_CRTC = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
+    if ((e = getenv("KWINWRAP_SPLIT_W")))     { SPLIT_W    = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
+    if ((e = getenv("KWINWRAP_SPLIT_H")))     { SPLIT_H    = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
+    if ((e = getenv("KWINWRAP_SPLIT_PLANES"))) {
+        unsigned v[4]; int n = 0;
+        for (char *s = strtok((char *)e, ","); s && n < 4; s = strtok(NULL, ","))
+            v[n++] = (unsigned)strtoul(s, NULL, 0);
+        if (n >= 1) { SPLIT_PLANE_L = SPLIT_PLANE_VIRT = v[0]; from_env = 1; }
+        if (n >= 2) { SPLIT_PLANE_R = SPLIT_PLANE_VIRT2 = v[1]; from_env = 1; }
+    }
+    if (from_env) {
+        SPLIT_DISCOVERED = 1;
+        fprintf(LOG, "split: 来自环境变量 conn=%u crtc=%u planes=%u,%u %ux%u\n",
+                SPLIT_CONN, SPLIT_CRTC, SPLIT_PLANE_L, SPLIT_PLANE_R, SPLIT_W, SPLIT_H);
+    }
+
+    if (DRMFD < 0) return;
+
+    drmModeRes *res = drmModeGetResources(DRMFD);
+    if (!res) { fprintf(LOG, "split: GetResources 失败，保留兜底值\n"); return; }
+
+    /* ── connector ── */
+    if (!(e = getenv("KWINWRAP_SPLIT_CONN"))) {
+        unsigned best = 0, best_modes = 0;
+        for (int i = 0; i < res->count_connectors; i++) {
+            drmModeConnector *c = drmModeGetConnector(DRMFD, res->connectors[i]);
+            if (!c) continue;
+            int virt = (c->connector_type == DRM_MODE_CONNECTOR_VIRTUAL ||
+                        c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK);
+            if (c->connection == DRM_MODE_CONNECTED && c->count_modes > 0 && !virt &&
+                c->count_modes > best_modes) {
+                best = c->connector_id;
+                best_modes = c->count_modes;
+            }
+            drmModeFreeConnector(c);
+        }
+        if (best) {
+            SPLIT_CONN = best;
+            SPLIT_DISCOVERED = 1;
+            fprintf(LOG, "split: 发现 connector %u (%u modes)\n", best, best_modes);
+        }
+    }
+
+    /* ── crtc + 面板尺寸 ── */
+    drmModeConnector *c = drmModeGetConnector(DRMFD, SPLIT_CONN);
+    if (!c) {
+        fprintf(LOG, "split: connector %u 打不开\n", SPLIT_CONN);
+        drmModeFreeResources(res);
+        return;
+    }
+    if (!(e = getenv("KWINWRAP_SPLIT_CRTC"))) {
+        unsigned crtc = 0;
+        /* drmModeConnector 只有 encoder_id；当前链着的 crtc 在 encoder 上。 */
+        if (c->encoder_id) {
+            drmModeEncoder *enc = drmModeGetEncoder(DRMFD, c->encoder_id);
+            if (enc) {
+                crtc = enc->crtc_id;
+                if (!crtc)
+                    for (int b = 0; b < 32 && !crtc; b++)
+                        if (enc->possible_crtcs & (1u << b)) crtc = res->crtcs[b];
+                drmModeFreeEncoder(enc);
+            }
+        }
+        if (crtc) {
+            SPLIT_CRTC = crtc;
+            SPLIT_DISCOVERED = 1;
+            fprintf(LOG, "split: 发现 crtc %u\n", crtc);
+        } else {
+            fprintf(LOG, "split: connector %u 没链到 crtc，也没 encoder\n", SPLIT_CONN);
+        }
+    }
+    if (c->count_modes > 0) {
+        if (!(e = getenv("KWINWRAP_SPLIT_H"))) SPLIT_H = c->modes[0].vdisplay;
+        if (!(e = getenv("KWINWRAP_SPLIT_W"))) {
+            /* 宽度按 plane 数量等分：两个 plane 就是半宽 */
+            unsigned npl = 2;
+            SPLIT_W = c->modes[0].hdisplay / (npl ? npl : 1);
+        }
+        SPLIT_DISCOVERED = 1;
+        fprintf(LOG, "split: 面板 mode %ux%u → 每段 %ux%u\n",
+                c->modes[0].hdisplay, c->modes[0].vdisplay, SPLIT_W, SPLIT_H);
+    }
+    drmModeFreeConnector(c);
+
+    /* ── planes ── */
+    if (!(e = getenv("KWINWRAP_SPLIT_PLANES"))) {
+        drmModePlaneRes *pr = drmModeGetPlaneResources(DRMFD);
+        if (pr) {
+            unsigned cand[64]; int nc = 0;
+            int crtc_idx = -1;
+            for (int i = 0; i < res->count_crtcs; i++)
+                if (res->crtcs[i] == SPLIT_CRTC) { crtc_idx = i; break; }
+            if (crtc_idx >= 0) {
+                for (uint32_t i = 0; i < pr->count_planes && nc < 64; i++) {
+                    drmModePlane *p = drmModeGetPlane(DRMFD, pr->planes[i]);
+                    if (!p) continue;
+                    if (p->possible_crtcs & (1u << crtc_idx)) cand[nc++] = p->plane_id;
+                    drmModeFreePlane(p);
+                }
+            }
+            /* 按 id 升序，便于跨次运行稳定 */
+            for (int i = 0; i < nc; i++)
+                for (int j = i + 1; j < nc; j++)
+                    if (cand[j] < cand[i]) { unsigned t = cand[i]; cand[i] = cand[j]; cand[j] = t; }
+
+            fprintf(LOG, "split: 能驱动 crtc%u 的 plane 候选（%d 个）:", SPLIT_CRTC, nc);
+            for (int i = 0; i < nc; i++) fprintf(LOG, " %u", cand[i]);
+            fprintf(LOG, "\n");
+
+            if (nc >= 2) {
+                /* 前两个作左右半屏。⚠️ 这只是启发式：真正的左右 plane
+                 * 需要配合 drm-diag-once.sh 的输出人工确认，
+                 * 确认后用 KWINWRAP_SPLIT_PLANES 固定。 */
+                SPLIT_PLANE_L = SPLIT_PLANE_VIRT  = cand[0];
+                SPLIT_PLANE_R = SPLIT_PLANE_VIRT2 = cand[1];
+                SPLIT_DISCOVERED = 1;
+                fprintf(LOG, "split: 启发式选中 planes %u,%u —— 请用 --probe-split 核对\n",
+                        cand[0], cand[1]);
+            } else {
+                fprintf(LOG, "split: 候选 plane 不足 2 个，保留兜底 planes %u,%u\n",
+                        SPLIT_PLANE_L, SPLIT_PLANE_R);
+            }
+            drmModeFreePlaneResources(pr);
+        }
+    }
+
+    drmModeFreeResources(res);
+
+    if (!SPLIT_DISCOVERED) {
+        fprintf(LOG,
+            "split: ⚠️⚠️ 运行时发现失败，正在使用编译期兜底值 "
+            "conn=%u crtc=%u planes=%u,%u %ux%u —— 这些是 piano 的值，"
+            "在本设备上几乎肯定是错的！请跑 `kwinwrap --probe-split` "
+            "并用 KWINWRAP_SPLIT_* 显式指定。\n",
+            SPLIT_CONN, SPLIT_CRTC, SPLIT_PLANE_L, SPLIT_PLANE_R, SPLIT_W, SPLIT_H);
+    }
+}
+
+/* --probe-split：把发现结果按 shell 可 eval 的格式打印出来。
+ * 设备适配层这样用：
+ *     eval "$(kwinwrap --probe-split)"
+ * 然后 KWINWRAP_SPLIT_* 就固化进环境，下次不必再发现。 */
+static int probe_split(void)
+{
+    if (!LOG) LOG = stderr;   /* 发现过程的日志走 stderr，stdout 留给 eval */
+    DRMFD = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+    if (DRMFD < 0) { perror("open /dev/dri/card0"); return 1; }
+    init_split();
+    /* 发现过程写日志，结果写 stdout（两者分开，方便 eval） */
+    printf("KWINWRAP_SPLIT_CONN=%u\n", SPLIT_CONN);
+    printf("KWINWRAP_SPLIT_CRTC=%u\n", SPLIT_CRTC);
+    printf("KWINWRAP_SPLIT_W=%u\n", SPLIT_W);
+    printf("KWINWRAP_SPLIT_H=%u\n", SPLIT_H);
+    printf("KWINWRAP_SPLIT_PLANES=%u,%u\n", SPLIT_PLANE_L, SPLIT_PLANE_R);
+    /* ⚠️ card0 的"首个打开者自动成为 master"规则意味着上面这次 open
+     * 可能已经把 master 拿走了。显式 DROP 掉，别让一次探针影响随后
+     * 真正的交接时序（关 fd 也会释放，但显式更确定）。 */
+    ioctl(DRMFD, DRM_DROP_MASTER_REQ, 0);
+    close(DRMFD);
+    DRMFD = -1;
+    return SPLIT_DISCOVERED ? 0 : 3;
 }
 
 static int writeto(pid_t t, unsigned long long addr, const void *buf, size_t n) {
@@ -450,9 +676,10 @@ static int build_local_atomic(pid_t t, unsigned long long uptr,
         readmem(t, src.prop_values_ptr, vals, total * 8) < 0)
         return -1;
 
-    /* Dynamic target: kwin probes connector 67 against different crtcs;
-     * whatever CRTC this request links 67 to (T) must itself survive the
-     * filter, else the kernel sees "enabled/connectors mismatch" -22. */
+    /* Dynamic target: kwin probes the real connector against different crtcs;
+     * whatever CRTC this request links it to (T) must itself survive the
+     * filter, else the kernel sees "enabled/connectors mismatch" -22.
+     * ★ 原版这里写死 67（piano 的 connector id）。 */
     unsigned T = 0;
     int dyn = 0;
     __u64 crtc_of[64];
@@ -470,20 +697,20 @@ static int build_local_atomic(pid_t t, unsigned long long uptr,
             }
         }
         for (__u32 o = 0; o < src.count_objs; o++)
-            if (objs[o] == 67 && crtc_of[o] != ~0ULL) { T = (unsigned)crtc_of[o]; dyn = 1; }
+            if (objs[o] == SPLIT_CONN && crtc_of[o] != ~0ULL) { T = (unsigned)crtc_of[o]; dyn = 1; }
     }
 
     __u32 nobjs2 = 0, nprops2 = 0;
     unsigned off = 0;
     for (__u32 o = 0; o < src.count_objs; o++) {
-        int is67 = objs[o] == 67;
-        int keepobj = !dyn || is67 || (dyn && T && objs[o] == T) ||
+        int is_conn = objs[o] == SPLIT_CONN;
+        int keepobj = !dyn || is_conn || (dyn && T && objs[o] == T) ||
                       (dyn && T && crtc_of[o] == T && !has_mode[o]);
         unsigned kept = 0;
         for (__u32 i = 0; i < cnts[o]; i++, off++) {
             const char *nm = pname(props[off]);
             if (dyn && !keepobj) continue;
-            if (dyn && is67 && strcmp(nm, "CRTC_ID")) continue;
+            if (dyn && is_conn && strcmp(nm, "CRTC_ID")) continue;
             if (dyn && T && objs[o] == T &&
                 strcmp(nm, "MODE_ID") && strcmp(nm, "ACTIVE")) continue;
             r_props[nprops2] = props[off];
@@ -514,24 +741,31 @@ static long relay_atomic(struct drm_mode_atomic *la) {
 }
 
 /* ---- primary-plane dual-pipe split --------------------------------------
- * This 3200x2136 dual-DSI panel cannot be driven by a single legacy pipe:
- * kwin picks plane97 (legacy virtual) and everything scans out garbled
- * (花屏, proven across GL + QPainter rounds). The vendor composer and our
- * own band commits use SSPP planes 161 (left half) + 157 (right half) fed
- * the SAME framebuffer. So rewrite every kwin commit that touches plane97
- * in-place (scratch below the thread's SP — unused while it sits in its
- * own syscall) into that two-plane layout. kwin then EXECUTES THE REWRITTEN
- * COMMIT ITSELF on its native master fd: ret, flip events, fences all stay
- * on the natural path.
+ * 双 DSI 面板无法由单个 legacy pipe 驱动：kwin 会挑一个 virtual plane，
+ * 扫出来是花屏。厂商 composer 与我们的 band commit 用的是两个 SSPP plane
+ * （左半 + 右半）喂同一个 framebuffer。所以把 kwin 每一个碰到该 plane 的
+ * commit **原地**重写成那个双 plane 布局（scratch 放在线程 SP 之下——
+ * 它正在自己 syscall 里，那段栈没人用）。kwin 随后在它自己的 master fd 上
+ * 执行被改写过的 commit：返回值、flip 事件、fence 全走原生路径。
+ *
+ * ══ ★ 本次重构改掉了什么 ══
+ * 这些 ID 原来是编译期 #define，写死的是 piano（小米平板 8 Pro）的值：
+ *     SPLIT_CRTC 200 / SPLIT_CONN 67 / SPLIT_W 1600 / SPLIT_H 2000
+ * 换到任何别的设备上它们全错，而且**不会报错**——只会往错误的对象上写，
+ * 现象是"kwin 起来了、也有 master、就是花屏或不出画"，极难定位。
+ *
+ * 现在：优先运行时发现（init_split），发现结果可被
+ * KWINWRAP_SPLIT_{CRTC,CONN,W,H,PLANES} 覆盖；发现失败时**大声告警**
+ * 而不是静默用错值。`kwinwrap --probe-split` 可以把结果打印出来。
+ *
+ * ⚠️ PLANES 是唯一无法可靠自动发现的一项：需要两个"能驱动该 CRTC 且属于
+ *    同一 SSPP 组"的 plane，纯靠 possible_crtcs 枚举可能挑错。
+ *    首次上新设备请用 --probe-split 的候选列表配合 display/drm-diag-once.sh
+ *    的输出人工确认，然后用 KWINWRAP_SPLIT_PLANES 固定下来。
+ *
+ * （SPLIT_* 变量与 init_split 的声明在本文件靠上的位置，因为
+ *   keep_prop / init_keep / probe_split 都早于这里引用它们。）
  */
-#define SPLIT_PLANE_VIRT 92u
-#define SPLIT_PLANE_VIRT2 123u
-#define SPLIT_PLANE_L    92u
-#define SPLIT_PLANE_R    123u
-#define SPLIT_CRTC       200u
-#define SPLIT_CONN       67u
-#define SPLIT_W 1600u
-#define SPLIT_H 2000u
 static __u32 s_objs[64], s_cnts[64], s_props[2048], s_props2[2048];
 static __u64 s_vals[2048], s_vals2[2048];
 static __u32 pl_fb, pl_crtc, pl_sx, pl_sy, pl_sw, pl_sh, pl_cx, pl_cy, pl_cw, pl_ch;
@@ -1114,27 +1348,46 @@ static void handle_entry(pid_t t, struct phase *ph) {
 int main(int argc, char **argv) {
     char *out = "/tmp/kwinwrap.log";
     int di = 1;
+
+    /* --probe-split：只做几何发现并把结果打印成可 eval 的形式，不 exec 任何东西。
+     * 设备适配层用它把 split 几何固化下来（见 core/lib/display.sh）。 */
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--probe-split")) return probe_split();
+
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--out") && i + 1 < argc) { out = argv[++i]; di = i + 1; }
         else if (!strcmp(argv[i], "--")) { di = i + 1; break; }
         else if (i == 1 || di == i) di = i;
     }
-    if (di >= argc) { fprintf(stderr, "usage: kwinwrap --out LOG -- prog args...\n"); return 1; }
+    if (di >= argc) {
+        fprintf(stderr, "usage: kwinwrap [--out LOG] -- prog args...\n"
+                        "       kwinwrap --probe-split\n");
+        return 1;
+    }
     LOG = fopen(out, "we");
     if (!LOG) { perror("open log"); return 1; }
     setvbuf(stderr, NULL, _IOLBF, 0);
     FILTER = getenv("KWINWRAP_FILTER") ? 1 : 0;
     SECCMODE = getenv("KWINWRAP_SECCOMP") ? 1 : 0;
     LEASE = getenv("KWINWRAP_LEASE") ? 1 : 0;
-    init_keep();
-    fprintf(LOG, "kwinwrap: FILTER=%d keep=%u,%u,%u uid=%d euid=%d\n", FILTER,
-            KEEP_OBJS[0], KEEP_OBJS[1], KEEP_OBJS[2], getuid(), geteuid());
+    fprintf(LOG, "kwinwrap: FILTER=%d uid=%d euid=%d\n", FILTER, getuid(), geteuid());
     { char caps[128] = ""; FILE *f = fopen("/proc/self/status", "r");
       if (f) { char ln[256]; while (fgets(ln, sizeof ln, f))
                    if (!strncmp(ln, "CapEff", 6)) { snprintf(caps, sizeof caps, "%s", ln); break; }
                fclose(f); }
       fprintf(LOG, "kwinwrap: %s", caps); fflush(LOG); }
     DRMFD = open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+
+    /* ★ split 几何必须在拿 master 之前定下来：它决定 KEEP_OBJS 与
+     *   pre-disable 的目标对象。原版这里是编译期常量（piano 的）。 */
+    init_split();
+    init_keep();
+    fprintf(LOG, "kwinwrap: split conn=%u crtc=%u planes=%u,%u %ux%u discovered=%d\n",
+            SPLIT_CONN, SPLIT_CRTC, SPLIT_PLANE_L, SPLIT_PLANE_R, SPLIT_W, SPLIT_H,
+            SPLIT_DISCOVERED);
+    fprintf(LOG, "kwinwrap: keep=%u,%u,%u (n=%d)\n",
+            KEEP_OBJS[0], KEEP_OBJS[1], KEEP_OBJS[2], NKEEP);
+
     HIJACK = getenv("KWINWRAP_HIJACK") ? 1 : 0;
     if (HIJACK && DRMFD >= 0) {
         /* The FIRST open of card0 auto-becomes master when master is free
@@ -1157,7 +1410,8 @@ int main(int argc, char **argv) {
              * panel ("seamless" path -> -22 in atomic check), and kwin's
              * per-output test commits then never pass. A normal compositor
              * starts from VT-off; emulate that with a disable commit. */
-            unsigned dis_conn = 67, dis_crtc = 200;
+            /* ★ 原来写死 67 / 200（piano）。现在用 init_split() 发现的值。 */
+            unsigned dis_conn = SPLIT_CONN, dis_crtc = SPLIT_CRTC;
             __u32 p_link = find_prop(dis_conn, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
             __u32 p_act  = find_prop(dis_crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
             __u32 p_mode = find_prop(dis_crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
@@ -1193,15 +1447,11 @@ int main(int argc, char **argv) {
                         p_link, p_act, p_mode);
             }
             /* ---- DRM lease ------------------------------------------------
-             * Phantom Virtual-1/2 writeback connectors (ids 33/64) show up as
-             * kwin outputs ("Failed to find a working output layer
-             * configuration! 5120x2560"). A lease of everything real — minus
-             * those connectors — makes drmModeGetResources on the lessee fd
-             * return only DSI-1. The lessee file is is_master=1 +
-             * authenticated=1 (v6.6 drm_mode_create_lease_ioctl), so kwin may
-             * not even trip the EACCES path anymore; if it still does, the
-             * relay must stay inside kwin's namespace: RELAYFD = dup(leasefd)
-             * shares the same drm_file, so kwin's blobs/FBs resolve there. */
+             * Phantom Virtual-1/2 writeback connectors show up as kwin outputs
+             * ("Failed to find a working output layer configuration!").
+             * ★ 原版额外写死跳过 conn 33/64（piano 的虚 connector id）；
+             *   类型判断（VIRTUAL/WRITEBACK）已经覆盖了这件事，
+             *   写死 id 只会让换设备后漏掉/误伤。 */
             if (LEASE) {
                 static __u32 lobjs[256];
                 int nl = 0;
@@ -1212,8 +1462,7 @@ int main(int argc, char **argv) {
                         drmModeConnector *c = drmModeGetConnector(DRMFD, lr->connectors[i]);
                         if (!c) continue;
                         int skip = c->connector_type == DRM_MODE_CONNECTOR_VIRTUAL ||
-                                   c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK ||
-                                   c->connector_id == 33 || c->connector_id == 64;
+                                   c->connector_type == DRM_MODE_CONNECTOR_WRITEBACK;
                         int cid = c->connector_id, cty = c->connector_type;
                         drmModeFreeConnector(c);
                         if (skip) { fprintf(LOG, "kwinwrap: lease SKIP conn=%d type=%d\n", cid, cty); continue; }
@@ -1282,11 +1531,12 @@ int main(int argc, char **argv) {
          * never touches the SDE "brightness" prop -> panel stays black.
          * We are the only master right now, so this is the last chance to
          * write it without EACCES (KWINWRAP_BRIGHTNESS=<0..4095>). */
+        /* ★ 原来写死 connector 67（piano）。改用 init_split() 发现的值。 */
         char *be = getenv("KWINWRAP_BRIGHTNESS");
         if (be && *be) {
-            __u32 pid_ = find_prop(67, DRM_MODE_OBJECT_CONNECTOR, "brightness");
+            __u32 pid_ = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR, "brightness");
             struct drm_mode_obj_set_property sp = {
-                .obj_id = 67, .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+                .obj_id = SPLIT_CONN, .obj_type = DRM_MODE_OBJECT_CONNECTOR,
                 .prop_id = pid_, .value = strtoull(be, NULL, 0),
             };
             int r = pid_ ? ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &sp) : -1;
