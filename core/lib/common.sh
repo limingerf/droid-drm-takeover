@@ -293,6 +293,36 @@ drm_pids_uniq() {
     sort -u 2>/dev/null || cat
 }
 
+# 这个 pid 真的是我们的 watch 守护吗？
+#
+# ★★ 为什么"活着的 pid"不能当判据（实测踩过，后果很毒）：
+#   单例锁里记着上一次会话的 pid。设备重启后那个 pid 会被**无关进程**
+#   复用（实测：锁里 pid=2663，重启后 2663 是 oplus_gaia）。
+#   于是 `kill -0 2663` 成功 ⇒ 守护判定"已在跑" ⇒ 直接退出。
+#   现象：boot-autostart.log 里连续**四次开机**全是
+#     "watch 已在跑（pid=2663，持锁 …），退出"
+#   守护一次都没起来，而日志读起来像一切正常；容器里点「进入 Linux」
+#   写的请求永远没人处理。
+#
+#   所以判据必须落到"这个进程到底是不是 watch 自己"：
+#   命令行必须**以** `switch.sh watch` 结尾（不是子串匹配 —— 那样
+#   `watch-status` / `watch-stop` 也会命中，而查状态这个动作本身就会
+#   被当成"有另一个守护在跑"）。
+drm_pid_is_watch() {
+    _pw_p=$1
+    case "$_pw_p" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -r "/proc/$_pw_p/cmdline" ] || return 1
+    _pw_cl=$(tr '\0' ' ' <"/proc/$_pw_p/cmdline" 2>/dev/null) || return 1
+    [ -n "$_pw_cl" ] || return 1
+    _pw_cl=${_pw_cl% }
+    case "$_pw_cl" in
+        *"switch.sh watch") return 0 ;;
+    esac
+    return 1
+}
+
 # 对一组 pid 发信号；空列表是安全的空操作
 drm_kill_pids() {
     _sig=$1; shift
@@ -353,6 +383,29 @@ drm_boot_id() {
     if [ -r /proc/stat ]; then
         awk '/^btime/{print $2; exit}' /proc/stat 2>/dev/null
     fi
+}
+
+# ── 锁的"跨开机"判据 ─────────────────────────────────────────
+#
+# 安卓侧的锁目录在 /data 下（$DRM_ANDROID_PAYLOAD/run），**重启不丢**。
+# 而锁里记的是 pid，pid 重启后会被复用 ⇒ 只看 `kill -0` 会把上一次开机的
+# 锁误判成"还活着"。boot_id 变了就一定是陈旧的，这比 pid 可靠。
+drm_lock_stamp_boot() {
+    _lsb_d=$1
+    [ -d "$_lsb_d" ] || return 1
+    _lsb_b=$(drm_boot_id 2>/dev/null)
+    [ -n "$_lsb_b" ] && printf '%s\n' "$_lsb_b" >"$_lsb_d/boot_id" 2>/dev/null
+    return 0
+}
+
+# 返回 0 = 这把锁是**别的开机**留下的（陈旧，可以接管）
+drm_lock_from_other_boot() {
+    _lob_d=$1
+    [ -d "$_lob_d" ] || return 1
+    [ -r "$_lob_d/boot_id" ] || return 1
+    _lob_b=$(cat "$_lob_d/boot_id" 2>/dev/null)
+    _lob_cur=$(drm_boot_id 2>/dev/null)
+    [ -n "$_lob_b" ] && [ -n "$_lob_cur" ] && [ "$_lob_b" != "$_lob_cur" ]
 }
 
 drm_state_get() {
@@ -439,10 +492,23 @@ drm_lock_acquire() {
         printf '%s\n' "$$" >"$DRM_LOCK_DIR/pid"
         printf '%s\n' "$_who" >"$DRM_LOCK_DIR/who"
         printf '%s\n' "$(drm_ts)" >"$DRM_LOCK_DIR/at"
+        drm_lock_stamp_boot "$DRM_LOCK_DIR"
         DRM_LOCK_HELD=1
         return 0
     fi
-    # 已有锁：判断持有者是否还活着
+    # 已有锁：先看它是不是**上一次开机**留下的（锁在 /data 下，重启不丢）
+    if drm_lock_from_other_boot "$DRM_LOCK_DIR"; then
+        drm_warn "发现上一次开机留下的锁（boot_id 已变），接管"
+        rm -rf "$DRM_LOCK_DIR"
+        mkdir "$DRM_LOCK_DIR" 2>/dev/null || return 1
+        printf '%s\n' "$$" >"$DRM_LOCK_DIR/pid"
+        printf '%s\n' "$_who" >"$DRM_LOCK_DIR/who"
+        printf '%s\n' "$(drm_ts)" >"$DRM_LOCK_DIR/at"
+        drm_lock_stamp_boot "$DRM_LOCK_DIR"
+        DRM_LOCK_HELD=1
+        return 0
+    fi
+    # 同一次开机内：判断持有者是否还活着
     _op=$(cat "$DRM_LOCK_DIR/pid" 2>/dev/null)
     _ow=$(cat "$DRM_LOCK_DIR/who" 2>/dev/null)
     if [ -n "$_op" ] && [ -d "/proc/$_op" ]; then
@@ -455,6 +521,7 @@ drm_lock_acquire() {
     printf '%s\n' "$$" >"$DRM_LOCK_DIR/pid"
     printf '%s\n' "$_who" >"$DRM_LOCK_DIR/who"
     printf '%s\n' "$(drm_ts)" >"$DRM_LOCK_DIR/at"
+    drm_lock_stamp_boot "$DRM_LOCK_DIR"
     DRM_LOCK_HELD=1
     return 0
 }

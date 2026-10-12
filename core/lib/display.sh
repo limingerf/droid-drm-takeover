@@ -1579,28 +1579,50 @@ drm_start_desktop() {
     # ★ 想改用 fcitx5 做物理键盘输入法的话，必须**同时**满足两条，否则
     #   又会开始闪：把 maliit 从 kwinrc 的 InputMethod 摘掉（否则两个抢），
     #   并设 DEV_IM_FCITX=1 打开下面的开关。
-    _im_env=""
+    # ★★★ 必须拆成「选项」和「赋值」两个变量 ★★★
+    #   POSIX/GNU env 的选项**必须全部出现在第一个 NAME=VALUE 之前** ——
+    #   coreutils 的 env.c 用的是 getopt_long(..., "+i0v", ...)，
+    #   那个 "+" 就是**关闭 GNU 的参数重排**（没有它 getopt 会把选项
+    #   从后面捞出来，有它就必须老实按顺序写）。
+    #
+    #   旧代码把 `-u QT_IM_MODULE -u GTK_IM_MODULE …` 放在
+    #   `WAYLAND_DISPLAY=… HOME=…` **后面**，于是 env 把 `-u` 当成**程序名**：
+    #       env: '-u': No such file or directory
+    #   ⇒ **plasmashell 从来没启动过** ⇒ 整屏全黑
+    #     （KWin / kwinwrap 都在跑，但没有 shell ⇒ 黑屏 + 只有光标）。
+    #   日志里那两条 `env: '-u': No such file or directory` 就是它。
+    #
+    #   ★ 这个 bug 从 03de65e 就在，为什么以前"看起来是好的"：
+    #     设了 DEV_IM_FCITX=1 时走的是上面那条分支，产出的是**赋值**
+    #     （QT_IM_MODULE=fcitx …），恰好合法 ⇒ 能起来。
+    #     **默认路径（不设 DEV_IM_FCITX）一直是坏的**，只是以前没人在
+    #     纯默认配置下重启过桌面。
+    #
+    #   ⚠️ 以后再往这些 env 行里加东西，先问自己：这是选项还是赋值？
+    #     选项只能加在 `env` 后面紧跟的那一段（$_unset_env / $_im_unset）。
+    _im_unset=""
+    _im_set=""
     if [ "${DEV_IM_FCITX:-0}" = 1 ]; then
-        _im_env="QT_IM_MODULE=fcitx GTK_IM_MODULE=fcitx XMODIFIERS=@im=fcitx"
-        _im_env="$_im_env SDL_IM_MODULE=fcitx GLFW_IM_MODULE=ibus"
+        _im_set="QT_IM_MODULE=fcitx GTK_IM_MODULE=fcitx XMODIFIERS=@im=fcitx"
+        _im_set="$_im_set SDL_IM_MODULE=fcitx GLFW_IM_MODULE=ibus"
         drm_log "输入法：fcitx5 已启用（DEV_IM_FCITX=1）—— 注意此时必须同时摘掉 kwinrc 的 InputMethod，否则键盘会闪"
     else
         # 默认路径：交给 Wayland 输入法协议（KWin + maliit）。
         # 把 fcitx 的变量摘干净，避免应用去连一个没在跑的 fcitx5。
-        _im_env="-u QT_IM_MODULE -u GTK_IM_MODULE -u XMODIFIERS"
-        _im_env="$_im_env -u SDL_IM_MODULE -u GLFW_IM_MODULE"
+        _im_unset="-u QT_IM_MODULE -u GTK_IM_MODULE -u XMODIFIERS"
+        _im_unset="$_im_unset -u SDL_IM_MODULE -u GLFW_IM_MODULE"
         drm_log "输入法：走 Wayland 协议（KWin + maliit），已摘掉 fcitx 变量"
     fi
 
     setsid nohup runuser -u "$DESKTOP_USER" -- \
-        env -u DISPLAY $_unset_env \
+        env -u DISPLAY $_unset_env $_im_unset \
             WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
             XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
             QT_QPA_PLATFORM=wayland LANG="$_lang" \
             $_kde_env \
             $_qtqb \
-            $_im_env \
+            $_im_set \
             ${DEV_PLASMA_ENV:-} \
         plasmashell --replace >>"${DRM_LOG_DIR}/plasmashell.log" 2>&1 &
 
@@ -1636,7 +1658,7 @@ drm_start_desktop() {
             xdg-desktop-portal >>"${DRM_LOG_DIR}/portal.log" 2>&1 &
     fi
 
-    drm_start_input_methods "$_sock" "$_lang" "$_im_env"
+    drm_start_input_methods "$_sock" "$_lang" "$_im_set"
 
     return 0
 }

@@ -38,12 +38,18 @@
 #
 # ★ 容器侧认不出设备就会退回 generic，而 generic 的 DEV_COMPOSER_SVC
 #   之类是"通用默认值"——在真机上就是错的，会去停一个不存在的服务。
+#
+# ★ 多容器：**每个容器的会合目录都要发一份**。容器侧是各自读自己 rootfs
+#   里那份 `device` / `serial` 的；只发默认容器的话，从第二个容器进来就
+#   认不出设备。
 drm_identity_publish() {
-    _d=$(drm_rendezvous_ensure 2>/dev/null) || return 0
-    [ -n "$DRM_DEVICE" ] && printf '%s\n' "$DRM_DEVICE" >"$_d/device" 2>/dev/null
     _sn=$(drm_android_prop ro.serialno 2>/dev/null)
-    [ -n "$_sn" ] && printf '%s\n' "$_sn" >"$_d/serial" 2>/dev/null
-    chmod 644 "$_d/device" "$_d/serial" 2>/dev/null
+    for _d in $(drm_rendezvous_ensure_all 2>/dev/null); do
+        [ -n "$_d" ] || continue
+        [ -n "$DRM_DEVICE" ] && printf '%s\n' "$DRM_DEVICE" >"$_d/device" 2>/dev/null
+        [ -n "$_sn" ] && printf '%s\n' "$_sn" >"$_d/serial" 2>/dev/null
+        chmod 644 "$_d/device" "$_d/serial" 2>/dev/null
+    done
     return 0
 }
 

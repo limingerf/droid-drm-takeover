@@ -66,6 +66,19 @@ drm_shared_candidates() {
     _hn=$(head -1 /etc/hostname 2>/dev/null | tr -d '\r')
     [ -n "$_hn" ] && printf '%s\n' "/data/local/Droidspaces/Containers/$_hn/rootfs/root"
     [ -n "${DEV_CONTAINER:-}" ] && printf '%s\n' "/data/local/Droidspaces/Containers/$DEV_CONTAINER/rootfs/root"
+    # ★ 多容器：把本机所有容器的共享目录都列出来。
+    #   容器侧靠这串候选找 `.drm-device`（认设备用）；只列默认容器的话，
+    #   从第二个容器里就认不出设备 ⇒ 退回 generic ⇒ DEV_COMPOSER_SVC
+    #   变成通用默认值 ⇒ 去停一个不存在的服务。
+    #
+    # ★ 必须判存在：本函数在 drm_device_load() 里就会被调用，而那时
+    #   container.sh **还没被 source**（switch.sh 的加载顺序如此），
+    #   直接调 ds_list_containers 会打一行 "not found" 到 stderr。
+    if command -v ds_list_containers >/dev/null 2>&1; then
+        for _c in $(ds_list_containers 2>/dev/null); do
+            printf '%s\n' "$(ds_containers_dir)/$_c/rootfs/root"
+        done
+    fi
     return 0
 }
 
@@ -111,6 +124,47 @@ drm_rendezvous_ensure() {
     chmod 1777 "$_d" 2>/dev/null || true
     [ -d "$_d" ] || return 1
     printf '%s\n' "$_d"
+}
+
+# ── 多容器：本机**所有**容器的会合目录 ────────────────────────
+#
+# ★ 为什么守护必须每个都轮询：
+#   会合目录长在**每个容器各自的 rootfs** 里（`<rootfs>/var/lib/<project>`），
+#   所以"容器 A 的 enter.request"和"容器 B 的 enter.request"是两个不同的
+#   文件。守护只盯一个容器的话，从另一个容器里点「进入 Linux / 返回安卓」
+#   写下的请求**永远没人处理** —— 而且失败是静默的（请求文件静静躺着）。
+#
+# ★ 安全性质不变：请求"属于哪个容器"由**它出现在哪个目录**决定，而那些
+#   目录是守护自己从文件系统枚举出来的，不是从请求文件内容读出来的。
+#   会合目录是 1777 世界可写，所以"内容不参与执行决策"这条必须守住。
+drm_rendezvous_all() {
+    if [ "$DRM_SIDE" != android ]; then
+        printf '%s\n' "$DRM_RENDEZVOUS"
+        return 0
+    fi
+    _base=$(ds_containers_dir 2>/dev/null) || return 1
+    for _c in $(ds_list_containers 2>/dev/null); do
+        printf '%s\n' "$_base/$_c/rootfs/var/lib/$DRM_PROJECT"
+    done
+    return 0
+}
+
+# 把所有容器的会合目录都建好（1777），返回它们（一行一个）。
+# 建不出来的（rootfs 不存在、没权限）直接跳过并告警，不阻断其余的。
+drm_rendezvous_ensure_all() {
+    _out=""
+    for _d in $(drm_rendezvous_all 2>/dev/null); do
+        [ -n "$_d" ] || continue
+        if [ ! -d "$_d" ]; then
+            mkdir -p "$_d" 2>/dev/null || { drm_warn "建不出会合目录：$_d"; continue; }
+        fi
+        chmod 1777 "$_d" 2>/dev/null || true
+        [ -d "$_d" ] || continue
+        _out="$_out$_d
+"
+    done
+    [ -n "$_out" ] || return 1
+    printf '%s' "$_out"
 }
 
 # 自动识别设备代号
@@ -192,7 +246,8 @@ drm_device_defaults() {
 
     : "${DEV_CONTAINER:=drm}"
     : "${DEV_DS_BIN:=/data/local/Droidspaces/bin/droidspaces}"
-    : "${DEV_DS_CFG:=/data/local/Droidspaces/Containers/$DEV_CONTAINER/container.config}"
+    : "${DEV_DS_CONTAINERS_DIR:=/data/local/Droidspaces/Containers}"
+    : "${DEV_DS_CFG:=$DEV_DS_CONTAINERS_DIR/$DEV_CONTAINER/container.config}"
 
     : "${DEV_DRM_CARD:=/dev/dri/card0}"
     : "${DEV_DRM_RENDER:=/dev/dri/renderD128}"
@@ -231,8 +286,13 @@ drm_device_defaults() {
     : "${DEV_KERNEL_DEBUG_OFF:=}"
     : "${DEV_KERNEL_DEBUG_ON:=}"
 
-    # 共享目录：容器 /root ←→ 安卓 /mnt/Droidspaces/<容器>/root
-    : "${DEV_SHARED:=/mnt/Droidspaces/$DEV_CONTAINER/root}"
+    # 共享目录：容器 /root ←→ 安卓 <containers>/<name>/rootfs/root
+    #
+    # ★ 默认值原来是 /mnt/Droidspaces/$DEV_CONTAINER/root —— 那是 **Droidspaces
+    #   v5 的挂载点布局**。v6 里 rootfs 就是个普通目录，没有这个挂载点，
+    #   所以旧默认值恒不存在。opd2511 适配层显式写对了路径，才没暴露出来；
+    #   换一台设备（走 generic/piano/opd2413）就会静默指向不存在的目录。
+    : "${DEV_SHARED:=$DEV_DS_CONTAINERS_DIR/$DEV_CONTAINER/rootfs/root}"
     : "${DEV_DESKTOP_USER_HINT:=}"
 }
 

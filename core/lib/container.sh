@@ -2,7 +2,8 @@
 # core/lib/container.sh — Droidspaces 容器生命周期。
 #
 # 只做四件事：可用性判断、启动、停止、在容器内执行。
-# 具体容器名/配置路径来自设备适配层（DEV_CONTAINER / DEV_DS_BIN / DEV_DS_CFG）。
+# 具体容器名/配置路径来自设备适配层（DEV_CONTAINER / DEV_DS_BIN / DEV_DS_CFG），
+# 但**可以被 DRM_CONTAINER 覆盖** —— 本机可以有多个容器，见下面「多容器支持」。
 #
 # ══ Droidspaces v6 的 CLI（✔实测 v6.6.0，和旧版不兼容）══
 #   启动/停止：  droidspaces --name=DEBIAN start|stop|restart
@@ -34,11 +35,65 @@
 DS_BIN=""
 DS_CFG=""
 DS_NAME=""
+DS_CONT_DIR=""
+
+# ── 多容器支持 ────────────────────────────────────────────────
+#
+# 本机可以同时存在多个 Droidspaces 容器（实测 /data/local/Droidspaces/
+# Containers/ 下可以有 DEBIAN、UBUNTU…）。重构前容器名是**设备适配层里
+# 写死的一个常量**（DEV_CONTAINER=DEBIAN），于是：
+#   · 只能接管那一个容器，换容器要改设备适配层；
+#   · 更隐蔽的是 DEV_DS_CFG / DEV_SHARED 也写死了默认容器 ——
+#     选中别的容器时它们仍然指向默认容器，会去 start/stop 错的容器、
+#     把仓库同步进错的 rootfs。这种"改了等于没改"最难查。
+#
+# 现在的优先级：
+#   DRM_CONTAINER（显式指定，APK/命令行/守护都用它）
+#     > DEV_CONTAINER（设备适配层的默认值）
+#       > DEBIAN（兜底）
+# 并且 **CFG 与 SHARED 一律按最终选中的容器推导**，只有"选中的就是适配层
+# 默认容器"时才用适配层写死的那两个路径（那是对默认容器的权威描述）。
+
+# 所有容器的根目录（Droidspaces v6 里 rootfs 就是个普通目录）
+ds_containers_dir() {
+    printf '%s\n' "${DEV_DS_CONTAINERS_DIR:-/data/local/Droidspaces/Containers}"
+}
+
+# 枚举本机所有"看起来是个容器"的条目。
+#
+# ★ 判据是 `<name>/rootfs` 目录存在，而不是"droidspaces show 里列出来了"：
+#   · 守护在**开机早期**就要开始轮询会合目录，那时 droidspaces 可能还没
+#     把容器列出来（甚至容器从来没起过 —— 而"第一次进 Linux"正是要起它）；
+#   · 反过来，一个停着的容器**依然要有会合目录**，否则它第一次启动时
+#     安卓侧根本没人听。
+#   所以按文件系统枚举，不依赖 droidspaces 的运行时状态。
+ds_list_containers() {
+    _base=$(ds_containers_dir)
+    for _d in "$_base"/*/; do
+        [ -d "$_d" ] || continue
+        _n=$(basename "$_d")
+        [ -n "$_n" ] || continue
+        [ -d "$_d/rootfs" ] || continue
+        printf '%s\n' "$_n"
+    done
+}
 
 ds_init() {
-    DS_NAME=${DEV_CONTAINER:-DEBIAN}
     DS_BIN=${DEV_DS_BIN:-/data/local/Droidspaces/bin/droidspaces}
-    DS_CFG=${DEV_DS_CFG:-/data/local/Droidspaces/Containers/$DS_NAME/container.config}
+    DS_CONT_DIR=$(ds_containers_dir)
+    DS_NAME=${DRM_CONTAINER:-${DEV_CONTAINER:-DEBIAN}}
+
+    if [ -n "${DEV_CONTAINER:-}" ] && [ "$DS_NAME" = "$DEV_CONTAINER" ] && [ -n "${DEV_DS_CFG:-}" ]; then
+        DS_CFG=$DEV_DS_CFG
+    else
+        DS_CFG=$DS_CONT_DIR/$DS_NAME/container.config
+    fi
+}
+
+# 选中的容器就是设备适配层描述的那个吗？
+# 只有为真时才允许用 DEV_DS_CFG / DEV_SHARED 这两个写死的路径。
+ds_is_default_container() {
+    [ -n "${DEV_CONTAINER:-}" ] && [ "${DS_NAME:-}" = "$DEV_CONTAINER" ]
 }
 
 # ★ 必须先 ds_init：旧实现直接读 $DS_BIN，而它只有 ds_init 才赋值，
@@ -144,8 +199,16 @@ ds_stop() {
 # 容器里看到的 /root ←→ 安卓侧直接读写的那个目录
 # ★ v6 里 rootfs 就是个普通目录，没有 /mnt/Droidspaces 这种挂载点。
 #   容器没起时这个目录**依然存在**（不像旧版那样没挂载），所以往里写是安全的。
+#
+# ★ 多容器：DEV_SHARED 是设备适配层对**默认容器**的描述，选中别的容器时
+#   必须按 DS_NAME 重新推导，否则会把仓库同步进默认容器的 rootfs。
 ds_shared_dir() {
-    printf '%s\n' "${DEV_SHARED:-/data/local/Droidspaces/Containers/${DEV_CONTAINER:-DEBIAN}/rootfs/root}"
+    ds_init
+    if ds_is_default_container && [ -n "${DEV_SHARED:-}" ]; then
+        printf '%s\n' "$DEV_SHARED"
+    else
+        printf '%s\n' "$DS_CONT_DIR/$DS_NAME/rootfs/root"
+    fi
 }
 
 # 共享目录在**容器内部**的路径。
@@ -187,4 +250,35 @@ ds_shared_ready() {
 
 ds_require_shared() {
     ds_shared_ready || drm_die "共享目录不可写：$(ds_shared_dir)"
+}
+
+# ── 在"指定容器"的语境里跑一段逻辑 ────────────────────────────
+#
+# ★ 为什么不用 `DRM_CONTAINER=x func` 这种前置赋值：
+#   POSIX 里"命令名是函数"时，前置变量赋值**是否在函数返回后保留是未规定的**
+#   （dash 会保留、有些 shell 不保留）。守护要在一个循环里反复切换容器，
+#   一旦泄漏就会让下一轮操作打到错的容器上 —— 这类错是静默的。
+#   所以显式保存/恢复。
+#
+# 用法: ds_with_container UBUNTU ds_shared_dir
+ds_with_container() {
+    _dwc_c=$1; shift
+    [ -n "$_dwc_c" ] || return 1
+
+    _dwc_had=0
+    [ -n "${DRM_CONTAINER+x}" ] && _dwc_had=1
+    _dwc_save=${DRM_CONTAINER:-}
+
+    DRM_CONTAINER=$_dwc_c
+    export DRM_CONTAINER
+    "$@"
+    _dwc_rc=$?
+
+    if [ "$_dwc_had" = 1 ]; then
+        DRM_CONTAINER=$_dwc_save
+        export DRM_CONTAINER
+    else
+        unset DRM_CONTAINER
+    fi
+    return $_dwc_rc
 }

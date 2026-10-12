@@ -19,13 +19,19 @@
 #   rollback  接管中途放弃，原地把安卓拉回来（尽力而为）
 #   status    打印当前状态（两侧都能跑）
 #   doctor    环境体检（两侧都能跑）
-#   watch     安卓侧常驻守护：轮询共享目录里的退出请求
+#   watch     安卓侧常驻守护：轮询**每个容器**会合目录里的进入/退出请求
 #
 # ══ 用法 ══
 #   安卓侧:  su -c 'sh /data/local/drm-takeover/core/switch.sh enter'
 #   容器侧:  sh /root/droid-drm-takeover/core/switch.sh status
 #
 # ══ 环境变量（全部可选）══
+#   DRM_CONTAINER=DEBIAN   选中哪个容器。本机可以同时有多个容器
+#                          （/data/local/Droidspaces/Containers/<name>/），
+#                          默认取设备适配层的 DEV_CONTAINER。
+#                          ★ 会合目录长在各容器自己的 rootfs 里，所以
+#                            "哪个容器发的请求"由**目录**决定；watch 守护
+#                            会轮询全部容器，不需要在这里指定。
 #   DRM_DEVICE=opd2511     强制指定设备适配层
 #   FULL_STOP=1            连 framework 一起 stop（⚠️ 会永久毁掉音频，默认关）
 #   DRM_NET=0              跳过网络接管
@@ -121,7 +127,23 @@ cmd_doctor() {
     ds_init
     if ds_available; then
         _ok "Droidspaces：$DS_BIN"
+        _allc=$(ds_list_containers 2>/dev/null | tr '\n' ' ')
+        if [ -n "$_allc" ]; then
+            _ok "容器清单：$_allc（当前选中 $DS_NAME）"
+        else
+            _bad "枚举不到任何容器（$(ds_containers_dir) 下没有 <name>/rootfs）"
+        fi
         if ds_running; then _ok "容器 $DS_NAME 在跑"; else _warn "容器 $DS_NAME 没在跑"; fi
+        # 每个容器的共享目录 + 会合目录各查一遍：多容器时只查默认容器会漏
+        for _c in $(ds_list_containers 2>/dev/null); do
+            _sd=$(ds_with_container "$_c" ds_shared_dir 2>/dev/null) || continue
+            _rd=$(ds_with_container "$_c" drm_rendezvous_local 2>/dev/null) || _rd=""
+            printf '  · %-12s 共享=%s\n' "$_c" "${_sd:-?}"
+            if [ -n "$_rd" ]; then
+                printf '  %-14s 会合=%s %s\n' "" "$_rd" \
+                    "$([ -d "$_rd" ] && echo '(已建)' || echo '(未建)')"
+            fi
+        done
     else
         _bad "找不到 Droidspaces：$DS_BIN"
     fi
@@ -168,6 +190,8 @@ cmd_doctor() {
 cmd_enter() {
     # 时序实现在 core/lib/enter.sh 的 drm_do_enter()，与容器侧的
     # display/desk-takeover.sh 共用同一套阶段顺序（重构前是两个实现）。
+    ds_init
+    drm_log "接管目标容器：$DS_NAME（$(ds_shared_dir)）"
     drm_lock_acquire enter || exit 1
     trap 'drm_lock_release' EXIT INT TERM
 
@@ -261,7 +285,8 @@ cmd_rollback() {
 #   · `setprop sys.powerctl reboot` 在厂商改过的 init 上也无反应
 #   只有不依赖 framework 的 /system/bin/reboot 可靠。
 cmd_exit() {
-    drm_log "══ exit：返回安卓（停容器 → 整机重启）══"
+    ds_init
+    drm_log "══ exit：返回安卓（停容器 $DS_NAME → 整机重启）══"
     drm_state_set PHASE returning
 
     ds_stop 2>/dev/null || true
@@ -337,23 +362,13 @@ drm_watch_pids() {
     for _d in /proc/[0-9]*; do
         _p=${_d#/proc/}
         case "$_tree" in *" $_p "*) continue ;; esac
-        [ -r "$_d/cmdline" ] || continue
-        _cl=$(tr '\0' ' ' <"$_d/cmdline" 2>/dev/null) || continue
-        [ -n "$_cl" ] || continue
-        # ★ 必须要求命令行**以** `switch.sh watch` 结尾。
-        #   原来写的是 case "$_cl" in *"switch.sh watch") ...
-        #   —— 那是**子串**匹配，`switch.sh watch-status` / `switch.sh watch-stop`
-        #   一样命中！而 exit-watch.sh 的 _alive() 就是靠调 watch-status 判活的，
-        #   于是"查状态"这个动作本身被当成了"有另一个守护在跑"。
-        #   实测后果：开机时模块把守护拉起来，守护第一件事查单例，
-        #   恰好撞上别处正在跑的 watch-status，于是记一条
-        #     "watch 已在跑（pid=2734 3027 3032），退出"
-        #   然后自杀 —— 守护永远起不来，而日志说"已在跑"。
-        _cl=${_cl% }
-        case "$_cl" in
-            *"switch.sh watch") ;;
-            *) continue ;;
-        esac
+        # ★ 判据统一走 common.sh 的 drm_pid_is_watch：
+        #   · 命令行必须**以** `switch.sh watch` 结尾
+        #     （子串匹配会把 watch-status / watch-stop 也算进来，而
+        #      exit-watch.sh 的 _alive() 正是靠调 watch-status 判活的，
+        #      于是"查状态"这个动作本身被当成"有另一个守护在跑"）
+        #   · 不再在这里重复实现，避免两处判据漂移
+        drm_pid_is_watch "$_p" || continue
         printf '%s\n' "$_p"
     done
 }
@@ -361,15 +376,9 @@ drm_watch_pids() {
 cmd_watch() {
     _stop="$DRM_RUN_DIR/.watch-stop"
 
-    # ── 单例 ──
-    # ★ 判据是扫 /proc，不是 pid 文件。
-    #   实测踩过：pid 文件写的是一个值，而真正活着的守护可能是另一个
-    #   （start 时先 rm 掉信号文件、再拉起新的，旧守护还没轮到轮询就把
-    #    停止信号删了 ⇒ 两个守护并存 ⇒ 一个请求被处理两次）。
-    #   进程表不会撒谎。
     # ── 单例：原子锁目录 ──
     #
-    # ★★ 为什么不用"扫 /proc 数进程"当判据（这是本轮最大的坑）★★
+    # ★★ 为什么不用"扫 /proc 数进程"当判据（这是最大的坑）★★
     #   判据曾经是 `drm_watch_pids` 非空就退出。但那个函数靠 fork 记账来
     #   排除自己（见 drm_self_tree 的注释），而 `$( )` / 管道 / 函数调用
     #   到底 fork 几层、`$$` 在子 shell 里是不是主 shell 的 pid，
@@ -385,23 +394,46 @@ cmd_watch() {
     #   手动从 adb shell 起只有一个启动器，所以永远复现不出来。
     #
     #   `mkdir` 是原子的，不依赖任何 fork 记账 ⇒ 谁抢到谁跑，确定性的。
+    #
+    # ★★★ 判据（本次重写，这是"APK 点了没反应"的总根因）★★★
+    #   原来只看 `kill -0 $pid`。**pid 会被复用**：锁目录在
+    #   /data/local/drm-takeover/run 下，重启不丢；重启后锁里那个 pid
+    #   会被无关进程占用（实测 pid=2663 → oplus_gaia），于是
+    #     `kill -0 2663` 成功 ⇒ 判定"watch 已在跑" ⇒ 守护直接退出。
+    #   实测后果：boot-autostart.log 里连续四次开机全是
+    #     "watch 已在跑（pid=2663，持锁 …），退出"
+    #   守护一次都没起来，日志读起来却像一切正常。
+    #
+    #   现在三重判据，任意一条命中即判为陈旧：
+    #     ① 锁的 boot_id ≠ 本次开机        —— 跨重启必陈旧（最可靠）
+    #     ② pid 不存在
+    #     ③ pid 存在但命令行不是 watch     —— 抓到同一次开机内的 pid 复用
     mkdir -p "$DRM_RUN_DIR" 2>/dev/null
     _lk="$DRM_RUN_DIR/watch.lock"
     if [ -d "$_lk" ]; then
         _op=$(cat "$_lk/pid" 2>/dev/null)
-        if [ -n "$_op" ] && kill -0 "$_op" 2>/dev/null; then
+        if drm_lock_from_other_boot "$_lk"; then
+            drm_warn "发现上一次开机留下的锁 $_lk（boot_id=$(cat "$_lk/boot_id" 2>/dev/null) → $(drm_boot_id)），接管"
+            rm -rf "$_lk" 2>/dev/null
+        elif [ -n "$_op" ] && drm_pid_is_watch "$_op"; then
             drm_log "watch 已在跑（pid=$_op，持锁 $_lk），退出"
             return 0
+        else
+            if [ -n "$_op" ] && [ -d "/proc/$_op" ]; then
+                drm_warn "锁里的 pid=$_op 活着但**不是** watch 进程（pid 被复用：$(cat "/proc/$_op/comm" 2>/dev/null)），接管"
+            else
+                drm_warn "发现陈旧锁 $_lk（pid=${_op:-空} 已不在），接管"
+            fi
+            rm -rf "$_lk" 2>/dev/null
         fi
-        # 陈旧锁（持锁进程已死）——接管它，否则一次异常退出就再也起不来了
-        drm_warn "发现陈旧锁 $_lk（pid=${_op:-空} 已不在），接管"
-        rm -rf "$_lk" 2>/dev/null
     fi
     if ! mkdir "$_lk" 2>/dev/null; then
         drm_log "抢锁失败（$_lk 被并发创建），退出"
         return 0
     fi
     printf '%s\n' "$$" >"$_lk/pid" 2>/dev/null
+    drm_lock_stamp_boot "$_lk"
+    printf '%s\n' "$(drm_ts)" >"$_lk/at" 2>/dev/null
     # 退出路径必须放锁，否则一次异常退出就留下陈旧锁（虽然有接管逻辑兜底）
     _unlock() { rm -rf "$_lk" 2>/dev/null; }
     # 顺带把 /proc 扫到的"别的守护"记下来 —— 只做诊断，不再当判据
@@ -409,46 +441,63 @@ cmd_watch() {
     [ -n "$_others" ] && drm_warn "另有 watch 进程在跑（不阻断）：$_others"
     rm -f "$_stop" 2>/dev/null
 
-    _rd=$(drm_rendezvous_ensure 2>/dev/null) || _rd=""
-    if [ -z "$_rd" ]; then
-        drm_err "建不出会合目录 —— 容器侧将无法发出任何请求"
+    # ── 会合目录：**每个容器**都要准备好 ──
+    #
+    # ★ 多容器：会合目录长在各容器自己的 rootfs 里，所以"哪个容器发的请求"
+    #   由**目录**决定。守护必须把本机所有容器的会合目录都建出来并轮询，
+    #   否则从第二个容器点「进入 Linux / 返回安卓」永远没人处理，
+    #   而且失败是静默的（请求文件静静躺在那里）。
+    _rds=$(drm_rendezvous_ensure_all 2>/dev/null) || _rds=""
+    if [ -z "$_rds" ]; then
+        drm_err "建不出任何会合目录 —— 容器侧将无法发出请求"
         _unlock
         return 1
     fi
     drm_identity_publish
 
-    drm_log "watch 启动（pid=$$）：轮询 $_rd（enter.request / exit.request）"
+    _rds_flat=$(printf '%s' "$_rds" | tr '\n' ' ')
+    drm_log "watch 启动（pid=$$）：轮询 $_rds_flat（enter.request / exit.request）"
     while :; do
         [ -f "$_stop" ] && { drm_log "watch 收到停止信号"; _unlock; return 0; }
 
-        drm_heartbeat_touch
-
-        # ── 返回安卓 ──
-        if [ -f "$_rd/exit.request" ]; then
-            drm_log "检测到返回安卓请求"
-            rm -f "$_rd/exit.request" 2>/dev/null   # ★ 必须在停容器之前
-            _unlock
-            cmd_exit
-            return 0
-        fi
-
-        # ── 进入 Linux ──
+        # ── 逐个容器轮询 ──
         #
-        # ★ 身份信息要在接管**之前**再发一次：容器启动后 rootfs 里的
-        #   路径才真正可写，而且设备可能换过。
-        if [ -f "$_rd/enter.request" ]; then
-            drm_log "检测到进入 Linux 请求"
-            rm -f "$_rd/enter.request" "$_rd/enter.result" 2>/dev/null
-            drm_identity_publish
-            if cmd_enter; then
-                printf 'ok\n' >"$_rd/enter.result" 2>/dev/null
-            else
-                printf 'fail 接管失败，详见 %s\n' "$DRM_JOURNAL" >"$_rd/enter.result" 2>/dev/null
+        # ★ 用 ds_with_container 切换容器语境（而不是 `DRM_CONTAINER=x cmd`）：
+        #   前置赋值对函数是否在返回后保留是 POSIX 未规定的，泄漏就会让
+        #   下一轮操作打到错的容器上，而且是静默的。
+        for _c in $(ds_list_containers 2>/dev/null); do
+            ds_with_container "$_c" drm_heartbeat_touch
+
+            _rd=$(ds_with_container "$_c" drm_rendezvous_local 2>/dev/null) || continue
+            [ -n "$_rd" ] && [ -d "$_rd" ] || continue
+
+            # ── 返回安卓 ──
+            if [ -f "$_rd/exit.request" ]; then
+                drm_log "检测到返回安卓请求（容器 $_c）"
+                rm -f "$_rd/exit.request" 2>/dev/null   # ★ 必须在停容器之前
+                _unlock
+                ds_with_container "$_c" cmd_exit
+                return 0
             fi
-            chmod 644 "$_rd/enter.result" 2>/dev/null
-            # 接管成功后本进程所在的框架/显示栈已被改动，继续轮询即可；
-            # 失败则原地回滚已由 cmd_enter → drm_do_enter 完成。
-        fi
+
+            # ── 进入 Linux ──
+            #
+            # ★ 身份信息要在接管**之前**再发一次：容器启动后 rootfs 里的
+            #   路径才真正可写，而且设备可能换过。
+            if [ -f "$_rd/enter.request" ]; then
+                drm_log "检测到进入 Linux 请求（容器 $_c）"
+                rm -f "$_rd/enter.request" "$_rd/enter.result" 2>/dev/null
+                drm_identity_publish
+                if ds_with_container "$_c" cmd_enter; then
+                    printf 'ok\n' >"$_rd/enter.result" 2>/dev/null
+                else
+                    printf 'fail 接管失败，详见 %s\n' "$DRM_JOURNAL" >"$_rd/enter.result" 2>/dev/null
+                fi
+                chmod 644 "$_rd/enter.result" 2>/dev/null
+                # 接管成功后本进程所在的框架/显示栈已被改动，继续轮询即可；
+                # 失败则原地回滚已由 cmd_enter → drm_do_enter 完成。
+            fi
+        done
 
         sleep 1
     done
@@ -480,15 +529,25 @@ cmd_watch_stop() {
 }
 
 cmd_watch_status() {
-    # ★ 判据以锁为准（见 drm_watch_acquire 的注释：/proc 扫描会误判）
+    # ★ 判据以锁为准（见 cmd_watch 的注释：只看 kill -0 会被 pid 复用骗过）
     _lk="$DRM_RUN_DIR/watch.lock"
     if [ -d "$_lk" ]; then
         _op=$(cat "$_lk/pid" 2>/dev/null)
-        if [ -n "$_op" ] && kill -0 "$_op" 2>/dev/null; then
+        if drm_lock_from_other_boot "$_lk"; then
+            printf 'watch: not running (锁来自上一次开机 boot_id=%s)\n' \
+                "$(cat "$_lk/boot_id" 2>/dev/null)"
+            return 1
+        fi
+        if [ -n "$_op" ] && drm_pid_is_watch "$_op"; then
             printf 'watch: running (pid=%s)\n' "$_op"
             return 0
         fi
-        printf 'watch: not running (陈旧锁 pid=%s)\n' "${_op:-空}"
+        if [ -n "$_op" ] && [ -d "/proc/$_op" ]; then
+            printf 'watch: not running (陈旧锁 pid=%s 已被复用为 %s)\n' \
+                "$_op" "$(cat "/proc/$_op/comm" 2>/dev/null)"
+        else
+            printf 'watch: not running (陈旧锁 pid=%s)\n' "${_op:-空}"
+        fi
         return 1
     fi
     _p=$(drm_watch_pids | tr '\n' ' ')
@@ -506,6 +565,17 @@ cmd_watch_status() {
 
 cmd_status() {
     printf '设备      : %s (%s) [%s 侧]\n' "$DRM_DEVICE" "$DEV_MODEL" "$DRM_SIDE"
+    ds_init
+    _sel="${DRM_CONTAINER:-}"
+    if [ -n "$_sel" ]; then
+        printf '容器      : %s（DRM_CONTAINER 显式指定）\n' "$DS_NAME"
+    else
+        printf '容器      : %s（适配层默认 %s）\n' "$DS_NAME" "${DEV_CONTAINER:-?}"
+    fi
+    _all=$(ds_list_containers 2>/dev/null | tr '\n' ' ')
+    [ -n "$_all" ] && printf '容器清单  : %s\n' "$_all"
+    printf '共享目录  : %s\n' "$(ds_shared_dir)"
+    printf '会合目录  : %s\n' "$(drm_rendezvous_local 2>/dev/null || echo '-')"
     drm_state_show
     _lh=$(drm_lock_holder 2>/dev/null) && printf '锁        : %s\n' "$_lh" || printf '锁        : 空闲\n'
     cmd_watch_status
@@ -514,6 +584,17 @@ cmd_status() {
         printf 'composer  : %s\n' "$(android_svc_state "$DEV_COMPOSER_SVC")"
         _h=$(android_card_holders 2>/dev/null)
         printf 'card0持有 : %s\n' "${_h:-无}"
+        # 会合目录：多容器时每个容器一个，逐个列出请求/心跳状态
+        printf '会合状态  :\n'
+        for _rd in $(drm_rendezvous_all 2>/dev/null); do
+            [ -n "$_rd" ] || continue
+            _hb="-"
+            [ -r "$_rd/heartbeat" ] && _hb=$(cat "$_rd/heartbeat" 2>/dev/null)
+            _req=""
+            [ -f "$_rd/enter.request" ] && _req="$_req enter.request"
+            [ -f "$_rd/exit.request" ] && _req="$_req exit.request"
+            printf '  %s\n     心跳=%s%s\n' "$_rd" "$_hb" "$_req"
+        done
     else
         printf 'kwin      : %s\n' "$(drm_pids_by_comm kwin_wayland | tr '\n' ' ')"
         printf 'plasmashell: %s\n' "$(drm_pids_by_comm plasmashell | tr '\n' ' ')"
@@ -541,6 +622,7 @@ $DRM_PROJECT — 统一切换控制器
   watch-status 查看 watch 状态
 
 环境变量:
+  DRM_CONTAINER=名字   选中哪个容器（本机可以有多个；默认取设备适配层的 DEV_CONTAINER）
   DRM_DEVICE=opd2511   强制设备适配层（默认自动识别）
   FULL_STOP=1          连 framework 一起 stop（⚠️ 会永久毁掉音频）
   DRM_NET=0            跳过网络接管
@@ -548,6 +630,7 @@ $DRM_PROJECT — 统一切换控制器
   DRM_WAYLAND_SOCKET   合成器 socket 名（默认 taketest）
 
 当前设备: $DRM_DEVICE ($DEV_MODEL)，本进程在 $DRM_SIDE 侧
+当前容器: $DS_NAME（本机容器：$(ds_list_containers 2>/dev/null | tr '\n' ' ')）
 EOF
 }
 
