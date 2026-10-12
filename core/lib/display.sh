@@ -1641,11 +1641,19 @@ drm_start_input_methods() {
     # 本机实测缺它的直接后果：
     #   · 系统托盘里没有蓝牙图标（bluedevil.so 是 kded 模块）
     #   · 设备自动挂载、通知、剪贴板同步、触摸板配置全都不工作
-    # ⚠️ 但它**不能**解决 WiFi 密钥代理问题 —— 实测 kded6 跑起来、
-    #    `loadModule networkmanagement` 也返回 true，而
-    #    org.freedesktop.NetworkManager.SecretAgent 仍然 no such name。
-    #    那个 kded 模块提供的是小程序后端，不是密钥代理。
-    #    密钥代理的绕行办法见 network/net-takeover.sh 的 nt_fix_secrets。
+    # ⚠️ 关于 WiFi 密钥代理 —— 2026-10-12 勘误：
+    #   旧注释写的是"kded6 跑起来也没用，SecretAgent 仍然 no such name，
+    #   那个模块提供的是小程序后端不是密钥代理"。**这个结论是错的。**
+    #   错在判据：org.freedesktop.NetworkManager.SecretAgent 这个名字
+    #   **永远没有 owner** —— NM 的代理协议走 AgentManager.Register()，
+    #   代理用唯一名（:1.xxx）注册。
+    #   正确判据是 NM 日志出现
+    #       agent-manager: agent[.../org.kde.plasma.networkmanagement/1000]:
+    #           agent registered
+    #   实测：kded6 起来之后**还必须显式 loadModule networkmanagement**
+    #   （autoloaded=true 也不会自动加载），加载后代理即注册，
+    #   用户在图形界面输一次密码就连上了。
+    #   ⇒ 所以下面 kded6 起来后要顺手加载这个模块，见 kded 段落末尾。
     # ★ 放在输入法检查之前：kded6 是独立需求，不能因为没装输入法就跳过。
     if ds_exec 'command -v kded6 >/dev/null 2>&1' >/dev/null 2>&1; then
         if ds_exec 'pgrep -x kded6 >/dev/null 2>&1' >/dev/null 2>&1; then
@@ -1669,6 +1677,45 @@ drm_start_input_methods() {
         fi
     else
         drm_warn "容器里没有 kded6，跳过"
+    fi
+
+    # ── ★★ 加载 networkmanagement kded 模块（WiFi 密钥代理）★★ ──
+    # 为什么单独一步：kded6 起来**不会**自动加载这个模块，
+    # 即使它的元数据里写着 X-KDE-Kded-autoload、autoloaded 也返回 true。
+    # 不加载 ⇒ NM 问遍总线没有代理应答 ⇒ 图形界面点 WiFi 直接失败：
+    #     no secrets: No agents were available for this request.
+    #     state change: need-auth -> failed (reason 'no-secrets')
+    # 加载 ⇒ NM 日志出现
+    #     agent-manager: agent[.../org.kde.plasma.networkmanagement/1000]:
+    #         agent registered
+    # ⇒ 用户在托盘里输一次密码就能连上（这正是用户要的图形界面路径）。
+    #
+    # ★ kded6 的 DBus 对象路径是 **/kded**，不是 /kded6（后者报 UnknownObject，
+    #   会让人误以为 kded6 没起来）。
+    # ★ 判据是上面那行 NM 日志，**不是** SecretAgent 名字有没有 owner
+    #   （那个名字永远没有 owner）。
+    if ds_exec 'pgrep -x kded6 >/dev/null 2>&1' >/dev/null 2>&1; then
+        if ds_exec 'command -v qdbus6 >/dev/null 2>&1' >/dev/null 2>&1; then
+            _nmload=$(ds_exec "runuser -u $DESKTOP_USER -- env \
+                HOME=$DESKTOP_HOME XDG_RUNTIME_DIR=$DESKTOP_RUNTIME_DIR \
+                DBUS_SESSION_BUS_ADDRESS=unix:path=$DESKTOP_RUNTIME_DIR/bus \
+                qdbus6 org.kde.kded6 /kded \
+                org.kde.kded6.loadModule networkmanagement" 2>&1 | tr -d '\r')
+            if [ "$_nmload" = "true" ]; then
+                drm_log "已加载 networkmanagement 模块（WiFi 密钥代理就位，图形界面可提示输密码）"
+            else
+                drm_warn "加载 networkmanagement 模块返回 '$_nmload'，WiFi 图形界面可能无法提示密码"
+            fi
+            # 顺手设为自动加载，减少下次依赖
+            ds_exec "runuser -u $DESKTOP_USER -- env \
+                HOME=$DESKTOP_HOME XDG_RUNTIME_DIR=$DESKTOP_RUNTIME_DIR \
+                DBUS_SESSION_BUS_ADDRESS=unix:path=$DESKTOP_RUNTIME_DIR/bus \
+                qdbus6 org.kde.kded6 /kded \
+                org.kde.kded6.setModuleAutoloading networkmanagement true" \
+                >/dev/null 2>&1 || true
+        else
+            drm_warn "容器里没有 qdbus6，无法加载 networkmanagement 模块"
+        fi
     fi
 
     # ── 屏幕键盘：告诉 KWin 用哪个 ────────────────────────────

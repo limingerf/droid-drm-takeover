@@ -397,54 +397,78 @@ nt_install_route_dispatcher() {
 # 90-drm-route-fix —— DRM 接管容器的出网兜底路由自动重挂
 #
 # 为什么需要它：NetworkManager 把默认路由写进 main 表，而安卓 netd 的 rule
-# 列表里没有 \`32766: from all lookup main\`，所以 main 表永远不被查。
-# 我们要自己建一张表 + 一条夹在 netd 的 20000 与 32000 之间的 rule。
+# 列表里没有 \`32766: from all lookup main\`，所以 main 表永远不被查；
+# 末尾还有一条兜底的 \`32000: from all unreachable\`。
+# 所以我们要在 32000 **之前**塞两条 rule 把流量导向真正的表：
+#     <MAIN_PREF> → main  （直连子网 + NM 装的默认路由）
+#     <TBL_PREF>  → 1042  （容器自己的表）
 #
-# ★ 为什么必须是 dispatcher：那张表和那条 rule 是在 NM 之外加的，NM 不认识
-#   它们。实测 NM 一重载/重连，那条 rule 就被清掉 ⇒ 立刻断网（DNS 都到不了）。
-#   挂成 dispatcher 后，每次接口 up / DHCP 续约都会自动补回来。
+# ★ 为什么必须是 dispatcher：这两条 rule 是在 NM 之外加的，NM 不认识
+#   它们。实测 NM 一重载/重连，rule 就被清掉 ⇒ 立刻断网（连同一子网的
+#   网关都 ping 不通，DNS 也到不了）。挂成 dispatcher 后每次接口 up /
+#   DHCP 续约 / reapply 都会自动补回来。
+#
+# ══════════════════════════════════════════════════════════════════════
+# ★★★ 2026-10-12 勘误：网关取错了，导致这个 dispatcher 一直是坏的 ★★★
+# ══════════════════════════════════════════════════════════════════════
+# 旧版本从 \`1000+ifindex\` 或表 1042 里读网关。实测日志：
+#     re-applied: wlan0 up gw=192.168.1.1 table=1042 pref=31500
+# 而真实网关是 192.168.1.2 —— 它读到的是**表 1042 自己里面的过期值**，
+# 典型的自我循环：用自己写坏的默认路由去算下一次要写的默认路由，
+# 于是永远修不好。而且旧版本**只补 31500，从不补指向 main 的那条**，
+# 所以连直连子网都不可达。
+#
+# ★ 正确做法：网关**只从 main（254）表读** —— 那是 NM 用 DHCP 拿到的、
+#   唯一可信的来源。
 #
 # ⚠️ 红线：绝不 \`ip rule flush\`，绝不删 netd 的任何 rule/table，只新增。
 IFACE="\$1"
 ACTION="\$2"
 
-case "\$ACTION" in
-    up|vpn-up|dhcp4-change|dhcp6-change) ;;
+# 只关心 wlan0/p2p0 上会改变路由的事件
+case "\$IFACE" in
+    wlan0|p2p0) ;;
     *) exit 0 ;;
 esac
-
-TBL=$_rtbl
-PREF=$_rpref
+case "\$ACTION" in
+    up|connectivity-change|dhcp4-change|dhcp6-change|reapply) ;;
+    *) exit 0 ;;
+esac
 
 # 只处理有 IPv4 的接口
 ip -4 -o addr show "\$IFACE" 2>/dev/null | grep -q 'inet ' || exit 0
 
-# 找网关：优先从 netd 的 per-interface 表（表号 = 1000 + ifindex）读
-IDX=\$(cat "/sys/class/net/\$IFACE/ifindex" 2>/dev/null)
-GW=""
-for t in \$((1000 + \${IDX:-0})) \$TBL; do
-    g=\$(ip -4 route show table "\$t" 2>/dev/null | awk '/^default/{print \$3; exit}')
-    [ -n "\$g" ] && { GW=\$g; break; }
-done
-if [ -z "\$GW" ]; then
-    r=\$(ip -4 route show table all 2>/dev/null | grep "dev \$IFACE" | grep 'scope link' | head -1)
-    GW=\$(printf '%s' "\$r" | awk '{print \$1}' | sed 's|/.*||' | sed 's/\\.[0-9]*\$/.1/')
+TBL=$_rtbl
+PREF=$_rpref
+MAIN_PREF=31000
+
+# ★★★ 网关只从 main（254）表读 —— 唯一可信来源 ★★★
+# 绝不要从表 1042 或 1000+ifindex 读：那里面有可能是**我们自己上次写坏的**
+# 过期网关（实测过 gw=192.168.1.1 而真实是 192.168.1.2），自我循环永远修不好。
+GW=$(ip -4 route show table main 2>/dev/null | awk '/^default/{print $3; exit}')
+[ -n "$GW" ] || exit 0
+
+# ── ① 补指向 main 的 rule ──────────────────────────────────
+# 没有它，连直连子网都不可达（netd 的 rule 列表里没有 lookup main）。
+if ! ip rule show 2>/dev/null | grep -q "^$MAIN_PREF:"; then
+    ip rule add pref "$MAIN_PREF" from all lookup main 2>/dev/null
 fi
-[ -n "\$GW" ] || exit 0
 
-NET=\$(printf '%s' "\$GW" | sed 's/\\.[0-9]*\$/.0/')
-
+# ── ② 表 1042 + 指向它的 rule ──────────────────────────────
+NET=$(printf '%s' "$GW" | sed 's/\.[0-9]*$/.0/')
 # 递归路由必须先建（网段 scope link 在默认路由之前），否则内核判 Nexthop invalid
-ip -4 route replace "\$NET/24" dev "\$IFACE" scope link table "\$TBL" 2>/dev/null
-ip -4 route replace default via "\$GW" dev "\$IFACE" onlink table "\$TBL" 2>/dev/null
+ip -4 route replace "$NET/24" dev "$IFACE" scope link table "$TBL" 2>/dev/null
+ip -4 route replace default via "$GW" dev "$IFACE" table "$TBL" 2>/dev/null
 
-# rule：先删同 pref 旧条目（ip rule add 会重复堆叠），iif lo 只匹配本机发出的包
-while ip rule show 2>/dev/null | grep -q "^\$PREF:"; do
-    ip rule del pref "\$PREF" 2>/dev/null || break
+# rule：先删同 pref 旧条目（ip rule add 会重复堆叠）
+while ip rule show 2>/dev/null | grep -q "^$PREF:"; do
+    ip rule del pref "$PREF" 2>/dev/null || break
 done
-ip rule add pref "\$PREF" iif lo lookup "\$TBL" 2>/dev/null
+# ★ 用 from all 而不是 iif lo：iif lo 只匹配本机发出的包，
+#   容器里的转发/回包会漏掉（旧版本这里也是错的）。
+ip rule add pref "$PREF" from all lookup "$TBL" 2>/dev/null
 
-logger -t drm-route-fix "re-applied: \$IFACE \$ACTION gw=\$GW table=\$TBL pref=\$PREF" 2>/dev/null
+logger -t drm-route-fix "re-applied: $IFACE $ACTION gw=$GW main_pref=$MAIN_PREF tbl=$TBL pref=$PREF" 2>/dev/null
 exit 0
 DISPEOF
 )
@@ -471,65 +495,94 @@ nt_fix_dns() {
              cat /etc/resolv.conf' 2>&1 | tr -d '\r' | sed 's/^/    /'
 }
 
-# ── ★★ 密钥代理缺失的绕行 ★★ ──────────────────────────────
+# ── ★★ 密钥代理：加载 kded 模块即可，不需要任何绕行 ★★ ──────────
 #
-# 本机实测：容器里**没有** NetworkManager 的密钥代理。
-#   · kded6 已在跑，`loadModule networkmanagement` 也返回 true，
-#     但 `org.freedesktop.NetworkManager.SecretAgent` 仍然 `no such name`
-#     ⇒ 那个 kded 模块提供的是小程序后端，**不是**密钥代理。
-#   · 后果：用户在 plasma-nm 图形界面里输的密码 NM 收不到，日志报
-#         device (wlan0): no secrets: No agents were available for this request.
-#         device (wlan0): state change: need-auth -> failed (reason 'no-secrets')
+# 症状：图形界面里点 WiFi 连不上，NM 日志报
+#     device (wlan0): no secrets: No agents were available for this request.
+#     device (wlan0): state change: need-auth -> failed (reason 'no-secrets')
 #
-# 绕行办法（已验证有效）：让 NM **自己保存**密码 ——
-#   ① 把连接的 `psk-flags` 从 1（代理持有）改成 0（NM 持有）
-#   ② 用 `nmcli device wifi connect <SSID> password <PSK>` 连一次
-#      —— 密码直达 NM，不经过任何代理，然后被写进 .nmconnection
-#   ③ 之后托盘小程序再连就不需要代理了
+# 根因：**kded6 没有加载 networkmanagement 模块**。
+# 提供密钥代理的就是 plasma-nm 的这个 kded 模块：
+#     /usr/lib/aarch64-linux-gnu/qt6/plugins/kf6/kded/networkmanagement.so
+# 它的元数据内嵌在 .so 里（X-KDE-Kded-autoload / SecretAgent），
+# 所以 /usr/share/kservices6/ 为空是**正常**的，不要往那儿补 .desktop。
+# 真正的原因是：我们绕过 startplasma-wayland 手工起 plasmashell，
+# kded6 从没被正常拉起并加载模块。autoloaded=true 也不够，必须显式加载。
 #
-# ★★★ 2026-10-12 严重事故：**只做①不做②会把 WiFi 彻底弄坏** ★★★
+#     qdbus6 org.kde.kded6 /kded org.kde.kded6.loadModule networkmanagement
+#     （完整脚本见 network/nm-agent-fix.sh）
 #
-# 我上次就是只跑了这一步，结果：
-#   · 连接的 `psk-flags` 变成 0（NM 认为"密码应该由我自己保管"）
-#   · 但文件里**根本没有 `psk=` 这一行**（密码原本在代理里）
-#   · 于是 NM 既不去问代理、文件里又没有 ⇒ 永远连不上：
-#         device (wlan0): no secrets: No agents were available for this request.
-#         state change: need-auth -> failed (reason 'no-secrets')
-#   · 而且**图形界面也不会再提示输密码**（NM 认为密码已经有了）
-#   · 备份文件里同样没有 psk（备份是 19:48 的，那时就是 flags=1），救不回来
-#   ⇒ 只能靠用户重新输一次密码。
+# ══════════════════════════════════════════════════════════════════════
+# ★★★ 勘误：2026-10-12 之前这里写的结论是**错的** ★★★
+# ══════════════════════════════════════════════════════════════════════
+# 旧注释说：
+#     "loadModule 返回 true，但 SecretAgent 仍然 no such name
+#      ⇒ 那个 kded 模块提供的是小程序后端，不是密钥代理"
 #
-# 所以现在这个函数**只做安全检查，不做破坏性修改**：
-#   · 已经有 psk 的连接 → 确保 flags=0（NM 持有，最稳）
-#   · 还没有 psk 的连接 → **保持 flags=1 不动**，只提示用户走 wifi-connect
-#     （那条路会把密码直接交给 NM，之后自动落盘）
+# 这个判断错在**判据选错了**：
+#   ★ org.freedesktop.NetworkManager.SecretAgent 这个名字**永远没有 owner**。
+#     NM 的代理协议走 AgentManager.Register()，代理用**自己的唯一名**
+#     （:1.xxx）注册，不占用那个 well-known name。
+#     所以 "no such name" 完全不能说明代理不存在。
+#
+#   ★ 正确判据是 NM 日志里出现：
+#         agent-manager: agent[...:1.xxx/org.kde.plasma.networkmanagement/1000]:
+#             agent registered
+#     实测 loadModule 之后这行就出现了 —— 模块**确实**提供密钥代理。
+#
+#   ★ 还有一个更误导人的判据陷阱：`nmcli connection up` 失败**不能**说明
+#     代理没生效。nmcli 自己不弹窗（除非加 --ask），必然报
+#         Secrets were required, but not provided
+#     真正弹窗的是 plasmashell 里的 plasma-nm 小程序，也就是用户点托盘图标
+#     那条路。实测：代理注册后，用户在图形界面输密码**一次就连上了**。
+#
+# 所以基于旧结论推出的"绕行办法"（把 psk-flags 改成 0 再用
+# `nmcli device wifi connect ... password ...` 连一次）**不要再用了**：
+#   · 那是命令行路径，而用户要的是**图形面板能用**；
+#   · 而且只改①不改②会把连接彻底弄坏（见下）。
+#
+# ══════════════════════════════════════════════════════════════════════
+# ★★★ psk-flags 的正确取值 ★★★
+# ══════════════════════════════════════════════════════════════════════
+#     psk-flags=1  →  密钥由**代理**保管（KWallet）＝ 图形界面提示输密码
+#                      ★ 这是本仓库要的模式，**不要改**
+#     psk-flags=0  →  密钥由 **NM 自己**保管，需要文件里有 `psk=` 字面值
+#
+# ★ 2026-10-12 事故：把 psk-flags 从 1 改成 0，但文件里**没有 `psk=` 行**
+#   （密码原本在代理里），于是 NM 既不去问代理、文件里又找不到 ⇒
+#   永远连不上，**而且图形界面也不再提示输密码**（NM 认为密码已经有了）。
+#   备份里同样没有 psk，救不回来，只能让用户重输一次。
+#   ⇒ 所以本函数**只确保 flags=1，绝不改成 0**。
+#
+# ★ 本函数**不做任何破坏性修改**，只做两件事：
+#     ① 把 flags 归位到 1（代理模式，图形界面可提示）
+#     ② 加载 kded 模块，让代理真正注册
 nt_fix_secrets() {
-    drm_log "检查 WiFi 密钥存放方式（不做破坏性修改）"
-    ds_exec 'has_psk=0; no_psk=""
-             for f in /etc/NetworkManager/system-connections/*.nmconnection; do
+    drm_log "确保 WiFi 密钥走代理模式（图形界面可提示输密码）"
+    ds_exec 'for f in /etc/NetworkManager/system-connections/*.nmconnection; do
                  [ -f "$f" ] || continue
+                 # 有 psk 字面值 ⇒ 保持 NM 持有也可以，但统一回 1 更一致：
+                 # 图形界面能提示、也能改密码。
                  if grep -q "^psk=" "$f"; then
-                     has_psk=1
-                     # 有密码 ⇒ 让 NM 自己持有，最稳
-                     sed -i "s/^psk-flags=1$/psk-flags=0/" "$f"
-                     chmod 600 "$f"
-                     echo "  [OK] $(basename "$f")：文件里有 psk，flags=0（NM 持有）"
-                 else
-                     # 没密码 ⇒ 绝不改 flags，否则会把连接弄坏
-                     no_psk="$no_psk $(basename "$f")"
-                     echo "  [注意] $(basename "$f")：文件里没有 psk，保持 flags=$(grep -o "psk-flags=." "$f" | head -1 | cut -d= -f2) 不动"
+                     echo "  [信息] $(basename "$f")：文件里有 psk 字面值"
                  fi
+                 # ★ 只往 1 归位，绝不改成 0
+                 sed -i "s/^psk-flags=0$/psk-flags=1/" "$f"
+                 chmod 600 "$f"
+                 _f=$(grep -o "psk-flags=." "$f" | head -1 | cut -d= -f2)
+                 echo "  [OK] $(basename "$f")：psk-flags=${_f:-未设置}（1=代理持有，图形界面会提示）"
              done
-             if [ -n "$no_psk" ]; then
-                 echo ""
-                 echo "  ★ 下面这些连接没有保存密码，需要用户输一次："
-                 for n in $no_psk; do echo "      $n"; done
-                 echo "  ★ 请用触摸屏入口输密码（密码会直接交给 NM 并落盘）："
-                 echo "      sh /usr/local/bin/wifi-connect     （或点桌面图标）"
-                 echo "  ★ 千万不要手工把 psk-flags 改成 0 —— 那会让图形界面也不再提示密码，"
-                 echo "    连接彻底连不上（2026-10-12 踩过）。"
-             fi
              systemctl is-active NetworkManager' 2>&1 | tr -d '\r' | sed 's/^/    /'
+
+    # ② 加载 kded 模块，让 plasma-nm 的密钥代理注册
+    _af=/usr/local/lib/droid-drm-takeover/nm-agent-fix.sh
+    [ -x "$_af" ] || _af=$(dirname "$0")/nm-agent-fix.sh
+    if [ -x "$_af" ]; then
+        drm_log "加载 kded networkmanagement 模块（密钥代理）"
+        sh "$_af" 2>&1 | sed 's/^/    /'
+    else
+        drm_log "★ 找不到 nm-agent-fix.sh，图形界面可能无法提示输密码"
+    fi
 }
 
 # 触摸屏上可用的连 WiFi 入口。
