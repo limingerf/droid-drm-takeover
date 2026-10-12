@@ -107,6 +107,7 @@ Error playing sample
 | **C 容器直写 ALSA** | 容器 → `/dev/snd/pcmC0D*x` | ❌ 第 ② 层 EINVAL，**死路** |
 | **B anland / PulseAudio(AAudio) 桥** | sink = 安卓 OpenSL ES / AAudio，要 `audioserver` 活着 | ❌ `media.audio_flinger` 未注册（第 ③ 层）；本机也没 Termux |
 | **A 直连 vendor HAL**（上游主线） | 容器 PipeWire → `aa-feeder.sh` → socket → 安卓侧 `argsloop` → vendor AIDL HAL → AudioPatch → speaker | ⚠️ **架构上唯一可行**，但本机缺构建工具链 + 端口号要重抓（见 §5） |
+| **D 厂商 AGM/PAL 工具直连** | 安卓侧 `/vendor/bin/agmplay`（AGM metadata + 写 FE PCM）或 `PalTest`/`mm-audio-ftm`，**不需要 audioserver/AudioFlinger** | ⭐ **最有希望**，但本机卡在 AGM 的 `<intf> rate ch fmt` mixer 控件没暴露（见 `docs/音频诊断-2026-10-12.md` §8） |
 
 A 路链路（上游原文）：
 
