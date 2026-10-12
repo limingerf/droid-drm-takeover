@@ -63,8 +63,29 @@ while :; do
         _bp=/sys/class/backlight/$_bl/bl_power
         [ -w "$_bp" ] && [ "$(cat "$_bp" 2>/dev/null)" != 0 ] && \
             echo 0 >"$_bp" 2>/dev/null
-        _bn=/sys/class/backlight/$_bl/brightness
-        [ -w "$_bn" ] && echo "$DEV_BRIGHTNESS" >"$_bn" 2>/dev/null
+        # ★★ 2026-10-12：与按键守护（input/drm-keys.py）协作，别互相打架。
+        #
+        #   drm-keys 的电源键短按会做"熄屏"：先写背光 0、再 DPMS off，
+        #   并置 /run/drm-keys.screenoff=1。而本脚本每 5 秒把背光**钉回**
+        #   DEV_BRIGHTNESS —— 两者同时跑的结果是：
+        #     用户按一下电源键 → 屏幕黑了 → 最多 5 秒后自己又亮起来。
+        #   现象是"电源键熄屏时灵时不灵"，极难查（因为 DPMS 那半是生效的）。
+        #
+        #   所以熄屏期间**跳过 brightness 回写**。注意 bl_power 仍然要钉 0
+        #   （那是"别让安卓把背光电源硬关"的保护，和亮度不是一回事；
+        #    亮度已经是 0，钉 bl_power 不会让屏幕亮起来）。
+        #
+        #   ★ 只认这个明确的标志文件，不猜 DPMS 状态：sysfs 的
+        #     /sys/class/drm/*/dpms 实测不可信（kscreen-doctor --dpms off
+        #     之后它照样读 On，上游踩过）。
+        if [ "$(cat /run/drm-keys.screenoff 2>/dev/null)" = "1" ]; then
+            _bn=/sys/class/backlight/$_bl/brightness
+            [ -w "$_bn" ] && [ "$(cat "$_bn" 2>/dev/null)" != 0 ] && \
+                echo 0 >"$_bn" 2>/dev/null
+        else
+            _bn=/sys/class/backlight/$_bl/brightness
+            [ -w "$_bn" ] && echo "$DEV_BRIGHTNESS" >"$_bn" 2>/dev/null
+        fi
     fi
     # 兜底：能写 DRM 属性时也写一次（非接管态下才可能成功）
     if [ -n "$_sb" ]; then

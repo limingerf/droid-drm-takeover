@@ -109,7 +109,7 @@ net_takeover_wifi || true
 drm_phase "device-post-session"
 drm_device_hook dev_post_session_fixes
 
-# ── 14) 常驻守护：背光钉住 + 安卓 dmesg 收割 ───────────────
+# ── 14) 常驻守护：背光钉住 + 安卓 dmesg 收割 + 硬件按键 ───────
 drm_phase "guardians"
 _bl=$(drm_tool setbright 2>/dev/null)
 if [ -n "$_bl" ]; then
@@ -117,6 +117,29 @@ if [ -n "$_bl" ]; then
     setsid nohup sh -c "while :; do '$DRM_ROOT/display/keepbright.sh' 2>/dev/null; sleep 5; done" \
         >>"${DRM_LOG_DIR}/keepbright.log" 2>&1 &
     drm_log "已起 keepbright 守护"
+fi
+
+# ★ 硬件按键守护（音量键 + 电源键短按）。
+#
+# 【为什么必须在这里起】实测（2026-10-12）按键事件**确实**进了容器
+#   （evmon2.py 抓到 KEY_VOLUMEUP / KEY_POWER），但没人处理：
+#     · kglobalaccel 里没有 volume 动作（PowerDevil 从没启动，
+#       graphical-session.target inactive）⇒ 音量键的 keysym 无人接收；
+#     · logind 的 HandlePowerKey=ignore ⇒ 电源键被主动丢弃
+#       （journal 有 `Power key pressed short.` 但无动作）。
+#   所以必须自己读。守护全程 O_RDONLY **不 grab**，logind/KWin 照旧收到事件，
+#   长按电源键的硬件强制断电能力完全不受影响。
+#
+# 【为什么放在 keepbright 之后】守护熄屏时要把背光写 0，而 keepbright 会
+#   每 5 秒把背光钉回目标值 —— 两者会打架（现象：按电源键熄屏后最多 5 秒
+#   又自己亮起来）。现在 keepbright 会读 /run/drm-keys.screenoff，
+#   熄屏期间只钉 bl_power、不再回写 brightness（见 display/keepbright.sh）。
+if [ -f "$DRM_ROOT/input/install-keys.sh" ]; then
+    sh "$DRM_ROOT/input/install-keys.sh" >>"${DRM_LOG_DIR}/keys.log" 2>&1 \
+        && drm_log "已起 drm-keys 守护（音量键 + 电源键短按）" \
+        || drm_warn "drm-keys 守护没起来（见 keys.log）"
+else
+    drm_warn "找不到 $DRM_ROOT/input/install-keys.sh —— 音量键/电源键不会有响应"
 fi
 
 # ── 15) 汇总 ──────────────────────────────────────────────

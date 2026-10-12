@@ -199,7 +199,10 @@ drm_stage_payload_to_container() {
 
     rm -rf "$_dst" 2>/dev/null
     mkdir -p "$_dst" 2>/dev/null
-    for _d in core linux display tools configs docs android; do
+    # ★ input/ 必须一起同步：drm-keys.py（音量键+电源键守护）在里面，
+    #   漏掉它的后果是"容器里没有按键守护"，而且失败是静默的
+    #   （session-up.sh 里的 install-keys.sh 找不到源文件只会告警）。
+    for _d in core linux display input tools configs docs android; do
         [ -d "$_src/$_d" ] && cp -R "$_src/$_d" "$_dst/" 2>/dev/null
     done
     for _f in Makefile README.md; do
