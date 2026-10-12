@@ -72,11 +72,62 @@ adb 序列号 `HA2HZAW2`，Android 17 / SDK 37）上实测通过：
 | ① | 桥日志出现 `initializationComplete(status=0 SUCCESS)` | 通过（HAL 收下了我们的回调节点） |
 | ② | 容器 `hciconfig -a hci0` 有 `Bus: UART` **且** BD_ADDR 非全零 | `Type: Primary Bus: UART` / `BD Address: 14:38:FA:15:E0:5D` / `UP RUNNING` / `errors:0` |
 | ③ | 容器 `bluetoothctl show` 列出 Controller | `Powered: yes` / `PowerState: on` / 13 个 UUID / `Roles: central peripheral` |
-| ④ | 收桥后 `/sys/class/bluetooth` 为空、rfkill 回基线、模块仍在 | 两边都空 / `bt_power soft=0 hard=0` / 5 个模块 |
+| ④ | 收桥后 `/sys/class/bluetooth` 为空、rfkill 回基线、模块仍在 | **两边**都空 / `bt_power soft=0 hard=0` / 5 个模块 |
+
+④ 必须**两边都查**（安卓侧 + 容器侧）：hci0 在共享内核里，只查一边会漏掉
+"另一边还留着"。
 
 外加一条**信息性**验证（不进退出码，射频环境不由我们决定）：容器里
-`bluetoothctl --timeout 12 scan on` 实测**扫到 12 个真实设备** —— 证明这不是
-"注册了个空壳设备节点"，而是射频真的在收发。
+`bluetoothctl --timeout 12 scan on` 实测**扫到 7~13 个真实设备**（midea 家电、
+LAPTOP-… 等）—— 证明这不是"注册了个空壳设备节点"，而是射频真的在收发。
+
+## 调试记录：踩过的坑
+
+留在这里是因为每一条都**看起来像别的问题**，会把人带到错的方向上。
+
+### `hci0/flags` 不存在，但被当成了"设备不存在"的判据
+
+本机 `/sys/class/bluetooth/hci0/` 里只有 `power` / `rfkill9` / `subsystem` /
+`uevent` —— **没有 `flags`**。早先状态行写的是
+
+```sh
+cat /sys/class/bluetooth/hci0/flags 2>/dev/null || echo NO-SYSFS-ON-ANDROID
+```
+
+于是**永远**打 `NO-SYSFS-ON-ANDROID`，把"其实好着呢"写成"看不见设备"，白白
+误导了一轮排查。现在判据是**目录在不在**（`access(path, F_OK)`），打
+`present` / `ABSENT`，顺带省掉每 10 秒一次 `popen`。
+
+### 日志时间戳是假的
+
+早先 `logmsg()` 拿 `CLOCK_MONOTONIC` 的秒数去喂 `localtime_r`，得到的是
+"开机秒数当成 epoch 秒"的假时间：设备实际 `00:44`，日志写 `17:24`，跨进程对时
+全错（当时正在排内核 setup 的超时，差点被这个带偏）。墙钟必须用
+`CLOCK_REALTIME`；差值才用单调钟（那是 `now_ms()` 的事）。
+
+### 桥有一次跑了几分钟后自行退场，日志什么都没说
+
+实测遇到过一次：桥起来一切正常，跑了几分钟后走了**正常退场路径**
+（`HAL close()` → 恢复 vtable 页 → 关 pty），但日志里没有任何原因。当时
+`g_run = 0` 的三条路径里，**两条是完全静默的**：
+
+```c
+if (until && now_ms() >= until) break;        // --keep 到期：不吭声
+if (s < 0 && errno != EINTR) break;           // poll 出错：不吭声
+static void on_term(int) { g_run = 0; }       // 收到信号：连是哪个信号都不记
+```
+
+现在每条都记：`--keep` 到期、`poll` 失败（带 `strerror`）、
+pty master `POLLHUP/POLLERR/POLLNVAL`（带 `revents`）、以及
+`· 收到信号 N ⇒ 主动退场`。
+
+**这次没复现出来**（如实说明）：插桩后跑了三轮 —— 裸 `nohup` 207 秒、
+裸 `nohup` 391 秒、真实 `--stay` 路径 444 秒，全程 pid 不变、`hci0` 一直在。
+最可疑的是 pty/ldisc 被内核侧拆掉导致 master 收到 `POLLHUP`（旧代码会静默
+`break`），但**没有证据**，不下结论。下次再出现，日志会自己说出原因。
+
+顺带排除：**不是 adb 会话回收**。完全断开 adb 静置 200 秒后桥照样活着
+（pid 不变），所以 `nohup + </dev/null` 的 detach 是够的。
 
 ## 关键实现点（都是实测反推，不是照抄文档）
 
@@ -252,3 +303,8 @@ CI 在 `.github/workflows/build.yml` 的 `btbridge` job（第 4 个 job），
   事务失败发现，不靠 death recipient。
 * 桥不实现 `--send-with-type` 的自动判定（发送方向无法自校验），
   默认按 AOSP 契约"不带"；万一换设备后命令方向全哑，先试这个开关。
+* `--stay` 只是"把桥留着不主动收"，**不是守护进程**：桥自己退了（比如上面那个
+  还没查清的自退场），`--stay` 不会把它拉起来。要长时间用，自己套一层
+  `while :; do ...; done` 或写个 systemd unit（注意红线：不做开机自启）。
+  想知道它还在不在：`sh bt/deploy.sh --down` 会报残留，或者直接看
+  `/sys/class/bluetooth`（**两边**）和 `bthci-bridge` 进程。

@@ -246,16 +246,20 @@ static volatile unsigned long long g_frameBad = 0;
 static void logmsg(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void logmsg(const char* fmt, ...) {
     // 带时间戳：内核 hdev->setup 有超时，"哪一步花了多久"是排时序问题的唯一线索。
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    // ★ 墙钟必须用 CLOCK_REALTIME / time()。早先这里拿 CLOCK_MONOTONIC 的秒数
+    //   去喂 localtime_r，得到的是"开机秒数当成 epoch 秒"的假时间（设备实际
+    //   00:44，日志写 17:24），跨进程对时全错。差值本来就该用单调钟，但那是
+    //   now_ms() 的事，不该混进这里。
+    struct timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
     struct tm tm;
-    time_t sec = ts.tv_sec;
+    time_t sec = rt.tv_sec;
     localtime_r(&sec, &tm);
     char tb[16];
     strftime(tb, sizeof(tb), "%H:%M:%S", &tm);
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "[bthci %s.%03ld] ", tb, ts.tv_nsec / 1000000);
+    fprintf(stderr, "[bthci %s.%03ld] ", tb, rt.tv_nsec / 1000000);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fprintf(stderr, "\n");
@@ -268,7 +272,14 @@ static long long now_ms() {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static void on_term(int) { g_run = 0; }
+// 收到哪个信号也要记下来：早先这里只把 g_run 置 0，日志上就只剩一句
+// "== 退场 =="，看不出是"运行时长到了""熔断了"还是"被人 SIGTERM 了" ——
+// 实测踩过一次（桥跑了 305 秒自己没了，查不出原因）。
+static volatile sig_atomic_t g_termSig = 0;
+static void on_term(int s) {
+    g_termSig = s;
+    g_run = 0;
+}
 
 // ============================================================ 回调 → 队列 → 写线程
 struct Pkt {
@@ -978,27 +989,38 @@ int main(int argc, char** argv) {
         long long until = keep > 0 ? now_ms() + (long long)keep * 1000 : 0;
         int tick = 0;
         while (g_run) {
-            if (until && now_ms() >= until) break;
+            if (until && now_ms() >= until) {
+                logmsg("· 运行时长到（--keep %d 秒）⇒ 退场", keep);
+                break;
+            }
             struct pollfd pf{g_mfd, POLLIN, 0};
             int s = poll(&pf, 1, 1000);
             if (s > 0 && (pf.revents & POLLIN)) pumpToHal();
-            if (s < 0 && errno != EINTR) break;
+            if (s > 0 && (pf.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+                // pty master 被挂断/出错是**静默退出**的另一个入口：早先只 break
+                // 不打日志，事后完全查不出为什么桥没了。
+                logmsg("★ pty master revents=0x%x（POLLHUP/ERR/NVAL）⇒ 退场", pf.revents);
+                break;
+            }
+            if (s < 0 && errno != EINTR) {
+                logmsg("★ poll(pty master) 失败: %s ⇒ 退场", strerror(errno));
+                break;
+            }
             if (++tick % (g_statusEvery > 0 ? g_statusEvery : 10) == 0) {
                 if (g_fuse && frameworkAlive()) {
                     logmsg("★ 熔断：安卓框架已活着（surfaceflinger=running）⇒ 立刻退场，"
                            "把 HAL 客户端位和 hci0 还给安卓（桥与安卓蓝牙栈不能同时存在）");
                     break;
                 }
-                // 注意：桥跑在安卓侧，这里**没有** /sys/class/bluetooth/hci0（那是容器侧的视图），
-                // 恒打 NO-SYSFS-ON-ANDROID 是正常的，不代表设备没了。
-                char fl[64] = "?";
-                FILE* g = popen("cat /sys/class/bluetooth/hci0/flags 2>/dev/null || echo NO-SYSFS-ON-ANDROID", "r");
-                if (g) {
-                    if (!fgets(fl, sizeof(fl), g)) snprintf(fl, sizeof(fl), "ERR");
-                    pclose(g);
-                }
-                size_t e = strlen(fl);
-                while (e && (fl[e - 1] == '\n' || fl[e - 1] == '\r')) fl[--e] = 0;
+                // ★ 判据是**目录在不在**，不是 `hci0/flags` 在不在。
+                //   本机 /sys/class/bluetooth/hci0/ 里只有 power / rfkill9 /
+                //   subsystem / uevent，**没有 flags** —— 早先拿
+                //   `cat .../hci0/flags || echo NO-SYSFS-ON-ANDROID` 当判据，
+                //   于是永远打 NO-SYSFS-ON-ANDROID，把"其实好着呢"写成"看不见设备"，
+                //   白白误导了一轮排查。顺带这也省掉每 10 秒一次 popen。
+                const char* fl = (access("/sys/class/bluetooth/hci0", F_OK) == 0)
+                                     ? "present"
+                                     : "ABSENT";
                 logmsg("状态 hci0.sysfs=%s 转发=%llu 收回=%llu 回调=%llu event=%llu "
                        "队列=%zu 队列丢=%llu 写pty丢=%llu 写错=%llu 字节=%llu 坏帧=%llu "
                        "cb带类型=%s rfkill0.soft=%d",
@@ -1013,6 +1035,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- 退场 ----
+    if (g_termSig) logmsg("· 收到信号 %d（SIGTERM=15/SIGINT=2/SIGHUP=1）⇒ 主动退场", (int)g_termSig);
     logmsg("== 退场 ==");
     if (g_close && g_slotClose >= 0) {
         typedef ReturnVoid (*CloseFn)(void* self);

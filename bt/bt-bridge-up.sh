@@ -118,19 +118,23 @@ container_running() { "$DS" show 2>/dev/null | grep -q "$CN"; }
 #   `SYSFS_BT=` 后面跟的是换行而不是空格，模式 `*"SYSFS_BT= "*` 永远不匹配，
 #   于是把"已经清干净"误报成"还有残留"。判据不能用脆弱的模式匹配来写。
 snapshot() {
+    # 两边都记：hci0 是**共享内核**里的设备，安卓侧和容器侧应该同时出现/同时消失。
+    # 只记一边的话，"另一边没清掉"这种情况就看不见了。
     _s_bt=$(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ',')
+    _s_btc=$(in_c ls /sys/class/bluetooth 2>/dev/null | tr '\n' ',')
     _s_rf=$(cat /sys/class/rfkill/rfkill0/name 2>/dev/null)
     _s_rfs=$(cat /sys/class/rfkill/rfkill0/soft 2>/dev/null)
     _s_rfh=$(cat /sys/class/rfkill/rfkill0/hard 2>/dev/null)
     _s_ld=$(grep -c n_hci /proc/tty/ldiscs 2>/dev/null)
     _s_md=$(grep -cE '^(bluetooth|hci_uart|btqca|btpower|rfkill) ' /proc/modules 2>/dev/null)
     _s_pid=$(bt_pids_by_comm bthci-bridge | tr '\n' ',')
-    echo "sysfs_bt=[${_s_bt:-}] rfkill=${_s_rf:-?}/${_s_rfs:-?}/${_s_rfh:-?} ldisc=${_s_ld:-?} modules=${_s_md:-?} bridge_pid=[${_s_pid:-}]"
+    echo "bt_android=[${_s_bt:-}] bt_container=[${_s_btc:-}] rfkill=${_s_rf:-?}/${_s_rfs:-?}/${_s_rfh:-?} ldisc=${_s_ld:-?} modules=${_s_md:-?} bridge_pid=[${_s_pid:-}]"
 }
 
 show_state() {
     hr
-    echo "· /sys/class/bluetooth : $(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')"
+    echo "· /sys/class/bluetooth（安卓侧）  : $(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')"
+    echo "· /sys/class/bluetooth（容器侧）  : $(in_c ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')"
     echo "· /proc/tty/ldiscs     : $(grep n_hci /proc/tty/ldiscs 2>/dev/null | tr '\n' ' ')"
     echo "· rfkill0              : $(cat /sys/class/rfkill/rfkill0/name 2>/dev/null) soft=$(cat /sys/class/rfkill/rfkill0/soft 2>/dev/null) hard=$(cat /sys/class/rfkill/rfkill0/hard 2>/dev/null)"
     echo "· bthci-bridge pid     : $(bt_pids_by_comm bthci-bridge | tr '\n' ' ')"
@@ -164,11 +168,13 @@ do_down() {
     _fail=0
 
     # ★ 逐项**显式**判定，不拿 snapshot 的字符串做模式匹配（那正是上一版的 bug）。
+    #   而且两边都要查：hci0 在共享内核里，只查一边会漏掉"另一边还留着"。
     _bt_now=$(ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')
-    if [ -z "$_bt_now" ]; then
-        echo "  ✅ /sys/class/bluetooth 已空（hci0 被内核回收）"
+    _btc_now=$(in_c ls /sys/class/bluetooth 2>/dev/null | tr '\n' ' ')
+    if [ -z "$_bt_now" ] && [ -z "$_btc_now" ]; then
+        echo "  ✅ /sys/class/bluetooth 两边都已空（hci0 被内核回收）"
     else
-        echo "  ❌ /sys/class/bluetooth 还有：$_bt_now"
+        echo "  ❌ /sys/class/bluetooth 还有：安卓侧=[$_bt_now] 容器侧=[$_btc_now]"
         _fail=1
     fi
 
