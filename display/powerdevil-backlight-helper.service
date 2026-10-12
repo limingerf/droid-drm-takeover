@@ -1,0 +1,69 @@
+# display/powerdevil-backlight-helper.service — 预启动 KAuth 背光助手
+#
+# ══════════════════════════════════════════════════════════════════════
+# 为什么需要这个文件（否则 KDE 的亮度滑块永远驱动不了真背光）
+# ══════════════════════════════════════════════════════════════════════
+#
+# PowerDevil 读背光走的是 KAuth：
+#   BacklightDetector::detect()
+#     → KAuth::Action("org.kde.powerdevil.backlighthelper.brightness")
+#     → 系统总线上的 org.kde.powerdevil.backlighthelper
+# 而那个名字由 D-Bus **激活**拉起，Debian 的 service 文件是：
+#   /usr/share/dbus-1/system-services/org.kde.powerdevil.backlighthelper.service
+#       Exec=/usr/lib/kf6/kauth/libexec/backlighthelper
+#       User=root
+#
+# 实测报错（PowerDevil 日志）：
+#   org.kde.powerdevil.backlighthelper.brightness failed
+#   "DBus Backend error: service start org.kde.powerdevil.backlighthelper
+#    failed: The permission of the setuid helper is not correct"
+#
+# 根因**不是**那个 helper 的权限，而是 **dbus-daemon 的启动助手**：
+#   /usr/lib/dbus-1.0/dbus-daemon-launch-helper
+#   实测属性 `-rwsr-xr-- root messagebus` —— setuid 位在。
+#   但本容器 rootfs 是 **nosuid** 挂载的 ⇒ setuid 位**不生效**，
+#   dbus-daemon（以 messagebus 身份运行）拿不到 root，
+#   于是**任何** `User=` 的 D-Bus system service 都激活不了。
+#   （同样受影响的还有 chargethresholdhelper / discretegpuhelper，
+#     PowerDevil 日志里那两条 chargethresholdhelper 失败是同一个病。）
+#
+# ★ 不要去 chmod 4755 那个 launch-helper：那是 dbus 包的文件，
+#   改它既没意义（nosuid 下 4755 依然不生效），又动了系统包。
+#
+# 绕法（本文件）：让 systemd（PID 1，本来就是 root）**常驻**把 helper 拉起来。
+#   helper 自己抢到总线名之后，dbus-daemon 就不需要走 launch-helper 了。
+#   KAuth 客户端只看到"名字已存在"，直接发 performAction。
+#
+# 实测自证（2026-10-12）：
+#   起 unit 之前：PowerDevil 日志每次都有 backlighthelper.brightness failed
+#   起 unit 之后：该行消失；PowerDevil 的屏幕列表仍只有 display0，
+#                 但 setBrightness 真的落到了 /sys/class/backlight/panel0-backlight
+#                 （1024→420、3072→1259、5000→2048，见 docs/亮度-PowerDevil与自动亮度.md）
+#
+# 为什么 PowerDevil 的屏幕列表**不会**因此多出一项：
+#   这是上游设计（daemon/controllers/screenbrightnesscontroller.cpp）：
+#   onDetectorDisplaysChanged() 里
+#       shouldUseExternalControl = m_externalBrightnessController->isActive()
+#                                  && !dynamic_cast<KWinDisplayDetector *>(detector)
+#   非 KWin 的探测器（BacklightDetector）探测到的屏**不**进 m_displaysById，
+#   而是通过 kde_external_brightness_v1 导出给 KWin，
+#   由 KWin 当作 DSI-1 自己的亮度设备（见 kwin src/core/brightnessdevice.h）。
+#   ⇒ 所以只有一条亮度链路，不会出现两个互相打架的滑块。
+#
+# ══════════════════════════════════════════════════════════════════════
+
+[Unit]
+Description=Droidspaces: pre-start KAuth backlight helper (nosuid rootfs workaround)
+Documentation=file:///usr/share/doc/plasma-workspace/
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/kf6/kauth/libexec/backlighthelper
+# 常驻：名字一旦掉线，KAuth 又会退回去走 launch-helper（必失败）。
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

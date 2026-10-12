@@ -10,6 +10,13 @@
 # 两条路径的亮度不一致。现在统一走 setbright（它会自己找 connected connector
 # 并 clamp 到合法范围）。
 #
+# ══ 与 PowerDevil 的关系（2026-10-12 新增）══
+# display/powerdevil-enable.sh 让 plasma-powerdevil 真正跑起来之后，背光就归
+# PowerDevil 管了（用户拖滑块 = PowerDevil 写 sysfs）。此时本脚本**只钉
+# bl_power，不再钉 brightness**，否则用户调好的亮度会被每 5 秒顶回
+# DEV_BRIGHTNESS。判据是进程 org_kde_powerde（comm 被截 15 字符）。
+# 详见 display/powerdevil-enable.sh 与 docs/亮度-PowerDevil与自动亮度.md。
+#
 # ══ 用法 ══
 #   sh display/keepbright.sh          # 前台循环，直到状态不再是 linux-active
 #   setsid nohup sh display/keepbright.sh &   # 后台
@@ -24,6 +31,25 @@ SELF_DIR=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
 . "$SELF_DIR/../core/lib/boot.sh"
 
 _sb=$(drm_tool setbright 2>/dev/null || true)
+
+# ★ PowerDevil 有没有在管背光？
+#
+#   comm 被内核截到 15 字符，所以是 `org_kde_powerde`（实测 ps 输出就是这个）。
+#   不用 systemctl 判：容器里不保证有 systemd，而且这里是 5 秒一轮的热路径。
+#   每 12 轮（约 1 分钟）重探一次 —— 覆盖"keepbright 先起、PowerDevil 后起"
+#   以及 PowerDevil 崩掉后重生的两种情况。
+_pd_owns=0
+_pd_probe() {
+    if [ -n "$(drm_pids_by_comm org_kde_powerde 2>/dev/null)" ]; then
+        _pd_owns=1
+    else
+        _pd_owns=0
+    fi
+}
+_pd_probe
+_i=0
+[ "$_pd_owns" = "1" ] && \
+    drm_log "检测到 PowerDevil 在跑 ⇒ 本脚本不再钉 brightness（背光归它管），只钉 bl_power"
 
 drm_log "keepbright 启动（亮度 ${DEV_BRIGHTNESS}）"
 while :; do
@@ -82,14 +108,36 @@ while :; do
             _bn=/sys/class/backlight/$_bl/brightness
             [ -w "$_bn" ] && [ "$(cat "$_bn" 2>/dev/null)" != 0 ] && \
                 echo 0 >"$_bn" 2>/dev/null
+        elif [ "$_pd_owns" = "1" ]; then
+            # ★★ 2026-10-12：PowerDevil 起来之后，**背光归它管**，不要再钉。
+            #
+            #   背景：display/powerdevil-enable.sh 让 plasma-powerdevil 真正跑起来，
+            #   并把背光探测器接到了 /sys/class/backlight/panel0-backlight
+            #   （见 docs/亮度-PowerDevil与自动亮度.md）。从那一刻起，
+            #   用户拖亮度滑块 = PowerDevil 写 sysfs。
+            #
+            #   如果这里还每 5 秒把 DEV_BRIGHTNESS 钉回去，结果就是：
+            #     用户把亮度拖到 40% → 最多 5 秒后自己跳回 50%（2048）。
+            #   现象是"亮度滑块拖了会自己弹回去"，而且**只在拖完 5 秒内看**
+            #   才抓得到，比"完全不能调"更难查。
+            #
+            #   ⇒ 只保留上面的 bl_power 钉 0（那是"别让安卓把背光电源硬关"的
+            #     保护，和亮度不是一回事），亮度这一项交给 PowerDevil。
+            #
+            #   ★ 熄屏分支仍然要钉 brightness=0：那是用户明确按了电源键，
+            #     而且 drm-keys 自己也会写 0，两边一致，不冲突。
+            :
         else
             _bn=/sys/class/backlight/$_bl/brightness
             [ -w "$_bn" ] && echo "$DEV_BRIGHTNESS" >"$_bn" 2>/dev/null
         fi
     fi
     # 兜底：能写 DRM 属性时也写一次（非接管态下才可能成功）
-    if [ -n "$_sb" ]; then
+    # ★ PowerDevil 在管背光时**跳过** —— 否则同样会把用户拖的亮度顶回去。
+    if [ -n "$_sb" ] && [ "$_pd_owns" != "1" ]; then
         "$_sb" "$DEV_BRIGHTNESS" >/dev/null 2>&1
     fi
+    _i=$((_i + 1))
+    [ $((_i % 12)) -eq 0 ] && _pd_probe
     sleep 5
 done

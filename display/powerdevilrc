@@ -1,0 +1,71 @@
+# display/powerdevilrc — PowerDevil 配置（装到 $HOME/.config/powerdevilrc）
+#
+# ══════════════════════════════════════════════════════════════════════
+# 为什么必须改这一处（这是"让 PowerDevil 跑起来"引入的**新**副作用）
+# ══════════════════════════════════════════════════════════════════════
+#
+# PowerDevil 没跑的时候，这个桌面上**没有**任何东西会按空闲时间熄屏；
+# 一旦它跑起来（见 display/powerdevil-enable.sh），它就会按默认策略
+# 在空闲后把屏幕打到全黑。而本设备的兜底手段只有长按电源键，
+# 所以这里把两个空闲动作都关掉。
+#
+# 实测证据（2026-10-12，A/B，判据见 docs/亮度-PowerDevil与自动亮度.md）：
+#   · 正对照 [AC][Display] TurnOffDisplayWhenIdle=true / ...Sec=30
+#       → 背光从 2048 掉到 **1**（1 是 KWin 侧外接亮度设备
+#         ExternalBrightnessDeviceV1 对内置屏的 clamp 下限，见下），
+#         并稳定保持；恢复后回到 2048。
+#   · 本文件 TurnOffDisplayWhenIdle=false / DimDisplayWhenIdle=false
+#       → 连续 125s+ 采样，背光一直是 2048，**没有出现 1**。
+#
+# ★ 为什么判据是"背光 == 1"而不是"背光变了"：
+#   本机还有第二个会写背光的东西 —— input/drm-keys.py 的电源键短按
+#   （写 0 熄屏 / 写 2048 亮屏）。用"变了"当判据会被它污染。
+#   而 1 这个值**只有** PowerDevil→KWin→kde_external_brightness_v1
+#   这条路会产生（内置屏 minBrightness=1，写 0 会被 clamp 成 1）。
+#   ⇒ 1 = PowerDevil，0/2048 = 电源键。两者可区分。
+#
+#   ⚠️ 但 1 有两个来源，别只看值：
+#     · **稳定保持**在 1（几十秒不动） = 空闲熄屏 ← 本文件要关掉的就是它
+#     · **一闪而过**的 1（下一拍就回原值） = PowerDevil 的唤醒淡入，正常
+#   实测：正对照里 1 稳定保持 25s；而唤醒淡入全程只有约 1s
+#   （日志里是一串 161→195→232→…→2048 的 Udev device changed 渐变）。
+#
+# ★ 上游语义（daemon/actions/bundled/dpms.cpp / dimdisplay.cpp）：
+#     bool DPMS::loadAction(...)
+#     {
+#         if (!profileSettings.turnOffDisplayWhenIdle() || timeout < 0ms) {
+#             onProfileUnload();
+#             return false;          // ← 根本不注册空闲定时器
+#         }
+#     }
+#   所以 WhenIdle=false 是**彻底不注册**，不是"注册一个很大的超时"。
+#
+# ★ 组名/键名怎么确定的（不要凭印象改）：
+#   · 键名从 libpowerdevilcore.so.6.3.6 的 KConfigXT 符号里挖出来：
+#       TurnOffDisplayWhenIdle / TurnOffDisplayIdleTimeoutSec
+#       DimDisplayWhenIdle     / DimDisplayIdleTimeoutSec
+#       LockBeforeTurnOffDisplay / TurnOffDisplayIdleTimeoutWhenLockedSec
+#   · 组名 [<profile>][Display]：PowerDevil 自己报的当前 profile 是 "AC"
+#     （busctl --user call org.kde.Solid.PowerManagement \
+#        /org/kde/Solid/PowerManagement org.kde.Solid.PowerManagement currentProfile
+#      → s "AC"），且正对照写进 [AC][Display] 后行为立刻改变 ⇒ 组名正确。
+#   · 三个 profile 都写，免得设备插拔/电量变化切到 Battery 时策略又变回默认。
+#
+# ★ 想恢复上游默认（空闲 5 分钟变暗、10 分钟熄屏）：
+#   删掉本文件的 [AC][Display] 等段，或把两个值改回 true，然后
+#     systemctl --user restart plasma-powerdevil.service
+#   （或直接调 org.kde.Solid.PowerManagement.reparseConfiguration）
+#
+# ══════════════════════════════════════════════════════════════════════
+
+[AC][Display]
+TurnOffDisplayWhenIdle=false
+DimDisplayWhenIdle=false
+
+[Battery][Display]
+TurnOffDisplayWhenIdle=false
+DimDisplayWhenIdle=false
+
+[LowBattery][Display]
+TurnOffDisplayWhenIdle=false
+DimDisplayWhenIdle=false
