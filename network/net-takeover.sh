@@ -223,6 +223,13 @@ NT_DEPS_BT="bluez bluedevil"
 NT_DEPS_IME="fcitx5 fcitx5-chinese-addons fcitx5-frontend-qt6 fcitx5-frontend-gtk3 fcitx5-config-qt fcitx5-module-wayland"
 NT_DEPS_OSK="maliit-keyboard qml6-module-qtquick-virtualkeyboard qt6-virtualkeyboard-plugin"
 
+# ★ libglib2.0-bin 是屏幕键盘中文的**硬依赖**，别漏。
+#   maliit-keyboard 不读 LANG/LC_ALL/LANGUAGE，它的活跃语言存在 GSettings
+#   （org.maliit.keyboard.maliit）里。而 gsettings / glib-compile-schemas
+#   都在 libglib2.0-bin 里 —— 没它就只能停在英文键盘。
+#   顺带它也提供 gdbus，排查 D-Bus（比如 NM 密钥代理）时要用。
+NT_DEPS_GLIB="libglib2.0-bin"
+
 nt_install_deps() {
     drm_phase "net-deps"
     nt_fix_glibc_ipv4
@@ -234,6 +241,12 @@ nt_install_deps() {
     ds_exec "DEBIAN_FRONTEND=noninteractive apt-get install -y $NT_DEPS_IME 2>&1 | tail -n 8"
     drm_log "装屏幕键盘：$NT_DEPS_OSK"
     ds_exec "DEBIAN_FRONTEND=noninteractive apt-get install -y $NT_DEPS_OSK 2>&1 | tail -n 8"
+    # ★ 必须装：屏幕键盘的中文切换靠 gsettings，而 gsettings 在这个包里。
+    #   漏了它的症状是"键盘能弹，但只有英文"。
+    drm_log "装 glib 工具（gsettings/gdbus，屏幕键盘中文必需）：$NT_DEPS_GLIB"
+    ds_exec "DEBIAN_FRONTEND=noninteractive apt-get install -y $NT_DEPS_GLIB 2>&1 | tail -n 8"
+    # schema 缓存不编译，gsettings 就看不见 org.maliit.keyboard.maliit
+    ds_exec "glib-compile-schemas /usr/share/glib-2.0/schemas 2>&1; echo '  schema 缓存已编译'"
     drm_log "依赖安装结束"
 }
 
@@ -346,6 +359,106 @@ nt_fix_route() {
         drm_warn "出网兜底 rule 未生效"
         drm_state_set NET_ROUTE_FIX 0
     fi
+
+    # ★★ 只设一次是不够的，必须挂成 NM dispatcher 让它自动重挂 ★★
+    nt_install_route_dispatcher "$_if" "$_tbl" "$_pref"
+}
+
+# ── 出网兜底路由的持久化：NetworkManager dispatcher ────────────
+#
+# ★★ 2026-10-12 实测：只设一次会丢，而且丢得很隐蔽 ★★
+#
+# 现象：明明 /etc/resolv.conf 里 nameserver 223.5.5.5 写得对，却
+#     getent hosts deb.debian.org   → 空
+#     curl http://www.baidu.com     → Could not resolve host
+#     ip -4 route get 1.1.1.1       → RTNETLINK answers: Network is unreachable
+#
+# 根因：NetworkManager **自己会管理 ip rule**。实测重载/重连之后：
+#     ip rule show  → 我们那条 `31500: from all iif lo lookup 1042` **没了**
+#     ip route show table 1042 → 表里的路由**还在**
+# 表和 rule 是我们在 NM 之外加的，NM 不认识，重载时把 rule 清掉了。
+# 表现成"DNS 配置明明对，却解析不了" —— 很容易误判成 DNS 问题。
+#
+# 解法：挂进 NM 的 dispatcher.d。接口 up / DHCP 续约时 NM 会以 root 调用
+# 这个脚本，把表和 rule 补回来。这样无论重连多少次都自动恢复。
+#
+# ⚠️ 红线：脚本里绝不 `ip rule flush`，绝不删 netd 的任何 rule/table，只新增。
+nt_install_route_dispatcher() {
+    _rif=${1:-wlan0}
+    _rtbl=${2:-1042}
+    _rpref=${3:-31500}
+    _disp=/etc/NetworkManager/dispatcher.d/90-drm-route-fix
+
+    drm_log "装 NM dispatcher：$_disp（接口 up 时自动重挂出网兜底）"
+
+    # dispatcher 脚本内容用 base64 传，避免嵌套引号在 ds_exec 里被打碎
+    _script=$(cat <<DISPEOF
+#!/bin/sh
+# 90-drm-route-fix —— DRM 接管容器的出网兜底路由自动重挂
+#
+# 为什么需要它：NetworkManager 把默认路由写进 main 表，而安卓 netd 的 rule
+# 列表里没有 \`32766: from all lookup main\`，所以 main 表永远不被查。
+# 我们要自己建一张表 + 一条夹在 netd 的 20000 与 32000 之间的 rule。
+#
+# ★ 为什么必须是 dispatcher：那张表和那条 rule 是在 NM 之外加的，NM 不认识
+#   它们。实测 NM 一重载/重连，那条 rule 就被清掉 ⇒ 立刻断网（DNS 都到不了）。
+#   挂成 dispatcher 后，每次接口 up / DHCP 续约都会自动补回来。
+#
+# ⚠️ 红线：绝不 \`ip rule flush\`，绝不删 netd 的任何 rule/table，只新增。
+IFACE="\$1"
+ACTION="\$2"
+
+case "\$ACTION" in
+    up|vpn-up|dhcp4-change|dhcp6-change) ;;
+    *) exit 0 ;;
+esac
+
+TBL=$_rtbl
+PREF=$_rpref
+
+# 只处理有 IPv4 的接口
+ip -4 -o addr show "\$IFACE" 2>/dev/null | grep -q 'inet ' || exit 0
+
+# 找网关：优先从 netd 的 per-interface 表（表号 = 1000 + ifindex）读
+IDX=\$(cat "/sys/class/net/\$IFACE/ifindex" 2>/dev/null)
+GW=""
+for t in \$((1000 + \${IDX:-0})) \$TBL; do
+    g=\$(ip -4 route show table "\$t" 2>/dev/null | awk '/^default/{print \$3; exit}')
+    [ -n "\$g" ] && { GW=\$g; break; }
+done
+if [ -z "\$GW" ]; then
+    r=\$(ip -4 route show table all 2>/dev/null | grep "dev \$IFACE" | grep 'scope link' | head -1)
+    GW=\$(printf '%s' "\$r" | awk '{print \$1}' | sed 's|/.*||' | sed 's/\\.[0-9]*\$/.1/')
+fi
+[ -n "\$GW" ] || exit 0
+
+NET=\$(printf '%s' "\$GW" | sed 's/\\.[0-9]*\$/.0/')
+
+# 递归路由必须先建（网段 scope link 在默认路由之前），否则内核判 Nexthop invalid
+ip -4 route replace "\$NET/24" dev "\$IFACE" scope link table "\$TBL" 2>/dev/null
+ip -4 route replace default via "\$GW" dev "\$IFACE" onlink table "\$TBL" 2>/dev/null
+
+# rule：先删同 pref 旧条目（ip rule add 会重复堆叠），iif lo 只匹配本机发出的包
+while ip rule show 2>/dev/null | grep -q "^\$PREF:"; do
+    ip rule del pref "\$PREF" 2>/dev/null || break
+done
+ip rule add pref "\$PREF" iif lo lookup "\$TBL" 2>/dev/null
+
+logger -t drm-route-fix "re-applied: \$IFACE \$ACTION gw=\$GW table=\$TBL pref=\$PREF" 2>/dev/null
+exit 0
+DISPEOF
+)
+    _b64=$(printf '%s' "$_script" | base64 -w0)
+
+    ds_exec "mkdir -p /etc/NetworkManager/dispatcher.d
+             printf '%s' '$_b64' | base64 -d > $_disp
+             chmod 755 $_disp
+             ls -l $_disp" 2>&1 | tr -d '\r' | sed 's/^/    /'
+
+    # 立刻跑一次，验证脚本本身能工作
+    ds_exec "$_disp $_rif up; echo \"  rc=\$?\"; ip rule show 2>/dev/null | grep -E '^$_rpref:'" \
+        2>&1 | tr -d '\r' | sed 's/^/    /'
+    drm_state_set NET_ROUTE_DISPATCHER 1
 }
 
 # DNS：NM 那边设了 dns=none，所以这里直接写死。

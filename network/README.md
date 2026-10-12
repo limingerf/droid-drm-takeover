@@ -218,6 +218,60 @@ HTTP  200   0.064s  -> http://www.baidu.com/
 HTTPS 200   0.103s
 ```
 
+### 8.1 ★★ 只设一次会丢：必须挂成 NM dispatcher ★★
+
+**后补的实测（2026-10-12）**：按上面的步骤设好之后，网是通的。但过了一会儿又断了，
+而且**断得很隐蔽**：
+
+```
+$ cat /etc/resolv.conf
+nameserver 223.5.5.5          ← 配置明明是对的
+nameserver 119.29.29.29
+
+$ getent hosts deb.debian.org
+（空）
+
+$ curl http://www.baidu.com
+curl: (6) Could not resolve host
+
+$ ip -4 route get 1.1.1.1
+RTNETLINK answers: Network is unreachable      ← ★ 真正的问题在这
+```
+
+**很容易误判成 DNS 问题** —— 因为配置确实是对的。实际是路由没了。
+
+**根因：NetworkManager 自己会管理 `ip rule`。** 实测重载/重连之后：
+
+```
+$ ip rule show | grep 31500
+（空）                                   ← ★ 我们那条 rule 被删了
+
+$ ip route show table 1042
+default via 192.168.31.1 dev wlan0 onlink      ← 表里的路由还在
+192.168.31.0/24 dev wlan0 scope link
+```
+
+**表还在，rule 没了。** 表和 rule 都是我们在 NM 之外加的，NM 不认识它们，
+重载时把 rule 清掉了。
+
+**解法**：挂进 `/etc/NetworkManager/dispatcher.d/`。接口 up / DHCP 续约时
+NM 会以 root 调用这个脚本，把表和 rule 补回来：
+
+```sh
+sh network/net-takeover.sh route      # 现在会顺带装 dispatcher
+# 装出 /etc/NetworkManager/dispatcher.d/90-drm-route-fix
+```
+
+验证它真的被调用（journal 里能看到我们打的 logger 行）：
+
+```
+Oct 12 20:24:26 DEBIAN drm-route-fix[5447]: re-applied: wlan0 up gw=192.168.31.1 table=1042 pref=31500
+```
+
+**教训**：在 NM 之外手工加的 rule，一定要挂 dispatcher 保活。
+这跟 §8 开头那条「`ip rule add` 会重复堆叠」是同一个机制的两面 ——
+**NM 会动 rule，所以我们既不能假设它留着，也不能假设它只被加一次**。
+
 ---
 
 ## 9. ★★ 密钥代理缺失：图形界面输的密码 NM 收不到 ★★

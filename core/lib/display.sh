@@ -1255,6 +1255,86 @@ drm_force_display_on() {
     return 0
 }
 
+# ── 容器环境净化 ──────────────────────────────────────────
+#
+# ★★ 2026-10-12 实测根因：/etc/environment 里的 Anland 时代污染 ★★
+#
+# 那份文件里同时存在**三个互相冲突的渲染驱动选择**：
+#     MESA_LOADER_DRIVER_OVERRIDE=msm     ← 选 msm
+#     GALLIUM_DRIVER=kgsl                 ← ★ 又让 Gallium 层走 kgsl
+#     FD_FORCE_KGSL=1                     ← ★ 再强制 kgsl
+# 外加一批指向**已经死掉的** Anland 显示桥的变量：
+#     ANLAND=1
+#     ANLAND_SOCKET=/run/display.sock
+#     ANLAND_DRM_DEVICE=/dev/dri/renderD128
+#     ANLAND_SKIP_IMPLICIT_SYNC_WAIT=1
+#     WAYLAND_DISPLAY=wayland-0           ← ★ KWin 的 socket 是 taketest，
+#                                            没有 wayland- 前缀；这条会把客户端
+#                                            指到一个不存在的 socket
+#
+# 危害（都是实测）：
+#   · plasmashell 采样 0.76 s CPU / 10 s（8%）⇒ 净化后 0.09 s / 10 s（1%），
+#     负载 2.97 → 2.55。`GALLIUM_DRIVER=kgsl` 把 Mesa 指到了那条连 dma-buf
+#     都分配不出来的路径上（kgsl_bo_new_dmabuf 失败 ⇒ 黑屏），一直在慢路径跑。
+#   · maliit 虚拟键盘拿到 kgsl ⇒ QSGContext 报
+#         depth buffer support missing, expect rendering errors
+#         stencil buffer support missing, expect rendering errors
+#     表现为键盘刚弹出时任务栏附近有拖影，几秒后自己消失。
+#
+# ★★ 为什么必须改文件本身，而不是像 _unset_env 那样逐个 env -u ★★
+# `env -u` 只对我们脚本**亲自 exec 的进程**有效。而 maliit 是 **KWin 拉起的**
+# （kwinrc 的 [Wayland] InputMethod=），plasmashell 的子进程、kded6 的模块、
+# 托盘小程序……都不在我们的启动链上，照样读到脏环境。
+# 改文件 = 一次修好所有进程，包括我们控制不到的那些。
+#
+# 幂等：已经干净就什么都不做。
+drm_fix_container_env() {
+    _envf=/etc/environment
+
+    # 已经干净（没有 kgsl / anland 污染）就直接返回
+    if [ -r "$_envf" ] \
+       && ! grep -qsE '^(GALLIUM_DRIVER|FD_FORCE_KGSL|ANLAND|ANLAND_SOCKET|ANLAND_DRM_DEVICE|ANLAND_SKIP_IMPLICIT_SYNC_WAIT)=' "$_envf"; then
+        drm_log "容器 /etc/environment 已干净，跳过"
+        return 0
+    fi
+
+    drm_log "净化容器 /etc/environment（摘掉 Anland 时代的 kgsl/anland 污染）"
+
+    # 先备份，便于回溯
+    _bak="${_envf}.bak-anland-$(date +%s)"
+    cp -a "$_envf" "$_bak" 2>/dev/null && drm_log "  已备份到 $_bak"
+
+    # 从原文件里**抢救**白名单内的变量（上游只放行这几个）
+    _keep_lang=$(sed -n 's/^LANG=//p'  "$_envf" 2>/dev/null | head -1)
+    _keep_lc=$(  sed -n 's/^LC_ALL=//p' "$_envf" 2>/dev/null | head -1)
+    _keep_cur=$( sed -n 's/^XCURSOR_SIZE=//p' "$_envf" 2>/dev/null | head -1)
+
+    {
+        printf '# 由 droid-drm-takeover 重写（drm_fix_container_env）。\n'
+        printf '# 历史版本被 anland 模式污染：GALLIUM_DRIVER=kgsl / FD_FORCE_KGSL=1\n'
+        printf '# 与 MESA_LOADER_DRIVER_OVERRIDE=msm 三者互相冲突，且 ANLAND_*\n'
+        printf '# 指向已死的显示桥。详见 core/lib/display.sh 的 drm_fix_container_env。\n'
+        printf '# 只保留上游白名单内的变量：LANG / LC_* / XCURSOR_SIZE / QT_QPA_PLATFORMTHEME。\n'
+        printf 'LANG=%s\n' "${_keep_lang:-en_US.UTF-8}"
+        [ -n "$_keep_lc" ] && printf 'LC_ALL=%s\n' "$_keep_lc"
+        printf 'XCURSOR_SIZE=%s\n' "${_keep_cur:-48}"
+        printf 'QT_QPA_PLATFORM=wayland\n'
+        printf 'QT_QPA_PLATFORMTHEME=kde\n'
+    } > "$_envf"
+
+    chmod 644 "$_envf" 2>/dev/null
+    chown root:root "$_envf" 2>/dev/null
+
+    # 验证：污染必须消失
+    if grep -qsE '^(GALLIUM_DRIVER|FD_FORCE_KGSL|ANLAND)' "$_envf"; then
+        drm_warn "  /etc/environment 净化后仍有残留，请人工检查"
+    else
+        drm_log "  已净化（kgsl/anland 污染全部摘除）"
+    fi
+    drm_state_set ENV_CLEAN 1
+    return 0
+}
+
 # ── 会话 ──────────────────────────────────────────────────
 #
 # ★ 血泪根因（重构前 README 记录）：plasmashell 硬依赖 kactivitymanagerd，
@@ -1266,6 +1346,13 @@ drm_force_display_on() {
 
 drm_start_desktop() {
     _sock=${DRM_WAYLAND_SOCKET:-taketest}
+
+    # ★★ 第一步就净化容器环境 ★★
+    # 必须在**读取 locale 之前**做，否则读到的是被污染那份里的值；
+    # 也必须在**启动 KWin 之前**做，因为 KWin 会 fork 出 maliit/kded6 等
+    # 子进程，它们不经过我们的 env -u 链路，只能靠文件本身干净。
+    drm_fix_container_env
+
     _env_file=""
     for _f in /etc/default/locale /etc/environment; do
         [ -r "$_f" ] && _env_file="$_env_file $_f"
@@ -1598,6 +1685,53 @@ drm_start_input_methods() {
                 $_im \
             fcitx5 -d >>"${DRM_LOG_DIR}/fcitx5.log" 2>&1 &
         drm_log "已拉起 fcitx5（引擎）"
+    fi
+
+    # ── maliit 的活跃语言：必须用 GSettings 设，环境变量完全无效 ──
+    #
+    # ★★ 2026-10-12 实测 ★★
+    # maliit-keyboard **不读** LANG / LC_ALL / LANGUAGE。实测用
+    #     LANG=zh_CN.UTF-8 LC_ALL=zh_CN.UTF-8 LANGUAGE=zh_CN maliit-keyboard
+    # 启动，日志依然是：
+    #     registerActiveLanguage(): activeLanguage is: "en"
+    #     plugin ".../languages/en/libenplugin.so" loaded
+    #     DB path: .../languages/en/database_en.db
+    #
+    # 它的语言存在 GSettings 的 org.maliit.keyboard.maliit 里（schema 文件
+    # /usr/share/glib-2.0/schemas/org.maliit.keyboard.maliit.gschema.xml）：
+    #     active-language    (s)   默认 'en'
+    #     enabled-languages  (as)  默认 ['en']
+    #
+    # ★ 关键坑：这个 schema 的**缓存没编译**时，`gsettings list-schemas` 根本
+    #   看不见它（实测输出为空）⇒ gsettings 报 not found ⇒ maliit 只能退回
+    #   默认 'en'。所以三步缺一不可：编译缓存 → 设 enabled-languages → 设
+    #   active-language。
+    #
+    # 中文插件本身是装好的（maliit-keyboard 包自带 zh-hans + libpinyin 词库）：
+    #     /usr/lib/aarch64-linux-gnu/maliit/keyboard2/languages/zh-hans/
+    # 设好后它打开的会是 /usr/lib/aarch64-linux-gnu/libpinyin/data/bigram.db。
+    #
+    # ★ 另一个实测结论：**fcitx5 不能当 OSK**，触摸屏要的是 maliit。
+    if ds_exec 'command -v gsettings >/dev/null 2>&1' >/dev/null 2>&1; then
+        _osk_lang=${DEV_OSK_LANG:-zh-hans}
+        ds_exec "glib-compile-schemas /usr/share/glib-2.0/schemas 2>/dev/null
+                 runuser -u $DESKTOP_USER -- env HOME=$DESKTOP_HOME \
+                     XDG_RUNTIME_DIR=$DESKTOP_RUNTIME_DIR \
+                     DBUS_SESSION_BUS_ADDRESS=unix:path=$DESKTOP_RUNTIME_DIR/bus \
+                     gsettings set org.maliit.keyboard.maliit enabled-languages \"['en', '$_osk_lang']\" 2>/dev/null
+                 runuser -u $DESKTOP_USER -- env HOME=$DESKTOP_HOME \
+                     XDG_RUNTIME_DIR=$DESKTOP_RUNTIME_DIR \
+                     DBUS_SESSION_BUS_ADDRESS=unix:path=$DESKTOP_RUNTIME_DIR/bus \
+                     gsettings set org.maliit.keyboard.maliit active-language '$_osk_lang' 2>/dev/null
+                 runuser -u $DESKTOP_USER -- env HOME=$DESKTOP_HOME \
+                     XDG_RUNTIME_DIR=$DESKTOP_RUNTIME_DIR \
+                     DBUS_SESSION_BUS_ADDRESS=unix:path=$DESKTOP_RUNTIME_DIR/bus \
+                     gsettings list-recursively org.maliit.keyboard.maliit 2>/dev/null | grep -E 'language'" \
+            2>&1 | tr -d '\r' | sed 's/^/    /'
+        drm_log "maliit 语言已设为 $_osk_lang（GSettings）"
+    else
+        drm_warn "容器里没有 gsettings（属 libglib2.0-bin）⇒ maliit 语言无法设置，会停在英文"
+        drm_warn "  装法：network/net-takeover.sh deps，或在容器里 apt-get install -y libglib2.0-bin"
     fi
 
     # maliit-keyboard：触摸屏屏幕键盘
