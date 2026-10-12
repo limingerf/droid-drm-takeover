@@ -1,0 +1,28 @@
+[Unit]
+Description=DRM 接管容器：策略路由看门狗（周期性确认 31000/31500 两条 rule 还在）
+Documentation=file:/root/droid-drm-takeover/network/net-rule-guard.sh
+# 网络起来之后才有意义；但**不能**写 Wants=network-online.target，
+# 因为那会在 NM 之前拉起、反而更早失败。用 After 只是排序，不是依赖。
+After=NetworkManager.service
+# 无论 NM 在不在都跑：断网时它反而是唯一在盯着的
+ConditionPathExists=/usr/local/lib/droid-drm-takeover/route-rule-fix.sh
+
+[Service]
+Type=simple
+# 直接跑常驻循环，交给 systemd 管重启 —— 比 timer 更省，且断网时也能立刻发现
+ExecStart=/usr/local/lib/droid-drm-takeover/net-rule-guard.sh
+Environment=INTERVAL=1
+Environment=LOG=/var/log/drm-net-guard.log
+Restart=always
+RestartSec=5
+# 看门狗本身极轻（每轮几条 ip 命令），给最低优先级，绝不和桌面抢 CPU
+Nice=19
+IOSchedulingClass=idle
+# 只读文件系统 + 改路由，不需要别的能力
+NoNewPrivileges=no
+ProtectSystem=no
+ProtectHome=no
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target

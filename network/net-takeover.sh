@@ -303,57 +303,72 @@ nt_proxy_bridge() {
 # ⇒ main 表永远不被查 ⇒ NM 的默认路由形同不存在。
 #
 # 解法（与上游 net-fix.sh 的 do_route 一致）：**只加不改** ——
-# 建自己的一张表 + 一条优先级夹在 netd 的 20000 与 32000 之间的 rule。
-# `iif lo` 只匹配**本机发出**的包，和 netd 自己那条 31000 同形状，
-# 所以安卓侧的 tethering/转发流量不会被误引到我们这张表上。
+# 建自己的一张表 + 两条优先级夹在 netd 的 20000 与 32000 之间的 rule。
 #
 # ⚠️ 红线：绝不 `ip rule flush`（会拆掉 netd 的策略路由地基）。
 #          也绝不删 netd 的任何 rule/table，只新增。
+#
+# ══════════════════════════════════════════════════════════════════════
+# ★★★ 2026-10-12 两处勘误（都实测过，别再改回去）★★★
+# ══════════════════════════════════════════════════════════════════════
+#
+# 【勘误 1】rule 用 `from all` 而不是 `iif lo`
+#   旧版写 `iif lo`（只匹配本机发出的包）。实测容器里的转发/回包会漏掉。
+#   现在两条 rule 都是 `from all`。
+#
+# 【勘误 2】网关**只从 main(254) 表读**
+#   旧版从 `1000+ifindex` 或**表 1042 自己**里读网关。实测日志：
+#       re-applied: wlan0 up gw=192.168.1.1 table=1042 pref=31500
+#   而真实网关是 192.168.1.2 —— 它读到的是表 1042 里**我们自己上次写坏的**
+#   过期值，典型的自我循环：用自己写坏的默认路由去算下一次要写的默认路由，
+#   于是永远修不好。main 表是 NM 用 DHCP 拿到的、唯一可信的来源。
+#
+# ★ 另外：光有 rule 还不够。本机 net_mode=host，容器与 Android 共用网络栈，
+#   Android 的 netd 会**周期性**（实测每 75-90 秒）重整策略路由把这两条删掉，
+#   而且**不产生任何 NM 事件** ⇒ dispatcher 永远等不到。所以必须再装一个
+#   看门狗（net-rule-guard.sh）。详见该脚本头部。
 nt_fix_route() {
     _if=${DEV_WIFI_IF:-wlan0}
     _tbl=${DEV_ROUTE_TABLE:-1042}
     _pref=${DEV_ROUTE_PREF:-31500}
+    _main_pref=31000
 
     if ! ds_exec "ip -4 -o addr show $_if 2>/dev/null | grep -q 'inet '" >/dev/null 2>&1; then
         drm_warn "出网兜底：$_if 还没有 IPv4，跳过"
         return 0
     fi
 
-    # 网关：优先从 netd 的 per-interface 表（表号 = 1000 + ifindex）读
-    _idx=$(ds_exec "cat /sys/class/net/$_if/ifindex 2>/dev/null" 2>/dev/null | tr -d '\r')
-    _gw=""
-    for _t in $((1000 + ${_idx:-0})) $_tbl; do
-        _g=$(ds_exec "ip -4 route show table $_t 2>/dev/null | awk '/^default/{print \$3; exit}'" 2>/dev/null | tr -d '\r')
-        [ -n "$_g" ] && { _gw=$_g; break; }
-    done
+    # ★★★ 网关只从 main(254) 表读 —— 唯一可信来源（见上方勘误 2）★★★
+    _gw=$(ds_exec "ip -4 route show table main 2>/dev/null | awk '/^default/{print \$3; exit}'" 2>/dev/null | tr -d '\r')
     if [ -z "$_gw" ]; then
-        # 退一步：从同网段的 scope link 路由推（末位换 .1）
-        _g=$(ds_exec "ip -4 route show table all 2>/dev/null | grep 'dev $_if' | grep 'scope link' | head -1" 2>/dev/null | tr -d '\r')
-        _gw=$(printf '%s' "$_g" | awk '{print $1}' | sed 's|/.*||' | sed 's/\.[0-9]*$/.1/')
-    fi
-    if [ -z "$_gw" ]; then
-        drm_warn "出网兜底：探不到网关，跳过（网络可能还没起来）"
+        drm_warn "出网兜底：main 表里没有默认路由，跳过（网络可能还没起来）"
         return 0
     fi
     _net=$(printf '%s' "$_gw" | sed 's/\.[0-9]*$/.0/')
-    drm_log "出网兜底：接口=$_if 网关=$_gw 网段=$_net 表=$_tbl pref=$_pref"
+    drm_log "出网兜底：接口=$_if 网关=$_gw 网段=$_net 表=$_tbl pref=$_pref main_pref=$_main_pref"
 
     # 递归路由必须先建：网段直连（scope link），否则默认路由会被内核判
     # "Nexthop invalid" 而拒绝。
     ds_exec "ip -4 route replace $_net/24 dev $_if scope link table $_tbl 2>/dev/null
-             ip -4 route replace default via $_gw dev $_if onlink table $_tbl 2>/dev/null
+             ip -4 route replace default via $_gw dev $_if table $_tbl 2>/dev/null
              ip -4 route show table $_tbl" 2>&1 | tr -d '\r' | sed 's/^/    /'
 
     # rule：先删同 pref 的旧条目再建（`ip rule add` 会重复堆叠，
     # 上游实测堆过 24600 条）。
+    # ① 指向 main —— 没有它连直连子网都不可达
+    ds_exec "while ip rule show 2>/dev/null | grep -q '^$_main_pref:'; do
+                 ip rule del pref $_main_pref 2>/dev/null || break
+             done
+             ip rule add pref $_main_pref from all lookup main 2>/dev/null" >/dev/null 2>&1
+    # ② 指向容器自己的表
     ds_exec "while ip rule show 2>/dev/null | grep -q '^$_pref:'; do
                  ip rule del pref $_pref 2>/dev/null || break
              done
-             ip rule add pref $_pref iif lo lookup $_tbl 2>/dev/null
+             ip rule add pref $_pref from all lookup $_tbl 2>/dev/null
              ip rule show 2>/dev/null | head -14" 2>&1 | tr -d '\r' | sed 's/^/    /'
 
     if ds_exec "ip rule show 2>/dev/null | grep -q '^$_pref:.*lookup $_tbl'" >/dev/null 2>&1; then
-        drm_log "出网兜底已就位（$_pref iif lo → 表 $_tbl）"
+        drm_log "出网兜底已就位（$_main_pref → main，$_pref → 表 $_tbl，均 from all）"
         drm_state_set NET_ROUTE_FIX 1
     else
         drm_warn "出网兜底 rule 未生效"
@@ -362,6 +377,10 @@ nt_fix_route() {
 
     # ★★ 只设一次是不够的，必须挂成 NM dispatcher 让它自动重挂 ★★
     nt_install_route_dispatcher "$_if" "$_tbl" "$_pref"
+
+    # ★★★ dispatcher 只覆盖"有 NM 事件"的情况。netd 周期性删规则时**没有**
+    # 任何 NM 事件，所以还必须装看门狗。见 net-rule-guard.sh 头部。★★★
+    nt_install_rule_guard
 }
 
 # ── 出网兜底路由的持久化：NetworkManager dispatcher ────────────
@@ -483,6 +502,83 @@ DISPEOF
     ds_exec "$_disp $_rif up; echo \"  rc=\$?\"; ip rule show 2>/dev/null | grep -E '^$_rpref:'" \
         2>&1 | tr -d '\r' | sed 's/^/    /'
     drm_state_set NET_ROUTE_DISPATCHER 1
+}
+
+# ── 策略路由看门狗 ──────────────────────────────────────────────
+#
+# ★★★ 为什么 dispatcher 不够（2026-10-12 实测，这条是核心）★★★
+#
+# dispatcher 只在 NM **事件**（up / dhcp4-change / reapply）时被调用。
+# 而本机 net_mode=host，容器和 Android **共用同一个网络栈** ——
+# Android 的 netd 会周期性重整它自己的策略路由，顺手把我们的两条删掉。
+#
+# 实测（连续监视 165 秒）：
+#     [23:24:02] 规则数=0  ← 消失（NM 事件：无）
+#     [23:25:27] 规则数=0  ← 消失（NM 事件：无）
+#     [23:26:42] 规则数=0  ← 消失（NM 事件：只有 p2p0，与 wlan0 无关）
+#     4 分钟内 NM 在 wlan0 上的事件数：0
+#
+# ⇒ 删的时候**不产生任何 NM 事件**，dispatcher 从设计上就永远等不到。
+#   这正是"修好又坏、修好又坏"的真正机制。
+#
+# 所以：dispatcher 负责"事件驱动的快速恢复"，看门狗负责"没人通知时的兜底"。
+# 两者都要，缺一不可。
+nt_install_rule_guard() {
+    _guard_src=""
+    for _c in "$(dirname "$0")/net-rule-guard.sh" \
+                /root/droid-drm-takeover/network/net-rule-guard.sh; do
+        [ -f "$_c" ] && { _guard_src=$_c; break; }
+    done
+    if [ -z "$_guard_src" ]; then
+        drm_warn "★ 找不到 net-rule-guard.sh，网络可能在 75-90 秒后掉线（且无任何 NM 事件可救）"
+        drm_state_set NET_RULE_GUARD 0
+        return 0
+    fi
+
+    _lib=/usr/local/lib/droid-drm-takeover
+    _unit=/etc/systemd/system/drm-net-guard.service
+    drm_log "装策略路由看门狗：$_lib/net-rule-guard.sh（1 秒一轮）"
+
+    ds_exec "mkdir -p $_lib
+             cp -f '$_guard_src' $_lib/net-rule-guard.sh
+             chmod 755 $_lib/net-rule-guard.sh
+             sh -n $_lib/net-rule-guard.sh && echo '  语法 OK' || echo '  ★ 语法错'" \
+        2>&1 | tr -d '\r' | sed 's/^/    /'
+
+    # systemd unit（容器是 systemd 就用 systemd，否则退化成 nohup 常驻）
+    _unit_src=""
+    for _c in "$(dirname "$0")/drm-net-guard.service" \
+                /root/droid-drm-takeover/network/drm-net-guard.service; do
+        [ -f "$_c" ] && { _unit_src=$_c; break; }
+    done
+
+    if [ "$(ds_exec 'ps -p 1 -o comm= 2>/dev/null' 2>/dev/null | tr -d '\r ')" = "systemd" ] \
+       && [ -n "$_unit_src" ]; then
+        ds_exec "cp -f '$_unit_src' $_unit
+                 chmod 644 $_unit
+                 systemctl daemon-reload
+                 systemctl enable drm-net-guard.service >/dev/null 2>&1
+                 systemctl restart drm-net-guard.service
+                 sleep 2
+                 echo \"  active=\$(systemctl is-active drm-net-guard.service)\"
+                 echo \"  enabled=\$(systemctl is-enabled drm-net-guard.service)\"" \
+            2>&1 | tr -d '\r' | sed 's/^/    /'
+    else
+        drm_warn "pid1 不是 systemd 或没有 unit 文件，改用 nohup 常驻"
+        ds_exec "pkill -f net-rule-guard.sh 2>/dev/null
+                 nohup $_lib/net-rule-guard.sh >/dev/null 2>&1 &
+                 sleep 2
+                 ps -A -o PID,CMD 2>/dev/null | grep net-rule-guard | grep -v grep" \
+            2>&1 | tr -d '\r' | sed 's/^/    /'
+    fi
+
+    if ds_exec "ps -A -o CMD 2>/dev/null | grep -q '[n]et-rule-guard.sh'" >/dev/null 2>&1; then
+        drm_log "看门狗在跑（规则被 netd 删掉后 ≤1 秒自动补回）"
+        drm_state_set NET_RULE_GUARD 1
+    else
+        drm_warn "★ 看门狗没起来，网络会在 75-90 秒后掉线"
+        drm_state_set NET_RULE_GUARD 0
+    fi
 }
 
 # DNS：NM 那边设了 dns=none，所以这里直接写死。
