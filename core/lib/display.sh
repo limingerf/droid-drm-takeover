@@ -1687,6 +1687,54 @@ drm_start_input_methods() {
         [ "$_kwinrc_dirty" = 1 ] && chown "$DESKTOP_USER" "$_kwinrc" 2>/dev/null
     fi
 
+    # ── 面板可见性：让屏幕键盘盖住任务栏 ──────────────────────
+    #
+    # ★ 用户明确要的效果："要不键盘就直接覆盖任务栏好了"。
+    # 平板上的屏幕键盘本来就该盖住任务栏，而不是被任务栏顶起来。
+    #
+    # Plasma 面板的可见性存在 appletsrc 的 panelVisibility：
+    #     0 = 始终可见（默认，会给键盘留占位）
+    #     1 = 自动隐藏
+    #     2 = 窗口可以覆盖   ← 用这个
+    #     3 = 窗口置于其下
+    #
+    # 实测背景：本机的面板是**浮动面板**（location=4），默认 panelVisibility
+    # 没写 ⇒ 用 0。改成 2 之后键盘会盖住任务栏。
+    #
+    # ★ 注意：这不是拖影的根因。实测改完拖影仍在（已排除的假设见
+    #   docs/ 里那份排查记录）。这里只是把用户要的交互固定下来。
+    #
+    # ★ 必须**先停 plasmashell 再改**，否则它会把文件回写掉。
+    #   所以这个改动放在启动 plasmashell **之前**做。
+    _appletsrc="$DESKTOP_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
+    if [ -f "$_appletsrc" ] && ! grep -aq '^panelVisibility=2' "$_appletsrc" 2>/dev/null; then
+        if grep -aq '^plugin=org\.kde\.panel' "$_appletsrc" 2>/dev/null; then
+            # 在每个 plugin=org.kde.panel 的 Containment 段里插入 panelVisibility=2。
+            # 两趟：先标出哪些段是面板，再逐段插入。
+            awk '
+                /^\[Containments\]\[[0-9]+\]$/ {
+                    if (sect != "" && ispanel && !done) print "panelVisibility=2"
+                    sect = $0; ispanel = 0; done = 0; print; next
+                }
+                /^\[/ {
+                    if (sect != "" && ispanel && !done) print "panelVisibility=2"
+                    sect = ""; ispanel = 0; done = 0; print; next
+                }
+                /^plugin=org\.kde\.panel$/ { ispanel = 1 }
+                /^panelVisibility=/ { done = 1 }
+                { print }
+                END { if (sect != "" && ispanel && !done) print "panelVisibility=2" }
+            ' "$_appletsrc" > "$_appletsrc.new" 2>/dev/null && mv "$_appletsrc.new" "$_appletsrc"
+            chown "$DESKTOP_USER" "$_appletsrc" 2>/dev/null
+            if grep -aq '^panelVisibility=2' "$_appletsrc" 2>/dev/null; then
+                drm_log "面板已设为「窗口可以覆盖」（panelVisibility=2），屏幕键盘会盖住任务栏"
+                drm_state_set PANEL_COVER 1
+            else
+                drm_warn "panelVisibility 写入失败，面板仍是默认「始终可见」"
+            fi
+        fi
+    fi
+
     _ok=0
     for _c in fcitx5 maliit-keyboard; do
         ds_exec "command -v $_c >/dev/null 2>&1" >/dev/null 2>&1 && _ok=1
