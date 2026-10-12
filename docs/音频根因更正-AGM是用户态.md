@@ -73,6 +73,13 @@ Failed to set device media config
 - `agmplay` 在容器里 strace 显示「**打开 wav 之后立即退出，从未碰 binder**」；
   `aplay -D agm`、`libagm_pcm_plugin.so` 的 ctypes 调用全部静默失败/崩溃。
 - 结论原文：**「正确客户端必须走 AIDL」**
+
+> ⚠️ **后续更正（详见《音频-本机HIDL路线与上游A路不可移植.md》）**：
+> 本机音频 HAL 是 **HIDL**（`android.hardware.audio@7.1::IDevicesFactory` +
+> `vendor.qti.hardware.AGMIPC@1.0::IAGM` + `vendor.qti.hardware.pal@1.0::IPAL`），
+> **不存在 AIDL `android.hardware.audio.core.IModule`**，所以本文 §3 那套 `argsloop` 方案
+> **在本机不可用**。可借鉴的是结论本身（"必须走服务接口，不能用 agmplay / ALSA 插件"），
+> 本机对应的实现是 HIDL 的 `libagmclient.so` / `libpalclient.so`。
   （`AServiceManager_waitForService("vendor.qti.hardware.agm.IAGM/default")` + `IAGM::fromBinder`），
   「**`agmplay` / ALSA 插件那条路在容器里不成立**」。
 
