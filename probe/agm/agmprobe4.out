@@ -1,0 +1,103 @@
+########## STEP=5  先 aif_connect 再 session_open ##########
+=== agmprobe v3  lib=/vendor/lib64/libagmclient.so STEP=5 REV=0 TAG=0 ===
+  [child pid=20778] STEP=5 REV=0 TAG=0
+  [1] dlopen ✓  init=0x76b8b9bc60 open=0x76b8b9bca0 close=0x76b8b9bd90 aif_list=0x76b8b9be60
+  [2] agm_init()...
+      rc=0 ✓ HIDL AGM 服务已连上
+  [3] agm_get_aif_info_list()...
+      rc=0 条数=54
+      共 54 条，步长 36B（name[32] + u32 aif_id）
+      [ 0] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-0"
+      [ 1] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1"
+      [ 2] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-2"
+      [ 3] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-3"
+      [ 4] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-5"
+      [ 5] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-6"
+      [ 6] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-3"
+      [ 7] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-4"
+      [ 8] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-2"
+      [ 9] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-0"
+      [10] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-1"
+      [11] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-0"
+      [12] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-1"
+      [13] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-2"
+      [14] aif_id=2    name="PCM_RT_PROXY-TX-1"
+      [15] aif_id=2    name="PCM_RT_PROXY-TX-2"
+      [16] aif_id=1    name="PCM_RT_PROXY-RX-1"
+      [17] aif_id=1    name="PCM_RT_PROXY-RX-2"
+      [18] aif_id=1    name="USB_AUDIO-RX"
+      [19] aif_id=2    name="USB_AUDIO-TX"
+      [20] aif_id=2    name="PCM_DUMMY-TX-0"
+      [21] aif_id=1    name="PCM_DUMMY-RX-0"
+      [22] aif_id=2    name="PCM_DUMMY-TX-1"
+      [23] aif_id=1    name="MI2S-LPAIF-RX-PRIMARY"
+      [24] aif_id=2    name="MI2S-LPAIF-TX-PRIMARY"
+      [25] aif_id=1    name="MI2S-LPAIF-RX-SECONDARY"
+      [26] aif_id=2    name="MI2S-LPAIF-TX-SECONDARY"
+      [27] aif_id=1    name="MI2S-LPAIF_AUD-RX-SECONDARY"
+      [28] aif_id=2    name="MI2S-LPAIF_AUD-TX-SECONDARY"
+      [29] aif_id=1    name="MI2S-LPAIF_RXTX-RX-PRIMARY"
+      [30] aif_id=2    name="MI2S-LPAIF_RXTX-TX-PRIMARY"
+      [31] aif_id=1    name="MI2S-LPAIF_VA-RX-PRIMARY"
+      [32] aif_id=2    name="MI2S-LPAIF_VA-TX-PRIMARY"
+      [33] aif_id=1    name="MI2S-LPAIF_WSA-RX-PRIMARY"
+      [34] aif_id=2    name="MI2S-LPAIF_WSA-TX-PRIMARY"
+      [35] aif_id=1    name="MI2S-LPAIF_AUD-RX-PRIMARY"
+      [36] aif_id=2    name="MI2S-LPAIF_AUD-TX-PRIMARY"
+      [37] aif_id=1    name="TDM-LPAIF-RX-PRIMARY"
+      [38] aif_id=2    name="TDM-LPAIF-TX-PRIMARY"
+      [39] aif_id=1    name="TDM-LPAIF-RX-SECONDARY"
+      [40] aif_id=2    name="TDM-LPAIF-TX-SECONDARY"
+      [41] aif_id=1    name="TDM-LPAIF_AUD-RX-SECONDARY"
+      [42] aif_id=2    name="TDM-LPAIF_AUD-TX-SECONDARY"
+      [43] aif_id=1    name="TDM-LPAIF_RXTX-RX-PRIMARY"
+      [44] aif_id=2    name="TDM-LPAIF_RXTX-TX-PRIMARY"
+      [45] aif_id=1    name="TDM-LPAIF_VA-RX-PRIMARY"
+      [46] aif_id=2    name="TDM-LPAIF_VA-TX-PRIMARY"
+      [47] aif_id=1    name="TDM-LPAIF_WSA-RX-PRIMARY"
+      [48] aif_id=2    name="TDM-LPAIF_WSA-TX-PRIMARY"
+      [49] aif_id=1    name="TDM-LPAIF_AUD-RX-PRIMARY"
+      [50] aif_id=2    name="TDM-LPAIF_AUD-TX-PRIMARY"
+      [51] aif_id=1    name="DISPLAY_PORT-RX"
+      [52] aif_id=1    name="SLIM-DEV1-RX-7"
+      [53] aif_id=2    name="SLIM-DEV1-TX-7"
+  [5] agm_session_aif_connect=0x76b8b9bd60
+      aif_connect(sid=100, aif=1, enable=1) rc=0
+      session_open(sid=100, mode=0) rc=-5 handle=0x0
+      aif_connect(sid=100, aif=2, enable=1) rc=0
+      session_open(sid=100, mode=0) rc=-5 handle=0x0
+      aif_connect(sid=200, aif=1, enable=1) rc=0
+      session_open(sid=200, mode=0) rc=-5 handle=0x0
+      aif_connect(sid=200, aif=2, enable=1) rc=0
+      session_open(sid=200, mode=0) rc=-5 handle=0x0
+  [6] agm_deinit rc=0
+子进程退出码=0
+VERDICT: OK
+
+########## 设备侧 AGM 服务日志 ##########
+10-13 00:01:45.006  4199  4199 E AGM: device: device_open: 377 Period Size 0 
+10-13 00:01:45.006  4199  4199 E AGM: session: session_connect_aif: 758 Error:-5 opening device object with id:1 
+10-13 00:01:45.006  4199  4199 E AGM: session: session_open_with_first_device: 898 Audio interface(Backend):1 <-> session(Frontend):100                    Connect failed error:-5
+10-13 00:01:45.006  4199  4199 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:100
+10-13 00:01:45.006  4199  4199 I AGM: API: agm_session_aif_connect: 625 connecting aifid:2 with session id=100
+10-13 00:01:45.006  4199  4199 D AGM: device: device_open: 358 Unsupported PCM rate 0 changing to default rate 48000
+10-13 00:01:45.007  4199  4199 E AGM: device: device_open: 376 Unable to open PCM device 1 (cannot set hw params: Invalid argument) rate 48000 ch 0 fmt 0
+10-13 00:01:45.007  4199  4199 E AGM: device: device_open: 377 Period Size 0 
+10-13 00:01:45.007  4199  4199 E AGM: session: session_connect_aif: 758 Error:-5 opening device object with id:1 
+10-13 00:01:45.007  4199  4199 E AGM: session: session_open_with_first_device: 898 Audio interface(Backend):1 <-> session(Frontend):100                    Connect failed error:-5
+10-13 00:01:45.007  4199  4199 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:100
+10-13 00:01:45.007  4199  4199 I AGM: API: agm_session_aif_connect: 625 connecting aifid:1 with session id=200
+10-13 00:01:45.007  4199  4199 D AGM: device: device_open: 358 Unsupported PCM rate 0 changing to default rate 48000
+10-13 00:01:45.008  4199  4199 E AGM: device: device_open: 376 Unable to open PCM device 1 (cannot set hw params: Invalid argument) rate 48000 ch 0 fmt 0
+10-13 00:01:45.008  4199  4199 E AGM: device: device_open: 377 Period Size 0 
+10-13 00:01:45.008  4199  4199 E AGM: session: session_connect_aif: 758 Error:-5 opening device object with id:1 
+10-13 00:01:45.008  4199  4199 E AGM: session: session_open_with_first_device: 898 Audio interface(Backend):1 <-> session(Frontend):200                    Connect failed error:-5
+10-13 00:01:45.008  4199  4199 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:200
+10-13 00:01:45.008  4199  4199 I AGM: API: agm_session_aif_connect: 625 connecting aifid:2 with session id=200
+10-13 00:01:45.008  4199  4199 D AGM: device: device_open: 358 Unsupported PCM rate 0 changing to default rate 48000
+10-13 00:01:45.008  4199  4199 E AGM: device: device_open: 376 Unable to open PCM device 1 (cannot set hw params: Invalid argument) rate 48000 ch 0 fmt 0
+10-13 00:01:45.008  4199  4199 E AGM: device: device_open: 377 Period Size 0 
+10-13 00:01:45.008  4199  4199 E AGM: session: session_connect_aif: 758 Error:-5 opening device object with id:1 
+10-13 00:01:45.008  4199  4199 E AGM: session: session_open_with_first_device: 898 Audio interface(Backend):1 <-> session(Frontend):200                    Connect failed error:-5
+10-13 00:01:45.008  4199  4199 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:200
+DONE

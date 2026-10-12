@@ -1,0 +1,252 @@
+########## STEP=3  AIF 全表（含 aif_id）##########
+=== agmprobe v3  lib=/vendor/lib64/libagmclient.so STEP=3 REV=0 TAG=0 ===
+  [child pid=30109] STEP=3 REV=0 TAG=0
+  [1] dlopen ✓  init=0x6faef30c60 open=0x6faef30ca0 close=0x6faef30d90 aif_list=0x6faef30e60
+  [2] agm_init()...
+      rc=0 ✓ HIDL AGM 服务已连上
+  [3] agm_get_aif_info_list()...
+      rc=0 条数=54
+      共 54 条，步长 36B（name[32] + u32 aif_id）
+      [ 0] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-0"
+      [ 1] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1"
+      [ 2] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-2"
+      [ 3] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-3"
+      [ 4] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-5"
+      [ 5] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-6"
+      [ 6] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-3"
+      [ 7] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-4"
+      [ 8] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-2"
+      [ 9] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-0"
+      [10] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-1"
+      [11] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-0"
+      [12] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-1"
+      [13] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-2"
+      [14] aif_id=2    name="PCM_RT_PROXY-TX-1"
+      [15] aif_id=2    name="PCM_RT_PROXY-TX-2"
+      [16] aif_id=1    name="PCM_RT_PROXY-RX-1"
+      [17] aif_id=1    name="PCM_RT_PROXY-RX-2"
+      [18] aif_id=1    name="USB_AUDIO-RX"
+      [19] aif_id=2    name="USB_AUDIO-TX"
+      [20] aif_id=2    name="PCM_DUMMY-TX-0"
+      [21] aif_id=1    name="PCM_DUMMY-RX-0"
+      [22] aif_id=2    name="PCM_DUMMY-TX-1"
+      [23] aif_id=1    name="MI2S-LPAIF-RX-PRIMARY"
+      [24] aif_id=2    name="MI2S-LPAIF-TX-PRIMARY"
+      [25] aif_id=1    name="MI2S-LPAIF-RX-SECONDARY"
+      [26] aif_id=2    name="MI2S-LPAIF-TX-SECONDARY"
+      [27] aif_id=1    name="MI2S-LPAIF_AUD-RX-SECONDARY"
+      [28] aif_id=2    name="MI2S-LPAIF_AUD-TX-SECONDARY"
+      [29] aif_id=1    name="MI2S-LPAIF_RXTX-RX-PRIMARY"
+      [30] aif_id=2    name="MI2S-LPAIF_RXTX-TX-PRIMARY"
+      [31] aif_id=1    name="MI2S-LPAIF_VA-RX-PRIMARY"
+      [32] aif_id=2    name="MI2S-LPAIF_VA-TX-PRIMARY"
+      [33] aif_id=1    name="MI2S-LPAIF_WSA-RX-PRIMARY"
+      [34] aif_id=2    name="MI2S-LPAIF_WSA-TX-PRIMARY"
+      [35] aif_id=1    name="MI2S-LPAIF_AUD-RX-PRIMARY"
+      [36] aif_id=2    name="MI2S-LPAIF_AUD-TX-PRIMARY"
+      [37] aif_id=1    name="TDM-LPAIF-RX-PRIMARY"
+      [38] aif_id=2    name="TDM-LPAIF-TX-PRIMARY"
+      [39] aif_id=1    name="TDM-LPAIF-RX-SECONDARY"
+      [40] aif_id=2    name="TDM-LPAIF-TX-SECONDARY"
+      [41] aif_id=1    name="TDM-LPAIF_AUD-RX-SECONDARY"
+      [42] aif_id=2    name="TDM-LPAIF_AUD-TX-SECONDARY"
+      [43] aif_id=1    name="TDM-LPAIF_RXTX-RX-PRIMARY"
+      [44] aif_id=2    name="TDM-LPAIF_RXTX-TX-PRIMARY"
+      [45] aif_id=1    name="TDM-LPAIF_VA-RX-PRIMARY"
+      [46] aif_id=2    name="TDM-LPAIF_VA-TX-PRIMARY"
+      [47] aif_id=1    name="TDM-LPAIF_WSA-RX-PRIMARY"
+      [48] aif_id=2    name="TDM-LPAIF_WSA-TX-PRIMARY"
+      [49] aif_id=1    name="TDM-LPAIF_AUD-RX-PRIMARY"
+      [50] aif_id=2    name="TDM-LPAIF_AUD-TX-PRIMARY"
+      [51] aif_id=1    name="DISPLAY_PORT-RX"
+      [52] aif_id=1    name="SLIM-DEV1-RX-7"
+      [53] aif_id=2    name="SLIM-DEV1-TX-7"
+子进程退出码=0
+VERDICT: OK
+
+########## STEP=4  TAG=0 ##########
+=== agmprobe v3  lib=/vendor/lib64/libagmclient.so STEP=4 REV=0 TAG=0 ===
+  [child pid=30120] STEP=4 REV=0 TAG=0
+  [1] dlopen ✓  init=0x70903a4c60 open=0x70903a4ca0 close=0x70903a4d90 aif_list=0x70903a4e60
+  [2] agm_init()...
+      rc=0 ✓ HIDL AGM 服务已连上
+  [3] agm_get_aif_info_list()...
+      rc=0 条数=54
+      共 54 条，步长 36B（name[32] + u32 aif_id）
+      [ 0] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-0"
+      [ 1] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1"
+      [ 2] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-2"
+      [ 3] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-3"
+      [ 4] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-5"
+      [ 5] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-6"
+      [ 6] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-3"
+      [ 7] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-4"
+      [ 8] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-2"
+      [ 9] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-0"
+      [10] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-1"
+      [11] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-0"
+      [12] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-1"
+      [13] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-2"
+      [14] aif_id=2    name="PCM_RT_PROXY-TX-1"
+      [15] aif_id=2    name="PCM_RT_PROXY-TX-2"
+      [16] aif_id=1    name="PCM_RT_PROXY-RX-1"
+      [17] aif_id=1    name="PCM_RT_PROXY-RX-2"
+      [18] aif_id=1    name="USB_AUDIO-RX"
+      [19] aif_id=2    name="USB_AUDIO-TX"
+      [20] aif_id=2    name="PCM_DUMMY-TX-0"
+      [21] aif_id=1    name="PCM_DUMMY-RX-0"
+      [22] aif_id=2    name="PCM_DUMMY-TX-1"
+      [23] aif_id=1    name="MI2S-LPAIF-RX-PRIMARY"
+      [24] aif_id=2    name="MI2S-LPAIF-TX-PRIMARY"
+      [25] aif_id=1    name="MI2S-LPAIF-RX-SECONDARY"
+      [26] aif_id=2    name="MI2S-LPAIF-TX-SECONDARY"
+      [27] aif_id=1    name="MI2S-LPAIF_AUD-RX-SECONDARY"
+      [28] aif_id=2    name="MI2S-LPAIF_AUD-TX-SECONDARY"
+      [29] aif_id=1    name="MI2S-LPAIF_RXTX-RX-PRIMARY"
+      [30] aif_id=2    name="MI2S-LPAIF_RXTX-TX-PRIMARY"
+      [31] aif_id=1    name="MI2S-LPAIF_VA-RX-PRIMARY"
+      [32] aif_id=2    name="MI2S-LPAIF_VA-TX-PRIMARY"
+      [33] aif_id=1    name="MI2S-LPAIF_WSA-RX-PRIMARY"
+      [34] aif_id=2    name="MI2S-LPAIF_WSA-TX-PRIMARY"
+      [35] aif_id=1    name="MI2S-LPAIF_AUD-RX-PRIMARY"
+      [36] aif_id=2    name="MI2S-LPAIF_AUD-TX-PRIMARY"
+      [37] aif_id=1    name="TDM-LPAIF-RX-PRIMARY"
+      [38] aif_id=2    name="TDM-LPAIF-TX-PRIMARY"
+      [39] aif_id=1    name="TDM-LPAIF-RX-SECONDARY"
+      [40] aif_id=2    name="TDM-LPAIF-TX-SECONDARY"
+      [41] aif_id=1    name="TDM-LPAIF_AUD-RX-SECONDARY"
+      [42] aif_id=2    name="TDM-LPAIF_AUD-TX-SECONDARY"
+      [43] aif_id=1    name="TDM-LPAIF_RXTX-RX-PRIMARY"
+      [44] aif_id=2    name="TDM-LPAIF_RXTX-TX-PRIMARY"
+      [45] aif_id=1    name="TDM-LPAIF_VA-RX-PRIMARY"
+      [46] aif_id=2    name="TDM-LPAIF_VA-TX-PRIMARY"
+      [47] aif_id=1    name="TDM-LPAIF_WSA-RX-PRIMARY"
+      [48] aif_id=2    name="TDM-LPAIF_WSA-TX-PRIMARY"
+      [49] aif_id=1    name="TDM-LPAIF_AUD-RX-PRIMARY"
+      [50] aif_id=2    name="TDM-LPAIF_AUD-TX-PRIMARY"
+      [51] aif_id=1    name="DISPLAY_PORT-RX"
+      [52] aif_id=1    name="SLIM-DEV1-RX-7"
+      [53] aif_id=2    name="SLIM-DEV1-TX-7"
+  [4] agm_session_open 试 mode 0..12（三参数, tag=0）...
+      mode=0  rc=-32    session_id=0x0
+      mode=1  rc=-32    session_id=0x0
+      mode=2  rc=-32    session_id=0x0
+      mode=3  rc=-32    session_id=0x0
+      mode=4  rc=-32    session_id=0x0
+      mode=5  rc=-32    session_id=0x0
+      mode=6  rc=-32    session_id=0x0
+      mode=7  rc=-32    session_id=0x0
+      mode=8  rc=-32    session_id=0x0
+      mode=9  rc=-32    session_id=0x0
+      mode=10 rc=-32    session_id=0x0
+      mode=11 rc=-32    session_id=0x0
+      mode=12 rc=-32    session_id=0x0
+      ⇒ 0..12 全被拒
+  [5] agm_deinit rc=0
+子进程退出码=20
+VERDICT: FAILED
+
+########## STEP=4  TAG=1 ##########
+=== agmprobe v3  lib=/vendor/lib64/libagmclient.so STEP=4 REV=0 TAG=1 ===
+  [child pid=30134] STEP=4 REV=0 TAG=1
+  [1] dlopen ✓  init=0x7177197c60 open=0x7177197ca0 close=0x7177197d90 aif_list=0x7177197e60
+  [2] agm_init()...
+      rc=0 ✓ HIDL AGM 服务已连上
+  [3] agm_get_aif_info_list()...
+      rc=0 条数=54
+      共 54 条，步长 36B（name[32] + u32 aif_id）
+      [ 0] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-0"
+      [ 1] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1"
+      [ 2] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-2"
+      [ 3] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-3"
+      [ 4] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-5"
+      [ 5] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-6"
+      [ 6] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-3"
+      [ 7] aif_id=2    name="CODEC_DMA-LPAIF_RXTX-TX-4"
+      [ 8] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-2"
+      [ 9] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-0"
+      [10] aif_id=1    name="CODEC_DMA-LPAIF_RXTX-RX-1-VT-1"
+      [11] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-0"
+      [12] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-1"
+      [13] aif_id=2    name="CODEC_DMA-LPAIF_VA-TX-2"
+      [14] aif_id=2    name="PCM_RT_PROXY-TX-1"
+      [15] aif_id=2    name="PCM_RT_PROXY-TX-2"
+      [16] aif_id=1    name="PCM_RT_PROXY-RX-1"
+      [17] aif_id=1    name="PCM_RT_PROXY-RX-2"
+      [18] aif_id=1    name="USB_AUDIO-RX"
+      [19] aif_id=2    name="USB_AUDIO-TX"
+      [20] aif_id=2    name="PCM_DUMMY-TX-0"
+      [21] aif_id=1    name="PCM_DUMMY-RX-0"
+      [22] aif_id=2    name="PCM_DUMMY-TX-1"
+      [23] aif_id=1    name="MI2S-LPAIF-RX-PRIMARY"
+      [24] aif_id=2    name="MI2S-LPAIF-TX-PRIMARY"
+      [25] aif_id=1    name="MI2S-LPAIF-RX-SECONDARY"
+      [26] aif_id=2    name="MI2S-LPAIF-TX-SECONDARY"
+      [27] aif_id=1    name="MI2S-LPAIF_AUD-RX-SECONDARY"
+      [28] aif_id=2    name="MI2S-LPAIF_AUD-TX-SECONDARY"
+      [29] aif_id=1    name="MI2S-LPAIF_RXTX-RX-PRIMARY"
+      [30] aif_id=2    name="MI2S-LPAIF_RXTX-TX-PRIMARY"
+      [31] aif_id=1    name="MI2S-LPAIF_VA-RX-PRIMARY"
+      [32] aif_id=2    name="MI2S-LPAIF_VA-TX-PRIMARY"
+      [33] aif_id=1    name="MI2S-LPAIF_WSA-RX-PRIMARY"
+      [34] aif_id=2    name="MI2S-LPAIF_WSA-TX-PRIMARY"
+      [35] aif_id=1    name="MI2S-LPAIF_AUD-RX-PRIMARY"
+      [36] aif_id=2    name="MI2S-LPAIF_AUD-TX-PRIMARY"
+      [37] aif_id=1    name="TDM-LPAIF-RX-PRIMARY"
+      [38] aif_id=2    name="TDM-LPAIF-TX-PRIMARY"
+      [39] aif_id=1    name="TDM-LPAIF-RX-SECONDARY"
+      [40] aif_id=2    name="TDM-LPAIF-TX-SECONDARY"
+      [41] aif_id=1    name="TDM-LPAIF_AUD-RX-SECONDARY"
+      [42] aif_id=2    name="TDM-LPAIF_AUD-TX-SECONDARY"
+      [43] aif_id=1    name="TDM-LPAIF_RXTX-RX-PRIMARY"
+      [44] aif_id=2    name="TDM-LPAIF_RXTX-TX-PRIMARY"
+      [45] aif_id=1    name="TDM-LPAIF_VA-RX-PRIMARY"
+      [46] aif_id=2    name="TDM-LPAIF_VA-TX-PRIMARY"
+      [47] aif_id=1    name="TDM-LPAIF_WSA-RX-PRIMARY"
+      [48] aif_id=2    name="TDM-LPAIF_WSA-TX-PRIMARY"
+      [49] aif_id=1    name="TDM-LPAIF_AUD-RX-PRIMARY"
+      [50] aif_id=2    name="TDM-LPAIF_AUD-TX-PRIMARY"
+      [51] aif_id=1    name="DISPLAY_PORT-RX"
+      [52] aif_id=1    name="SLIM-DEV1-RX-7"
+      [53] aif_id=2    name="SLIM-DEV1-TX-7"
+  [4] agm_session_open 试 mode 0..12（三参数, tag=1）...
+      mode=0  rc=-32    session_id=0x0
+      mode=1  rc=-32    session_id=0x0
+      mode=2  rc=-32    session_id=0x0
+      mode=3  rc=-32    session_id=0x0
+      mode=4  rc=-32    session_id=0x0
+      mode=5  rc=-32    session_id=0x0
+      mode=6  rc=-32    session_id=0x0
+      mode=7  rc=-32    session_id=0x0
+      mode=8  rc=-32    session_id=0x0
+      mode=9  rc=-32    session_id=0x0
+      mode=10 rc=-32    session_id=0x0
+      mode=11 rc=-32    session_id=0x0
+      mode=12 rc=-32    session_id=0x0
+      ⇒ 0..12 全被拒
+  [5] agm_deinit rc=0
+子进程退出码=20
+VERDICT: FAILED
+
+########## 设备侧 AGM 服务日志 ##########
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):3
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:3
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):4
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:4
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):5
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:5
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):6
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:6
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):7
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:7
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):8
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:8
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):9
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:9
+10-13 00:00:15.130 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):10
+10-13 00:00:15.130 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:10
+10-13 00:00:15.131 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):11
+10-13 00:00:15.131 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:11
+10-13 00:00:15.131 16541 16541 E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):12
+10-13 00:00:15.131 16541 16541 E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:12
+DONE

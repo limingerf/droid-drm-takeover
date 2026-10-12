@@ -156,3 +156,81 @@ $CC -std=gnu11 -O2 -fPIE -pie foo.c -o foo -lm -ldl     # 需要 AAudio 就加 -
 - 在 `/data/local/tests/vendor/` 建了目录并放了一份 `argsloop`（未删除；如需清理告诉我）。
 - 放过一次 1.5s / 440Hz / 振幅 0.08 的测试音（AAudio 探针），但它**在 openStream 就失败，
   没有真正出声** —— 所以**至今仍没有听到任何声音**，不能声称修好。
+
+---
+
+## 7. ★ P1 探针实测（2026-10-13 00:00）—— AGM 直连已推进到"配 PCM 参数"这一步
+
+探针：`probe/diag/agmprobe.c`（NDK r27c 编译）→ 推到 `/data/local/tmp/agmprobe`，
+**在默认命名空间就能跑通**（HIDL 走 `/dev/hwbinder`，与命名空间无关，不必进 vendor 域）。
+
+### 7.1 已确认成功（真实输出）
+
+```
+=== agmprobe v3  lib=/vendor/lib64/libagmclient.so STEP=5 ===
+  [1] dlopen ✓  init=0x76b8b9bc60 open=0x76b8b9bca0 close=0x76b8b9bd90 aif_list=0x76b8b9be60
+  [2] agm_init()...          rc=0 ✓ HIDL AGM 服务已连上
+  [3] agm_get_aif_info_list  rc=0 条数=54
+      [ 0] aif_id=1  name="CODEC_DMA-LPAIF_RXTX-RX-0"
+      [ 6] aif_id=2  name="CODEC_DMA-LPAIF_RXTX-TX-3"
+      [16] aif_id=1  name="PCM_RT_PROXY-RX-1"
+      [23] aif_id=1  name="MI2S-LPAIF-RX-PRIMARY"
+      [33] aif_id=1  name="MI2S-LPAIF_WSA-RX-PRIMARY"
+      [37] aif_id=1  name="TDM-LPAIF-RX-PRIMARY"
+      [47] aif_id=1  name="TDM-LPAIF_WSA-RX-PRIMARY"
+      ... 共 54 条（结构步长 36B = name[32] + u32 方向位，1=RX 2=TX）
+  [5] aif_connect(sid=100, aif=1, enable=1) rc=0   ← ★ 成功
+```
+
+`lshal` 里 AGM 客户端数原本是 `0/14`，现在有客户端了 —— 即**上游 §8「AGM 从未被任何
+客户端调用过」这个状态在本机被打破**（这是本机第一次真正调用 AGM 服务）。
+
+### 7.2 反汇编读出的真实 ABI（关键，上游文档没有）
+
+导出的 `agm_*` 只是 `bti c; b <实体>` 跳板，必须看实体：
+
+| 函数 | 实体 | ABI（从寄存器用法读出） |
+|---|---|---|
+| `agm_session_open` | @0xab84 | `(uint32_t session_id, uint32_t mode, agm_session_t *handle)` —— **三个参数**；`mov w20,w0 / w19,w1 / ldr x5,[x2]` |
+| `agm_session_aif_connect` | @0xaf0c | `(uint32_t session_id, uint32_t aif_id, uint32_t enable)` |
+| `agm_session_set_config` | @0x9964 | `(uint64_t session_id, session_config*, media_config*, buffer_config*)`；内部 `new[](180)` ⇒ 三结构体序列化约 180B |
+| `agm_get_aif_info_list` | @0xb99c | `(void *list, size_t *num)`（已知可用，做对照） |
+
+**踩坑记录**：只传两个参数调 `agm_session_open` 会**段错误**（第三个参数被当指针解引用）。
+这也是 v1 探针 `rc=139` 且一行日志都没留下的原因 —— stdout 块缓冲，崩溃时缓冲区全丢。
+v2 改成 `setvbuf(_IONBF)` + `fork()` 隔离后才定位到崩溃点。
+
+### 7.3 调用顺序（服务端日志实证）
+
+**先 `aif_connect`，再 `session_open`**：
+
+```
+# 只调 session_open（没挂后端）：
+E AGM: session: session_open_with_first_device: 889 No Audio interface(Backend) set on session(Frontend):3
+E AGM: session: session_obj_open: 2192 Unable to open a session with Session ID:3
+   ⇒ 注意 ":3" 正是我传的第一个参数 ⇒ **第一个参数是 session id（Frontend），不是 mode**
+
+# 先 aif_connect 再 session_open：
+I AGM: API: agm_session_aif_connect: 625 connecting aifid:1 with session id=100
+D AGM: device: device_open: 358 Unsupported PCM rate 0 changing to default rate 48000
+E AGM: device: device_open: 376 Unable to open PCM device 1 (cannot set hw params: Invalid argument) rate 48000 ch 0 fmt 0
+E AGM: device: device_open: 377 Period Size 0
+E AGM: session: session_connect_aif: 758 Error:-5 opening device object with id:1
+E AGM: session: session_open_with_first_device: 898 Audio interface(Backend):1 <-> session(Frontend):100 Connect failed error:-5
+   ⇒ "No Audio interface(Backend) set" 消失了 ⇒ **顺序对了**；
+     现在卡在 PCM 参数是 0/0/0（media config 还没设）
+```
+
+### 7.4 当前精确卡点与下一步
+
+**卡点**：`Unable to open PCM device 1 (cannot set hw params) rate 48000 ch 0 fmt 0`
+—— 会话的 **media config 仍是 0**，而 `session_open` 会拿它去 `device_open` 真开 PCM。
+
+**下一步（按序）**：
+1. 从 `agm_session_set_config` @0x9964 的反汇编还原 `agm_session_config` /
+   `agm_media_config` / `agm_buffer_config` 三个结构体的字段偏移；
+2. 填 `rate=48000, channels=2, format=16bit`，在 `aif_connect` 之后、`session_open` 之前调用；
+3. 然后才是 `prepare` → `start` → `write`（**到这一步才会出声**，届时振幅压到 0.08 级别）。
+
+**仍未出声**：本探针只做 init / aif_list / aif_connect / session_open / close，
+**没有 set_config 成功、没有 start、没有 write** ⇒ 依然不能声称修好。

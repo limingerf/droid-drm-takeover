@@ -1,0 +1,36 @@
+=== 哪些现成二进制链接了 libagmclient.so（可抄调用模式）===
+  agmplay              libagmclient=0
+  agmcap               libagmclient=0
+  agmcompressplay      libagmclient=0
+  agmhostless          libagmclient=0
+  agmvoiceui           libagmclient=0
+  mm-audio-ftm         libagmclient=0
+  audioadsprpcd        libagmclient=0
+  audiodsd2pcmtest     libagmclient=0
+  audioflacapp         libagmclient=0
+
+=== libagmclient.so 的 NEEDED ===
+	linux-vdso.so.1 => [vdso] (0x7000f99000)
+	libhidlbase.so => /system/lib64/libhidlbase.so (0x6ffec3e000)
+	libutils.so => /system/lib64/libutils.so (0x6ffe9c4000)
+	liblog.so => /system/lib64/liblog.so (0x6ffede4000)
+	libcutils.so => /system/lib64/libcutils.so (0x6ffd6c6000)
+	libhardware.so => /system/lib64/libhardware.so (0x6fffc62000)
+	libbase.so => /system/lib64/libbase.so (0x6ffed4b000)
+	vendor.qti.hardware.AGMIPC@1.0.so => /vendor/lib64/vendor.qti.hardware.AGMIPC@1.0.so (0x6ffea23000)
+	libc++.so => /system/lib64/libc++.so (0x6ffeac9000)
+	libc.so => /apex/com.android.runtime/lib64/bionic/libc.so (0x6ffe842000)
+	libm.so => /apex/com.android.runtime/lib64/bionic/libm.so (0x6ffea87000)
+	libdl.so => /apex/com.android.runtime/lib64/bionic/libdl.so (0x6ffedb9000)
+	libvndksupport.so => /system/lib64/libvndksupport.so (0x6fffc8e000)
+	libdl_android.so => /apex/com.android.runtime/lib64/bionic/libdl_android.so (0x6ffe994000)
+
+=== libagmmixer.so 的 NEEDED ===
+	linux-vdso.so.1 => [vdso] (0x711dbaa000)
+	libtinyalsa.so => /system/lib64/libtinyalsa.so (0x711c8db000)
+	libexpat.so => /system/lib64/libexpat.so (0x711c883000)
+	libc++.so => /system/lib64/libc++.so (0x711a0d3000)
+	libc.so => /apex/com.android.runtime/lib64/bionic/libc.so (0x711a239000)
+	libm.so => /apex/com.android.runtime/lib64/bionic/libm.so (0x711c847000)
+	libdl.so => /apex/com.android.runtime/lib64/bionic/libdl.so (0x711c92a000)
+DONE
