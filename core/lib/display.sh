@@ -1781,45 +1781,58 @@ drm_start_input_methods() {
     # ★ 用户明确要的效果："要不键盘就直接覆盖任务栏好了"。
     # 平板上的屏幕键盘本来就该盖住任务栏，而不是被任务栏顶起来。
     #
-    # Plasma 面板的可见性存在 appletsrc 的 panelVisibility：
-    #     0 = 始终可见（默认，会给键盘留占位）
-    #     1 = 自动隐藏
-    #     2 = 窗口可以覆盖   ← 用这个
-    #     3 = 窗口置于其下
+    # Plasma 面板的可见性存在 appletsrc 的 panelVisibility。
+    # ★ 枚举是 Plasma::Types::Visibility，**不是**直觉上的顺序：
+    #     0 = NormalPanel     始终可见（默认，会给窗口留占位）
+    #     1 = AutoHide        自动隐藏
+    #     2 = DodgeWindows    ★ 只在普通窗口碰到时才躲 —— 输入法面板不算普通窗口
+    #     3 = WindowsCanCover ★ 允许窗口盖住它 ← 用这个
+    #     4 = WindowsGoBelow  窗口永远在它下面
     #
-    # 实测背景：本机的面板是**浮动面板**（location=4），默认 panelVisibility
-    # 没写 ⇒ 用 0。改成 2 之后键盘会盖住任务栏。
+    # ★★ 这里之前写成 2 并注释成"窗口可以覆盖"，是错的 ★★
+    #   2 是 DodgeWindows。实测症状：屏幕键盘弹出时，任务栏仍然画在键盘
+    #   最后一行**上面**，把那一行盖掉 —— 用户报的"底下任务栏那一块缺了"。
+    #   因为 KWin 不把输入法面板当普通窗口，DodgeWindows 对它不生效。
     #
-    # ★ 注意：这不是拖影的根因。实测改完拖影仍在（已排除的假设见
-    #   docs/ 里那份排查记录）。这里只是把用户要的交互固定下来。
+    # 实测背景：本机的面板是**浮动面板**（location=4），而且 panelVisibility
+    # 在 appletsrc 里出现在 plugin=org.kde.panel **之前** ——
+    # 所以"先标记面板段再插值"的写法会漏掉它，只能按整行替换。
     #
     # ★ 必须**先停 plasmashell 再改**，否则它会把文件回写掉。
     #   所以这个改动放在启动 plasmashell **之前**做。
     _appletsrc="$DESKTOP_HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
-    if [ -f "$_appletsrc" ] && ! grep -aq '^panelVisibility=2' "$_appletsrc" 2>/dev/null; then
+    if [ -f "$_appletsrc" ]; then
         if grep -aq '^plugin=org\.kde\.panel' "$_appletsrc" 2>/dev/null; then
-            # 在每个 plugin=org.kde.panel 的 Containment 段里插入 panelVisibility=2。
-            # 两趟：先标出哪些段是面板，再逐段插入。
-            awk '
-                /^\[Containments\]\[[0-9]+\]$/ {
-                    if (sect != "" && ispanel && !done) print "panelVisibility=2"
-                    sect = $0; ispanel = 0; done = 0; print; next
-                }
-                /^\[/ {
-                    if (sect != "" && ispanel && !done) print "panelVisibility=2"
-                    sect = ""; ispanel = 0; done = 0; print; next
-                }
-                /^plugin=org\.kde\.panel$/ { ispanel = 1 }
-                /^panelVisibility=/ { done = 1 }
-                { print }
-                END { if (sect != "" && ispanel && !done) print "panelVisibility=2" }
-            ' "$_appletsrc" > "$_appletsrc.new" 2>/dev/null && mv "$_appletsrc.new" "$_appletsrc"
+            # 先备份（只备份一次）
+            if ! ls -1 "$_appletsrc".bak-panel-* >/dev/null 2>&1; then
+                cp -a "$_appletsrc" "$_appletsrc.bak-panel-$(date +%s)" 2>/dev/null
+            fi
+            # 按整行替换（panelVisibility 出现在 plugin= 之前，插值逻辑会漏）
+            if grep -aq '^panelVisibility=' "$_appletsrc" 2>/dev/null; then
+                sed -i 's/^panelVisibility=.*/panelVisibility=3/' "$_appletsrc" 2>/dev/null
+            else
+                # 一个都没有：在面板段末尾补一行
+                awk '
+                    /^\[Containments\]\[[0-9]+\]$/ {
+                        if (sect != "" && ispanel && !done) print "panelVisibility=3"
+                        sect = $0; ispanel = 0; done = 0; print; next
+                    }
+                    /^\[/ {
+                        if (sect != "" && ispanel && !done) print "panelVisibility=3"
+                        sect = ""; ispanel = 0; done = 0; print; next
+                    }
+                    /^plugin=org\.kde\.panel$/ { ispanel = 1 }
+                    /^panelVisibility=/ { done = 1 }
+                    { print }
+                    END { if (sect != "" && ispanel && !done) print "panelVisibility=3" }
+                ' "$_appletsrc" > "$_appletsrc.new" 2>/dev/null && mv "$_appletsrc.new" "$_appletsrc"
+            fi
             chown "$DESKTOP_USER" "$_appletsrc" 2>/dev/null
-            if grep -aq '^panelVisibility=2' "$_appletsrc" 2>/dev/null; then
-                drm_log "面板已设为「窗口可以覆盖」（panelVisibility=2），屏幕键盘会盖住任务栏"
+            if grep -aq '^panelVisibility=3' "$_appletsrc" 2>/dev/null; then
+                drm_log "面板已设为「窗口可以覆盖」（panelVisibility=3），屏幕键盘会盖住任务栏"
                 drm_state_set PANEL_COVER 1
             else
-                drm_warn "panelVisibility 写入失败，面板仍是默认「始终可见」"
+                drm_warn "panelVisibility 写入失败，面板仍是「始终可见」—— 任务栏会盖住键盘最后一行"
             fi
         fi
     fi

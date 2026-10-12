@@ -75,7 +75,25 @@ KeyPad {
 
     // ★ 固定键高 —— 打断 panel.keyHeight 的循环依赖，消除高度振荡。
     //   想调键盘整体高度就改这一个值。
-    readonly property int keyH: 86
+    //
+    // 86 → 64 的原因（2026-10-12，实测）：
+    //   KWin 把输入法面板**贴屏幕底**放置，不理会任务栏的 strut。
+    //   surface 高 434（y=566..1000），任务栏高 50 逻辑像素，正好压在
+    //   键盘最后一行上，把「符号 / 文A / 表情 / 空格 / Chinese」切掉一半。
+    //
+    //   试过让任务栏让开，三条路都不通：
+    //     panelVisibility=2 DodgeWindows    —— KWin 不把 IME 面板当普通窗口
+    //     panelVisibility=3 WindowsCanCover —— 同上
+    //     panelVisibility=1 AutoHide        —— 面板仍画在上面
+    //   所以只能让**键盘自己让位**：Keyboard.qml 里给 keypad 加 52 像素
+    //   底部边距，让按键在任务栏上方结束，任务栏只盖住键盘下方的空白。
+    //
+    //   可用高度因此变矮。具体剩多少**不能靠估** —— 上下边距是 C++ 侧的
+    //   Device.top_margin / Device.bottom_margin，值未知。踩过两次：
+    //   86 时最后一行被挤出屏幕，62 时仍然不够。
+    //   所以 Keyboard.qml 里加了一行 KBGEO 日志把真实几何打出来，
+    //   照日志取值，不要猜。
+    readonly property int keyH: 54
 
     Column {
         id: c1
