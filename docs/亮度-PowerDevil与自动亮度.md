@@ -320,19 +320,45 @@ PowerDevil 没跑的时候，桌面上没有任何东西会按空闲时间熄屏
 ```
 
 > ⚠️ 判据的**边界**（后来才搞清楚，记下来免得误判）：
-> `sysfs == 1` 还有一个来源 —— **PowerDevil 的唤醒淡入**。从
-> `/var/log` 的 PowerDevil 日志能看到它唤醒时会做一段渐变：
+> `sysfs == 1` 还有两个来源 —— **PowerDevil 的唤醒淡入**，以及
+> **电源键熄屏时的 clamp**。所以只看"是不是 1"是不够的：
+>
+> | 现象 | 含义 |
+> |---|---|
+> | `1` **稳定保持**几十秒，且 `screenoff=0` | 空闲熄屏 ← 要关掉的就是它 |
+> | `1` 一闪而过（下一拍回原值） | PowerDevil 唤醒淡入，正常 |
+> | `1` 且 `screenoff=1` | 电源键熄屏；drm-keys 写的 0 被 KWin clamp 成 1 |
+>
+> 淡入的证据（PowerDevil 日志，全程约 1 秒）：
 > ```
 > [BacklightBrightness]: Udev device changed brightness to: 161 … 195 … 232 …
 >                       474 … 598 … 737 … 892 … 976 … 1064 … 1352 … 1679 …
 >                       1918 … 2044 … 2048
 > [BacklightBrightness]: External brightness change observed: 2048 / 4095
 > ```
-> 所以：
-> * **稳定保持**在 1（几十秒不动）= 空闲熄屏（正对照就是这种）
-> * **一闪而过**的 1（下一拍就回到原值）= 唤醒淡入，不是故障
 >
-> 正对照里 1 稳定保持了 25 秒，而淡入全程只有约 1 秒 ⇒ 两者可区分。
+> ⇒ 于是做了**第二轮 A/B**，把 `screenoff` 一起记下来当过滤器：
+>
+> ```
+> 阶段1 正对照 TurnOffDisplayWhenIdle=true / 30s（每 3s 采样，共 120s）
+>   23:35:30 … 23:36:33  sysfs=2048 screenoff=0
+>   23:36:36 … 23:36:39  sysfs=0    screenoff=0    ← 淡出
+>   23:36:42 … 23:37:16  sysfs=1501 screenoff=0    ← 被唤醒，回到用户亮度
+>   23:37:19             sysfs=1    screenoff=0    ← ★ PowerDevil 自己打黑
+>   23:37:22 … 23:37:28  sysfs=0    screenoff=0
+>   ⇒ 命中 1 次
+>
+> 阶段2 最终配置 TurnOffDisplayWhenIdle=false（每 3s 采样，共 120s）
+>   全程只有 sysfs=2048 / 1501 / 0，以及 screenoff=1 的那段（电源键）
+>   ⇒ 命中 0 次
+> ```
+>
+> 这一轮 `systemctl --user restart` 其实是**失败**的（脚本以 root 跑，
+> `systemctl --user` 连不上会话总线：`Failed to connect to user scope bus
+> via local transport: Operation not permitted`）。也就是说两个阶段都没有
+> 重启 PowerDevil —— 行为变化**只**来自 powerdevilrc 的内容变化
+> （PowerDevil 用 KConfigWatcher 监听这个文件）。⇒ 反而更干净：
+> A/B 的变量只有那一个配置项。
 
 配合上游源码语义（`daemon/actions/bundled/dpms.cpp`）：
 
