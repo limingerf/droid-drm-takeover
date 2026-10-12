@@ -34,6 +34,33 @@
  *   · 拼音仍然有效：字母键照常提交字母，libpinyin 词库照常出候选。
  */
 
+/*
+ * ★★★ 为什么要写死键高（keyH）★★★
+ *
+ * 第一版布局照抄原版，让每个键用 CharKey 自己的 height: panel.keyHeight。
+ * 实测这会造成**高度振荡**，键盘一闪一闪：
+ *
+ *     panel.keyHeight (C++) → 布局 implicitHeight → 窗口高度
+ *         → panel 高度 (C++) → panel.keyHeight   ← 闭环
+ *
+ * maliit 靠迭代收敛来解这个环。发行版原版是 **4 行**，总高 438 逻辑像素，
+ * 有余量，能收敛。我们的布局是 **5 行**（多了数字行），总高顶到上限；
+ * 候选条（word ribbon）再占 9 像素，就收敛不了 —— 在 429 和 438 之间
+ * 来回跳。实测高度序列：
+ *
+ *     原版：438 438 390 48 438 48 438        ← 干净两态
+ *     5 行：48 438 429 438 48 438 429 438 …  ← 60 次里变了 59 次
+ *
+ * 429 与 438 差 9 像素，正好是候选条的高度。
+ *
+ * 修法：**给键高一个固定值**，让布局的 implicitHeight 不再依赖
+ * panel.keyHeight，环就断了。代价是键盘高度不再随屏幕自适应 ——
+ * 对固定分辨率的设备（3200x2000）这是可接受的，换来的是不再抖。
+ *
+ * keyH 取值依据：原版 4 行总高 438 ⇒ 约 109/行（含底行与 row_margin）。
+ * 5 行要保持同样的总高，约 438/5 ≈ 87，取 86 留一点余量。
+ */
+
 import QtQuick 2.4
 
 import MaliitKeyboard 2.0
@@ -46,6 +73,10 @@ KeyPad {
     content: c1
     symbols: "languages/Keyboard_symbols_zh-hans.qml"
 
+    // ★ 固定键高 —— 打断 panel.keyHeight 的循环依赖，消除高度振荡。
+    //   想调键盘整体高度就改这一个值。
+    readonly property int keyH: 86
+
     Column {
         id: c1
         anchors.fill: parent
@@ -56,19 +87,19 @@ KeyPad {
             anchors.horizontalCenter: parent.horizontalCenter;
             spacing: 0
 
-            CharKey { label: "1"; shifted: "!"; }
-            CharKey { label: "2"; shifted: "@"; }
-            CharKey { label: "3"; shifted: "#"; }
-            CharKey { label: "4"; shifted: "$"; }
-            CharKey { label: "5"; shifted: "%"; }
-            CharKey { label: "6"; shifted: "^"; }
-            CharKey { label: "7"; shifted: "&"; }
-            CharKey { label: "8"; shifted: "*"; }
-            CharKey { label: "9"; shifted: "("; }
-            CharKey { label: "0"; shifted: ")"; }
-            CharKey { label: "-"; shifted: "_"; }
-            CharKey { label: "="; shifted: "+"; }
-            BackspaceKey {}
+            CharKey { label: "1"; shifted: "!"; height: keyH; }
+            CharKey { label: "2"; shifted: "@"; height: keyH; }
+            CharKey { label: "3"; shifted: "#"; height: keyH; }
+            CharKey { label: "4"; shifted: "$"; height: keyH; }
+            CharKey { label: "5"; shifted: "%"; height: keyH; }
+            CharKey { label: "6"; shifted: "^"; height: keyH; }
+            CharKey { label: "7"; shifted: "&"; height: keyH; }
+            CharKey { label: "8"; shifted: "*"; height: keyH; }
+            CharKey { label: "9"; shifted: "("; height: keyH; }
+            CharKey { label: "0"; shifted: ")"; height: keyH; }
+            CharKey { label: "-"; shifted: "_"; height: keyH; }
+            CharKey { label: "="; shifted: "+"; height: keyH; }
+            BackspaceKey { height: keyH; }
         }
 
         // ── 第 1 行 ──────────────────────────────────────────
@@ -76,18 +107,18 @@ KeyPad {
             anchors.horizontalCenter: parent.horizontalCenter;
             spacing: 0
 
-            CharKey { label: "q"; shifted: "Q"; }
-            CharKey { label: "w"; shifted: "W"; }
-            CharKey { label: "e"; shifted: "E"; extended: ["ē", "é", "ě", "è"]; extendedShifted: ["Ē", "É", "Ě", "È"] }
-            CharKey { label: "r"; shifted: "R"; }
-            CharKey { label: "t"; shifted: "T"; }
-            CharKey { label: "y"; shifted: "Y"; }
-            CharKey { label: "u"; shifted: "U"; extended: ["ū", "ú", "ǔ", "ù"]; extendedShifted: ["Ū", "Ú", "Ǔ", "Ù"] }
-            CharKey { label: "i"; shifted: "I"; extended: ["ī", "í", "ǐ", "ì"]; extendedShifted: ["Ī", "Í", "Ǐ", "Ì"] }
-            CharKey { label: "o"; shifted: "O"; extended: ["ō", "ó", "ǒ", "ò"]; extendedShifted: ["Ō", "Ó", "Ǒ", "Ò"] }
-            CharKey { label: "p"; shifted: "P"; }
-            CharKey { label: "["; shifted: "{"; }
-            CharKey { label: "]"; shifted: "}"; }
+            CharKey { label: "q"; shifted: "Q"; height: keyH; }
+            CharKey { label: "w"; shifted: "W"; height: keyH; }
+            CharKey { label: "e"; shifted: "E"; height: keyH; extended: ["ē", "é", "ě", "è"]; extendedShifted: ["Ē", "É", "Ě", "È"] }
+            CharKey { label: "r"; shifted: "R"; height: keyH; }
+            CharKey { label: "t"; shifted: "T"; height: keyH; }
+            CharKey { label: "y"; shifted: "Y"; height: keyH; }
+            CharKey { label: "u"; shifted: "U"; height: keyH; extended: ["ū", "ú", "ǔ", "ù"]; extendedShifted: ["Ū", "Ú", "Ǔ", "Ù"] }
+            CharKey { label: "i"; shifted: "I"; height: keyH; extended: ["ī", "í", "ǐ", "ì"]; extendedShifted: ["Ī", "Í", "Ǐ", "Ì"] }
+            CharKey { label: "o"; shifted: "O"; height: keyH; extended: ["ō", "ó", "ǒ", "ò"]; extendedShifted: ["Ō", "Ó", "Ǒ", "Ò"] }
+            CharKey { label: "p"; shifted: "P"; height: keyH; }
+            CharKey { label: "["; shifted: "{"; height: keyH; }
+            CharKey { label: "]"; shifted: "}"; height: keyH; }
         }
 
         // ── 第 2 行 ──────────────────────────────────────────
@@ -95,18 +126,18 @@ KeyPad {
             anchors.horizontalCenter: parent.horizontalCenter;
             spacing: 0
 
-            CharKey { label: "a"; shifted: "A"; extended: ["ā", "á", "ǎ", "à"]; extendedShifted: ["Ā", "Á", "Ǎ", "À"] }
-            CharKey { label: "s"; shifted: "S"; }
-            CharKey { label: "d"; shifted: "D"; }
-            CharKey { label: "f"; shifted: "F"; }
-            CharKey { label: "g"; shifted: "G"; }
-            CharKey { label: "h"; shifted: "H"; }
-            CharKey { label: "j"; shifted: "J"; }
-            CharKey { label: "k"; shifted: "K"; }
-            CharKey { label: "l"; shifted: "L"; }
-            CharKey { label: ";"; shifted: ":"; }
-            CharKey { label: "'"; shifted: "\""; }
-            CharKey { label: "\\"; shifted: "|"; }
+            CharKey { label: "a"; shifted: "A"; height: keyH; extended: ["ā", "á", "ǎ", "à"]; extendedShifted: ["Ā", "Á", "Ǎ", "À"] }
+            CharKey { label: "s"; shifted: "S"; height: keyH; }
+            CharKey { label: "d"; shifted: "D"; height: keyH; }
+            CharKey { label: "f"; shifted: "F"; height: keyH; }
+            CharKey { label: "g"; shifted: "G"; height: keyH; }
+            CharKey { label: "h"; shifted: "H"; height: keyH; }
+            CharKey { label: "j"; shifted: "J"; height: keyH; }
+            CharKey { label: "k"; shifted: "K"; height: keyH; }
+            CharKey { label: "l"; shifted: "L"; height: keyH; }
+            CharKey { label: ";"; shifted: ":"; height: keyH; }
+            CharKey { label: "'"; shifted: "\""; height: keyH; }
+            CharKey { label: "\\"; shifted: "|"; height: keyH; }
         }
 
         // ── 第 3 行 ──────────────────────────────────────────
@@ -114,18 +145,18 @@ KeyPad {
             anchors.horizontalCenter: parent.horizontalCenter;
             spacing: 0
 
-            ShiftKey {}
-            CharKey { label: "z"; shifted: "Z"; }
-            CharKey { label: "x"; shifted: "X"; }
-            CharKey { label: "c"; shifted: "C"; }
-            CharKey { label: "v"; shifted: "V"; extended: ["ü", "ǖ", "ǘ", "ǚ", "ǜ"]; extendedShifted: ["Ü", "Ǖ", "Ǘ", "Ǚ", "Ǜ"] }
-            CharKey { label: "b"; shifted: "B"; }
-            CharKey { label: "n"; shifted: "N"; }
-            CharKey { label: "m"; shifted: "M"; }
-            CharKey { label: ","; shifted: "<"; }
-            CharKey { label: "."; shifted: ">"; }
-            CharKey { label: "/"; shifted: "?"; }
-            ShiftKey {}
+            ShiftKey { height: keyH; }
+            CharKey { label: "z"; shifted: "Z"; height: keyH; }
+            CharKey { label: "x"; shifted: "X"; height: keyH; }
+            CharKey { label: "c"; shifted: "C"; height: keyH; }
+            CharKey { label: "v"; shifted: "V"; height: keyH; extended: ["ü", "ǖ", "ǘ", "ǚ", "ǜ"]; extendedShifted: ["Ü", "Ǖ", "Ǘ", "Ǚ", "Ǜ"] }
+            CharKey { label: "b"; shifted: "B"; height: keyH; }
+            CharKey { label: "n"; shifted: "N"; height: keyH; }
+            CharKey { label: "m"; shifted: "M"; height: keyH; }
+            CharKey { label: ","; shifted: "<"; height: keyH; }
+            CharKey { label: "."; shifted: ">"; height: keyH; }
+            CharKey { label: "/"; shifted: "?"; height: keyH; }
+            ShiftKey { height: keyH; }
         }
 
         // ── 第 4 行：符号 / 语言 / 空格 / 回车 ────────────────
@@ -133,7 +164,9 @@ KeyPad {
             anchors.left: parent.left
             anchors.right: parent.right
 
-            height: panel.keyHeight + Device.row_margin;
+            // ★ 同样固定高度，不再用 panel.keyHeight。
+            //   原版这里是 panel.keyHeight + Device.row_margin，参与循环。
+            height: keyH
 
             SymbolShiftKey { id: symShiftKey; label: "符号";              anchors.left: parent.left; height: parent.height; }
             LanguageKey    { id: languageMenuButton;                     anchors.left: symShiftKey.right; height: parent.height; }
