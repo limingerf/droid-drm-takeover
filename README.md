@@ -184,6 +184,9 @@ display/
   keepbright.sh           背光钉住
   dmesg-harvester.sh      周期收割安卓 dmesg
   drm-diag-once.sh        新设备适配取证
+audio/
+  ct-snd-nodes.sh         容器内补 /dev/snd 节点（★ 已实测；⚠️ 节点齐 ≠ 能出声）
+  README.md               音频三层问题模型 + A 路（直连 vendor HAL）移植清单
 tools/
   runtime/                脚本硬依赖的 6 个（kwinwrap 等）
   probe/                  适配期探针
@@ -206,6 +209,16 @@ Makefile                  make（全部）/ make runtime（最小集）
 - **彻底断网根因**：接管后 SF 停 ~120s，安卓 system_server watchdog 会杀 system_server，init 级联
   SIGKILL wpa_supplicant/netd/zygote → WiFi 掉线且 UI 不可用，只能强重启。对策：接管前解除
   watchdog（`watchdog_timeout`/`nativehang`/`stay_on`）+ wake_lock 钉住。
+- **同一个 watchdog 循环也把音频打死**（2026-10-12 实测）：SF 停而 system_server 活着时，
+  `SystemServer.startBootstrapServices` 会在 `SurfaceSession` →
+  `ComposerServiceAIDL::connectLocked` → `AServiceManager_waitForService(SurfaceFlinger)`
+  **无限阻塞**（该调用没有超时），主线程卡 66s → watchdog 杀 → 重启，**周期恒为 78.9s**。
+  后果是 `activity`/`package`/`window`/`settings`/`media.audio_flinger`/`media.audio_policy`
+  从未注册，`AudioFlinger` 自己报
+  `hasAidlHalService android.hardware.audio.core.IModule/default: false`
+  ⇒ **安卓侧音频栈整体不可用**（不是容器的问题）。取证与结论见
+  [docs/音频诊断-2026-10-12.md](docs/音频诊断-2026-10-12.md) §4。
+  对策同样是上面那条（解除 watchdog），或者彻底 `stop` framework 后走 A 路直连 HAL。
 - **接管与回滚脚本都必须与将被它们杀掉的 GUI 栈脱钩**（`setsid` 后台 + 重试 + `fuser -k` 兜底）。
   我们被这事咬了两次：desk-stop 和 desk-takeover 从桌面终端启动时，杀掉 kwin 的瞬间终端连带
   脚本一起死，安卓又已 stop → 两头全黑。
