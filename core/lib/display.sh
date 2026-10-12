@@ -1509,21 +1509,55 @@ drm_start_desktop() {
         drm_log "Qt Quick 后端固定为 $DEV_QT_QUICK_BACKEND"
     fi
 
-    # ★★ 输入法环境（2026-10-12 新增）★★
-    # 重构前这里把 QT_IM_MODULE / GTK_IM_MODULE / XMODIFIERS 全部 `env -u` 摘掉，
-    # 后果是**装好 fcitx5 也永远不会被应用加载**（Qt/GTK 只认这几个变量）。
-    # 现在：装了 fcitx5 就指向它，没装才摘掉。
-    # ★ 注意 fcitx5 只负责"输入法引擎"（物理键盘打中文），
-    #   **不提供触摸屏虚拟键盘** —— 虚拟键盘是 maliit-keyboard，见
-    #   drm_start_input_methods()。触摸屏上输 WiFi 密码靠的是后者。
+    # ★★ 输入法环境（2026-10-12 重大修正）★★
+    #
+    # ★★★ 结论：**不要注入 QT_IM_MODULE=fcitx 这一套，也不要跑 fcitx5。** ★★★
+    #
+    # 历史：重构前这里把 QT_IM_MODULE / GTK_IM_MODULE / XMODIFIERS 全部 `env -u`
+    # 摘掉，当时认为"摘掉就没输入法了"，于是改成"装了 fcitx5 就指向它"。
+    # 这个改动是**错的**，它是键盘一闪一闪的根因。
+    #
+    # ★ 实测根因（有完整证据，见 docs/键盘一闪一闪-输入法冲突.md）：
+    #   容器里同时装了 fcitx5 和 maliit-keyboard，而 maliit-keyboard 是 KWin
+    #   通过 Wayland 的 zwp_input_method_v1 协议拉起来的**合成器级输入法**。
+    #   我们又装了 fcitx5-module-wayland，它让 fcitx5 也走 Wayland 输入法协议。
+    #   于是同一个文本框被两个输入法同时响应：
+    #       应用获得焦点 → KWin 给 maliit 发 activate → 键盘弹出（报高 429）
+    #       → fcitx5 的候选窗抢走焦点 → KWin 给 maliit 发 deactivate
+    #       → 键盘收起（报高 39）→ 焦点回到应用 → 又 activate → 无限循环
+    #   在 kwin.log 里就是这两行交替刷：
+    #       keyboard is reporting <x y w h>: < 0 571 1600 429 >
+    #       keyboard is reporting <x y w h>: < 0 961 1600 39 >
+    #   实测统计：一次会话里 activate 82 次 / deactivate 80 次 /
+    #   InputMethodContext 析构 80 次，且循环**自行持续**，无需用户操作。
+    #   这就是用户描述的"拖影还会一闪一闪的"。
+    #
+    # ★ 判决实验：pkill -x fcitx5 之后，30 秒内 "keyboard is reporting"
+    #   增长 **0** 次（基线 309 → 309），循环彻底停止。
+    #
+    # ★ 而且 fcitx5 在这里**根本没被任何应用用上**：实测 /etc/environment、
+    #   plasmashell 的环境里都没有 QT_IM_MODULE/GTK_IM_MODULE/XMODIFIERS。
+    #   中文拼音是 maliit 自己在做（maliit-keyboard 包自带 zh-hans 插件和
+    #   libpinyin 词库），用户已确认"输入法能打字"。
+    #   所以 fcitx5 在这里纯粹是制造冲突的负担。
+    #
+    # ★ 触摸屏要的是**屏幕键盘**，而 fcitx5 不提供虚拟键盘（实测结论），
+    #   只有 maliit 能弹。所以正确组合是：**只跑 maliit，不跑 fcitx5。**
+    #
+    # ★ 想改用 fcitx5 做物理键盘输入法的话，必须**同时**满足两条，否则
+    #   又会开始闪：把 maliit 从 kwinrc 的 InputMethod 摘掉（否则两个抢），
+    #   并设 DEV_IM_FCITX=1 打开下面的开关。
     _im_env=""
-    if ds_exec 'command -v fcitx5 >/dev/null 2>&1' >/dev/null 2>&1; then
+    if [ "${DEV_IM_FCITX:-0}" = 1 ]; then
         _im_env="QT_IM_MODULE=fcitx GTK_IM_MODULE=fcitx XMODIFIERS=@im=fcitx"
         _im_env="$_im_env SDL_IM_MODULE=fcitx GLFW_IM_MODULE=ibus"
-        drm_log "输入法：fcitx5（QT/GTK/X11 均已指向）"
+        drm_log "输入法：fcitx5 已启用（DEV_IM_FCITX=1）—— 注意此时必须同时摘掉 kwinrc 的 InputMethod，否则键盘会闪"
     else
+        # 默认路径：交给 Wayland 输入法协议（KWin + maliit）。
+        # 把 fcitx 的变量摘干净，避免应用去连一个没在跑的 fcitx5。
         _im_env="-u QT_IM_MODULE -u GTK_IM_MODULE -u XMODIFIERS"
         _im_env="$_im_env -u SDL_IM_MODULE -u GLFW_IM_MODULE"
+        drm_log "输入法：走 Wayland 协议（KWin + maliit），已摘掉 fcitx 变量"
     fi
 
     setsid nohup runuser -u "$DESKTOP_USER" -- \
@@ -1791,12 +1825,16 @@ drm_start_input_methods() {
     fi
 
     _ok=0
-    for _c in fcitx5 maliit-keyboard; do
+    # ★ 判据是**必须有 maliit**，不能是"fcitx5 或 maliit 有其一"。
+    #   触摸屏要的是屏幕键盘，只有 maliit 能弹；fcitx5 不提供虚拟键盘。
+    #   早先写成 `for _c in fcitx5 maliit-keyboard` 只要有一个就算过，
+    #   结果只装了 fcitx5 的机器会走到下面却发现没有键盘可用。
+    for _c in maliit-keyboard; do
         ds_exec "command -v $_c >/dev/null 2>&1" >/dev/null 2>&1 && _ok=1
     done
     if [ "$_ok" = 0 ]; then
-        drm_warn "容器里没装 fcitx5/maliit-keyboard，跳过输入法"
-        drm_warn "  装法：network/net-takeover.sh deps（或在容器里 apt-get install fcitx5 maliit-keyboard）"
+        drm_warn "容器里没装 maliit-keyboard，跳过输入法（触摸屏将没有屏幕键盘）"
+        drm_warn "  装法：network/net-takeover.sh deps（或在容器里 apt-get install maliit-keyboard）"
         return 0
     fi
 
@@ -1805,8 +1843,23 @@ drm_start_input_methods() {
     ds_exec 'pkill -x fcitx5 2>/dev/null; pkill -x maliit-keyboard 2>/dev/null; true' >/dev/null 2>&1
     sleep 1
 
-    # fcitx5：输入法引擎
-    if ds_exec 'command -v fcitx5 >/dev/null 2>&1' >/dev/null 2>&1; then
+    # ★★ 默认**不启动 fcitx5** ★★
+    #
+    # 这里是键盘一闪一闪的根因所在。容器里 fcitx5 和 maliit-keyboard 同时存在，
+    # 而 fcitx5-module-wayland 让 fcitx5 也走 Wayland 输入法协议，于是和
+    # KWin 拉起的 maliit 抢同一个文本框，焦点来回跳 ⇒ 键盘在"显示/隐藏"之间
+    # 无限循环 ⇒ 用户看到一闪一闪。
+    #
+    # 判决实验：pkill -x fcitx5 后 30 秒内 kwin.log 的 "keyboard is reporting"
+    # 增长 0 次（基线 309 → 309）。完整证据见
+    # docs/键盘一闪一闪-输入法冲突.md。
+    #
+    # ★ 上面那行 pkill 保留是**故意**的：上一次会话若留下了 fcitx5 进程，
+    #   不清掉就会立刻开始闪。所以"清掉残留"和"不再拉起"两件事都要做。
+    #
+    # 要用 fcitx5 的话设 DEV_IM_FCITX=1，并且**必须同时**把 maliit 从 kwinrc
+    # 的 InputMethod 摘掉，否则两个输入法会继续互相抢焦点。
+    if [ "${DEV_IM_FCITX:-0}" = 1 ] && ds_exec 'command -v fcitx5 >/dev/null 2>&1' >/dev/null 2>&1; then
         setsid nohup runuser -u "$DESKTOP_USER" -- \
             env -u DISPLAY $_unset_env \
                 WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
@@ -1816,7 +1869,11 @@ drm_start_input_methods() {
                 XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
                 $_im \
             fcitx5 -d >>"${DRM_LOG_DIR}/fcitx5.log" 2>&1 &
-        drm_log "已拉起 fcitx5（引擎）"
+        drm_log "已拉起 fcitx5（DEV_IM_FCITX=1）"
+        drm_warn "  ★ fcitx5 与 maliit 同时当输入法会互相抢焦点，键盘会一闪一闪"
+        drm_warn "  ★ 请同时把 kwinrc 的 [Wayland] InputMethod 摘掉"
+    else
+        drm_log "不启动 fcitx5（默认）：输入法交给 KWin + maliit 的 Wayland 协议"
     fi
 
     # ── maliit 的活跃语言：必须用 GSettings 设，环境变量完全无效 ──
