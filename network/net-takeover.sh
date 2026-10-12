@@ -654,19 +654,35 @@ nt_fix_dns() {
 #     ① 把 flags 归位到 1（代理模式，图形界面可提示）
 #     ② 加载 kded 模块，让代理真正注册
 nt_fix_secrets() {
-    drm_log "确保 WiFi 密钥走代理模式（图形界面可提示输密码）"
+    drm_log "确保 WiFi 密钥可保存（图形界面能记住密码）"
     ds_exec 'for f in /etc/NetworkManager/system-connections/*.nmconnection; do
                  [ -f "$f" ] || continue
-                 # 有 psk 字面值 ⇒ 保持 NM 持有也可以，但统一回 1 更一致：
-                 # 图形界面能提示、也能改密码。
+                 _n=$(basename "$f")
+                 # ★★★ 2026-10-13 更正 ★★★
+                 #   原来的实现是"无条件把 psk-flags 归位到 1"。那是**错的**：
+                 #   本容器的 KWallet 是坏的（kwalletd6 一被调用就 SIGABRT，
+                 #   钱包文件永远建不出来，见 docs/WiFi密码保存-kwalletd6崩溃.md），
+                 #   所以 flags=1 时密钥只活在 plasmashell 的内存里，
+                 #   **重启桌面就丢**，用户每次都要重输密码 —— 这正是
+                 #   "WiFi 密码保存失效"的根因。
+                 #
+                 #   正确判据是**文件里到底有没有 psk 字面值**：
+                 #     · 有 psk=  → flags 必须是 0（NM 自己保管），
+                 #                  改成 1 反而会让 NM 把已有的密码当没看见
+                 #     · 没有 psk= → 只能靠代理，flags 保持 1
+                 #   所以这里**只做一致性纠正**，不再单方向覆盖。
                  if grep -q "^psk=" "$f"; then
-                     echo "  [信息] $(basename "$f")：文件里有 psk 字面值"
+                     sed -i "s/^psk-flags=1$/psk-flags=0/" "$f"
+                     _f=$(grep -o "psk-flags=." "$f" | head -1 | cut -d= -f2)
+                     echo "  [OK] $_n：文件里有 psk 字面值 → psk-flags=${_f:-未设置}（0=NM 自己保管，重启不丢）"
+                 else
+                     sed -i "s/^psk-flags=0$/psk-flags=1/" "$f"
+                     _f=$(grep -o "psk-flags=." "$f" | head -1 | cut -d= -f2)
+                     echo "  [提示] $_n：没有 psk 字面值 → psk-flags=${_f:-未设置}（1=代理持有）"
+                     echo "         代理（KWallet）在本容器里不可用 ⇒ 密码重启会丢。"
+                     echo "         要让它记住，跑一次：wifi-save-password"
                  fi
-                 # ★ 只往 1 归位，绝不改成 0
-                 sed -i "s/^psk-flags=0$/psk-flags=1/" "$f"
                  chmod 600 "$f"
-                 _f=$(grep -o "psk-flags=." "$f" | head -1 | cut -d= -f2)
-                 echo "  [OK] $(basename "$f")：psk-flags=${_f:-未设置}（1=代理持有，图形界面会提示）"
              done
              systemctl is-active NetworkManager' 2>&1 | tr -d '\r' | sed 's/^/    /'
 

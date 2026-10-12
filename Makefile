@@ -46,13 +46,22 @@ BLD ?= build
 #   kwinwrap    DRM 交接桥（全项目心脏）
 #   setbright   背光（5 个脚本共 8 处调用，没有 fallback）
 #   setprop     connector 属性写（DPMS 点亮）
+#   drmbl       ★ 真正的熄面板（写 DRM connector 的 brightness）。
+#               为什么必须有它：本机 sysfs /sys/class/backlight 是**死的**
+#               （内核 dmesg: `bypass bl 0`，写 brightness=0/bl_power=4 都无效），
+#               唯一生效的是 DRM connector 属性；而那个属性没有 ATOMIC 位、
+#               又要求 master 权限，从外面写一律 EACCES。
+#               drmbl 用 pidfd_getfd(2) 从 KWin 那里偷一份 master fd 出来解决权限。
+#               ★ 它**只写 brightness，不碰 DPMS** —— DPMS 归 KWin 管，从旁边改
+#                 会让 KWin 原子提交全部 EINVAL（双 DSI 面板会左半屏不亮）。
+#               详见 tools/runtime/drmbl.c 顶部注释。
 #   crtcstate   取证
 #   connprops   取证
 #   atomicspy.so LD_PRELOAD 钩子，录每次 atomic commit
 #   drmfmt.so   LD_PRELOAD 钩子，摘掉 10 位像素格式（面板噪声修复，见下）
 #   touchabs.so LD_PRELOAD 钩子，改写触摸位置轴的 EVIOCGABS 量程
 #               （触摸方向修复，见下 —— 与 drmfmt.so 一起进 KWin 的 LD_PRELOAD）
-RUNTIME_TOOLS := kwinwrap setbright setprop crtcstate connprops
+RUNTIME_TOOLS := kwinwrap setbright setprop drmbl crtcstate connprops
 RUNTIME_LIBS  := $(BIN)/atomicspy.so $(BIN)/drmfmt.so $(BIN)/touchabs.so
 
 # ── probe：设备适配期用，不参与日常流程 ──

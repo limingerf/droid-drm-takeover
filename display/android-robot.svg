@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  android-robot.svg —— 经典 Android 机器人（bugdroid）。
+
+  用途：桌面「返回安卓」快捷方式的图标（见 display/android-return-icon.sh）。
+
+  ★ 为什么自己画而不是复用主题里的图标：
+    breeze / Adwaita 里只有 android-file-transfer、android-studio、
+    folder-android 这几个，**没有**经典机器人本体。用户明确要的是
+    "经典的安卓机器人"，所以这里按官方那个形状重画：绿色圆顶头 +
+    两根斜天线 + 两只白眼 + 圆角身体/手臂/腿。
+
+  颜色用官方品牌绿 #A4C639。用 currentColor 会让它在深色主题下变色，
+  所以这里写死 —— 机器人的辨识度就靠这个绿。
+
+  viewBox 512x512，头是上半圆（A 指令，sweep=1 在 y 轴向下的坐标系里
+  就是向上鼓），天线底端故意埋在头里面，这样接头处是干净的。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Android</title>
+
+  <!-- 天线（先画，被头盖住底部） -->
+  <g stroke="#A4C639" stroke-width="24" stroke-linecap="round" fill="none">
+    <line x1="170" y1="148" x2="207" y2="208"/>
+    <line x1="342" y1="148" x2="305" y2="208"/>
+  </g>
+
+  <!-- 头：上半圆 -->
+  <path d="M120 270 A136 136 0 0 1 392 270 Z" fill="#A4C639"/>
+
+  <!-- 眼睛 -->
+  <circle cx="200" cy="216" r="18" fill="#FFFFFF"/>
+  <circle cx="312" cy="216" r="18" fill="#FFFFFF"/>
+
+  <!-- 手臂 -->
+  <rect x="46"  y="300" width="42" height="132" rx="21" fill="#A4C639"/>
+  <rect x="424" y="300" width="42" height="132" rx="21" fill="#A4C639"/>
+
+  <!-- 身体 -->
+  <rect x="100" y="300" width="312" height="142" rx="22" fill="#A4C639"/>
+
+  <!-- 腿 -->
+  <rect x="140" y="442" width="42" height="82" rx="21" fill="#A4C639"/>
+  <rect x="330" y="442" width="42" height="82" rx="21" fill="#A4C639"/>
+</svg>

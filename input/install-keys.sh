@@ -67,6 +67,22 @@ case "${1:-}" in
         say "已停"
         exit 0 ;;
     --status)
+        # ★ 三个文件都要报：少装 lockscreen.sh 会让电源键静默退化成"只熄屏"，
+        #   少装 drmbl 会让"熄面板"退化成"最暗"。
+        if [ -f /usr/local/bin/lockscreen.sh ]; then
+            say "lockscreen.sh 已装（电源键可锁屏）"
+        else
+            say "★ lockscreen.sh 未装 ⇒ 电源键只会熄屏，不会锁屏"
+        fi
+        if [ -x /usr/local/bin/drmbl ]; then
+            if /usr/local/bin/drmbl probe >/dev/null 2>&1; then
+                say "drmbl 已装且可用（面板可真正熄灭）"
+            else
+                say "★ drmbl 装了但拿不到 master fd ⇒ 面板只会「最暗」，不会全黑"
+            fi
+        else
+            say "★ drmbl 未装 ⇒ 面板只会「最暗」，不会全黑"
+        fi
         [ -f "$DST" ] && exec python3 "$DST" --status
         say "还没装（$DST 不存在）"
         exit 1 ;;
@@ -82,6 +98,56 @@ stop_daemon
 mkdir -p /usr/local/bin
 cp "$SRC" "$DST" || { say "拷贝到 $DST 失败" >&2; exit 1; }
 chmod 755 "$DST"
+
+# ★★★ 锁屏辅助脚本必须和 drm-keys.py **放在同一目录** ★★★
+#
+# drm-keys.py 里的 LOCK_SCRIPT 是 `dirname(__file__)/lockscreen.sh`。
+# 电源键短按要调它来完成「锁屏 + 熄面板」。
+#
+# ⚠️ 少装它不会报错 —— 代码里有回退路径（_lock_run 返回 127 ⇒ 退化成
+#    普通的"只熄屏"）。也就是说**表面上电源键还能用，实际没有锁屏**。
+#    这种静默降级是最难查的一类问题，所以这里必须装，且失败要出声。
+LOCKS="$SELF_DIR/lockscreen.sh"
+LOCKDST=/usr/local/bin/lockscreen.sh
+if [ -f "$LOCKS" ]; then
+    if cp "$LOCKS" "$LOCKDST"; then
+        chmod 755 "$LOCKDST"
+    else
+        say "警告：拷贝 lockscreen.sh 到 $LOCKDST 失败 ⇒ 电源键将退化为「只熄屏」" >&2
+    fi
+else
+    say "警告：找不到 $LOCKS ⇒ 电源键将退化为「只熄屏」（没有锁屏）" >&2
+fi
+
+# ★★★ 熄面板的工具 drmbl 也必须装 ★★★
+#
+# lockscreen.sh 的 panel-off 靠 `drmbl blank` 把 DRM connector 的 brightness
+# 写成 0 —— 这是本机**唯一**有效的熄屏手段（sysfs 那条路被内核 bypass 了，
+# 见 input/lockscreen.sh 文件头）。少了它，电源键只会「锁屏 + 最暗」，
+# 面板并不会真正熄灭。
+#
+# 跟 lockscreen.sh 一样，少装它是**静默降级**（_drmbl_run 返回 127，日志里
+# 只会有一行 "!! drmbl blank 失败"），所以这里必须装，且失败要出声。
+DRMBL_SRC=""
+for _c in "$SELF_DIR/../bin/drmbl" "$SELF_DIR/drmbl"; do
+    [ -x "$_c" ] && { DRMBL_SRC=$_c; break; }
+done
+DRMBL_DST=/usr/local/bin/drmbl
+if [ -n "$DRMBL_SRC" ]; then
+    if cp "$DRMBL_SRC" "$DRMBL_DST" && chmod 755 "$DRMBL_DST"; then
+        # 装完立刻自检：它必须真的能从 KWin 那里拿到 master fd，
+        # 否则装了个跑不起来的二进制比不装更糟（看起来"装了"）。
+        if ! "$DRMBL_DST" probe >/dev/null 2>&1; then
+            say "警告：drmbl 装好了但 probe 失败（拿不到 DRM master fd）" >&2
+            say "      ⇒ 电源键会退化为「锁屏 + 最暗」，面板不会真正熄灭" >&2
+            "$DRMBL_DST" probe 2>&1 | sed 's/^/      /' >&2
+        fi
+    else
+        say "警告：拷贝 drmbl 到 $DRMBL_DST 失败 ⇒ 面板无法真正熄灭（只会最暗）" >&2
+    fi
+else
+    say "警告：找不到 bin/drmbl（先跑 make runtime）⇒ 面板无法真正熄灭（只会最暗）" >&2
+fi
 
 # ★ 把运行参数写进一个 env 文件，方便以后调参不用改脚本。
 #   守护的默认值已经是本机验证过的，这里只在环境里显式给了才写。

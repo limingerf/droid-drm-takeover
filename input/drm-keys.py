@@ -102,6 +102,7 @@
 # 环境变量：
 #   VOL_STEP=5        音量每档百分比
 #   LONG_MS=1500      长按判定（≥ 此值一律忽略）
+#   MIN_MS=30         最短有效按下（< 此值判为硬件幽灵事件；本机电源键会发 0~1ms 假配对）
 #   DEBOUNCE_MS=250   同一键的防抖
 #   SCREEN_WATCHDOG_S=300  熄屏后最多保持多少秒（0=不限）—— 防"守护死了屏幕还黑着"
 #   FIXED_DEV_VOL=...  指定音量设备（自测用）
@@ -152,12 +153,51 @@ PIDF, LOG, STATEF, BL_SAVE, LOCKF = _state_paths(_ST)
 #   本机 max_brightness=4095，KDE 默认 20% ⇒ 819；这里给 2048（≈50%）是
 #   接管脚本里 DEV_BRIGHTNESS 的默认量级，足够看清。
 BL_FALLBACK = int(os.environ.get('BL_FALLBACK', '2048'))
-# 保存亮度时的最小可用值：低于它的读数视为"脏值"（安卓关机残留），
-# 不作为"用户原亮度"保存，亮屏时改用 BL_FALLBACK。
-BL_MIN = int(os.environ.get('BL_MIN', '10'))
+# 保存亮度时的最小可用值：低于它的读数视为"脏值"，不作为"用户原亮度"保存，
+# 亮屏时改用 BL_FALLBACK。
+#
+# ★★★ 2026-10-12 从固定值 10 改成「max_brightness 的百分比」★★★
+#
+# 起因（实测日志）：
+#     bl_save: 保存用户亮度 131
+# 守护重启时，PowerDevil 正好把它自己的调光值 131（≈3%）写进了 sysfs，
+# 于是 131 被当成"用户原亮度"存下来 —— 之后每次亮屏都恢复到 131，
+# 屏幕暗到几乎看不见，而日志看起来完全正常。
+#
+# 131 > 旧的阈值 10，所以旧的固定阈值拦不住。
+# 改成百分比后：本机 max=4095，5% = 204 > 131 ⇒ 被正确拒绝。
+#
+# ⚠️ 副作用：用户真的把亮度调到 5% 以下时不会被记住，亮屏会回到兜底值。
+#    这是刻意的取舍 —— "记错亮度导致屏幕看不见"比"亮度没记住"严重得多。
+BL_MIN_PCT = int(os.environ.get('BL_MIN_PCT', '5'))
+
+
+def _bl_min_value():
+    """脏值判定的阈值：max_brightness 的 BL_MIN_PCT%，读不到 max 时退回 200。"""
+    m = None
+    try:
+        m = int(open(BLDIR + '/max_brightness').read().strip()) if BLDIR else None
+    except Exception:
+        m = None
+    if not m or m <= 0:
+        return 200
+    return max(1, m * BL_MIN_PCT // 100)
+
+
+# 显式给了 BL_MIN 就用它，否则用百分比算（延迟到 BLDIR 可用之后算不了，
+# 所以在 bl_save() 里调用 _bl_min_value()）。
+BL_MIN = int(os.environ.get('BL_MIN', '0')) or None
 # 是否在设背光时同时同步 PowerDevil 的亮度（见下面 _bl_set_via_powerdevil 注释）。
 # 关掉它只是让熄屏"更容易被 PowerDevil 抢回去"，一般不要关。
 POWERDEVIL_BRIGHTNESS = os.environ.get('POWERDEVIL_BRIGHTNESS', '1') != '0'
+
+# 熄屏走哪条路（2026-10-13 新增）。
+#   'crtc'（默认）—— 写 CRTC 的 ACTIVE=0/1，**安卓同款**。唤醒时是完整
+#                    modeset，两条 DSI 链路都会重新初始化 ⇒ 不会只亮半边。
+#   'dpms'        —— 旧的 DPMS 路径。唤醒后双 DSI 面板可能只亮半边，
+#                    留作排查/兜底。
+# 两者的根因和实测对比见 crtc() 的注释。
+PANEL_OFF_MODE = os.environ.get('PANEL_OFF_MODE', 'crtc').lower()
 LOCKF = '/run/drm-keys.lock'            # 单例锁
 
 RUNDIR = os.environ.get('RUNDIR', '/run/user/1000')
@@ -165,7 +205,29 @@ DESKTOP_USER = os.environ.get('DESKTOP_USER', '')       # 空则运行时解析
 WAYLAND_DISPLAY = os.environ.get('WAYLAND_DISPLAY', '')
 
 
-def detect_wayland_display():
+def _wl_alive(name):
+    """缓存下来的 socket 名还有效吗？
+
+    ★★ 2026-10-12 新增：原来 detect_wayland_display() **探到一次就永久缓存**，
+      再也不校验。于是出现下面两种失效，现象都是 kscreen-doctor rc=134：
+        ① KWin 重启（display/kwin-restart.sh 会做）⇒ socket 换成新的，
+           旧名字还在缓存里 ⇒ Failed to create wl_display
+        ② socket 短暂消失（KWin 正在重建 / 会话切换瞬间）
+      现象极具误导性：**背光那半成功了**（背光=0），只有 DPMS 那半失败，
+      看起来"熄屏了"（真的黑），实际显示管线还在扫。
+      ⇒ 所以每次用之前都验一下；失效就重探。
+    """
+    if not name:
+        return False
+    p = os.path.join(RUNDIR, name)
+    try:
+        import stat as _st
+        return _st.S_ISSOCK(os.stat(p).st_mode)
+    except Exception:
+        return False
+
+
+def detect_wayland_display(force=False):
     """运行时探测 Wayland socket 名。
 
     ★★ 2026-10-12 实测的坑：守护是 `droidspaces run` 起的，
@@ -185,10 +247,15 @@ def detect_wayland_display():
         Wayland 协议规定服务端会建 <socket>.lock 做互斥。
         本机实测 /run/user/1000/ 下：taketest + taketest.lock ✓
         （对照：pipewire-0 也有 .lock，所以还要排除已知的非 wayland 名。）
+
+    ★★ 第三个坑（2026-10-12 又修一次）：**缓存会失效**，见 _wl_alive()。
+      force=True 强制重探；默认也会先校验缓存。
     """
     global WAYLAND_DISPLAY
-    if WAYLAND_DISPLAY:
+    if WAYLAND_DISPLAY and not force and _wl_alive(WAYLAND_DISPLAY):
         return WAYLAND_DISPLAY
+    if WAYLAND_DISPLAY and force:
+        WAYLAND_DISPLAY = ''
     NOT_WL = ('pipewire', 'pulse', 'bus', 'dbus', 'systemd', 'gnupg',
               'dconf', 'gvfs', 'ssh', 'drkonqi', 'openssh')
     cands = []
@@ -224,6 +291,45 @@ def detect_wayland_display():
 VOL_STEP = int(os.environ.get('VOL_STEP', '5'))
 LONG_MS = int(os.environ.get('LONG_MS', '1500'))
 DEBOUNCE_MS = int(os.environ.get('DEBOUNCE_MS', '250'))
+# ★★★ 最短有效按下时长（2026-10-12 新增）★★★
+#
+# 本机的电源键**会发出幽灵事件**：一次真实按键会伴随若干组
+# "按下→立刻抬起"的配对，实测时长是 **1ms 和 0ms**。
+#
+# 后果（实测日志，用户只按了一次）：
+#     00:21:39 电源键短按 180ms ⇒ 锁屏 + 熄面板     ← 真实的那次
+#     00:21:41 电源键短按   1ms ⇒ 锁屏中，点亮面板   ← 幽灵
+#     00:21:42 电源键短按   0ms ⇒ 锁屏中，熄灭面板   ← 幽灵
+#     00:21:46 电源键短按 206ms ⇒ 锁屏中，点亮面板   ← 用户第二次按
+#     00:21:47 电源键短按 288ms ⇒ 锁屏中，熄灭面板
+# ⇒ 面板被反复翻转，最终停在用户没预期的状态（"锁屏了但面板没灭"）。
+#
+# DEBOUNCE_MS 拦不住它们，因为幽灵事件之间的间隔 > 250ms。
+# 真正可靠的判据是**按下时长**：人按不动 30ms 以下。
+#
+# 注意别设太大：设成 100ms 会开始丢掉真实的"轻点"。
+MIN_MS = int(os.environ.get('MIN_MS', '30'))
+# ★★★ 动作后冷却（2026-10-13 新增）★★★
+#
+# MIN_MS 只能滤掉 0~1ms 的幽灵配对，**滤不掉时长看起来正常的那些**。
+# 实测（用户只按了一次电源键，日志里出现三次"合理"时长）：
+#     电源键短按 169ms ⇒ 锁屏中，点亮面板
+#     电源键短按 192ms ⇒ 锁屏中，熄灭面板
+#     电源键短按 169ms ⇒ 锁屏中，点亮面板
+# ⇒ 面板连翻三次，停在用户没预期的状态。
+#
+# 根因：PMIC 在按键释放瞬间会重复上报几组**完整的** press/release，
+# 每组时长都像真人按的，所以任何基于"单次时长"的判据都拦不住它们
+# （MIN_MS 提大会开始丢真实的轻点，得不偿失）。
+#
+# 唯一可靠的判据是**时间**：真人不可能在 1 秒内连按两次电源键。
+#
+# ⇒ 动作执行后进入冷却，冷却期内忽略一切电源键事件。
+#
+# ★ 注意冷却只在**真正执行了动作之后**才续期，不在"收到事件"时续期。
+#   否则幽灵事件会一直把窗口往后推，用户的真实按键反而被吃掉。
+#   （实现上：冷却检查放在 MIN_MS 过滤**之后**，续期放在动作分支**之前**。）
+PWR_COOLDOWN_MS = int(os.environ.get('PWR_COOLDOWN_MS', '1200'))
 WATCHDOG_S = int(os.environ.get('SCREEN_WATCHDOG_S', '300'))
 FIXED_VOL = os.environ.get('FIXED_DEV_VOL', '')
 FIXED_PWR = os.environ.get('FIXED_DEV_PWR', '')
@@ -434,7 +540,8 @@ def bl_save():
         而不是让函数自己去读那个即将被改写的标志。
     """
     v = bl_get()
-    if v and v >= BL_MIN:
+    _min = BL_MIN if BL_MIN else _bl_min_value()
+    if v and v >= _min:
         try:
             with open(BL_SAVE, 'w') as f:
                 f.write(str(v))
@@ -442,8 +549,9 @@ def bl_save():
         except Exception as e:
             log("  bl_save: 写 %s 失败 %s" % (BL_SAVE, e))
     elif v:
-        log("  bl_save: 当前背光 %s 低于可用阈值 %s，不保存（亮屏时用兜底 %s）"
-            % (v, BL_MIN, BL_FALLBACK))
+        log("  bl_save: 当前背光 %s 低于可用阈值 %s（max 的 %d%%）⇒ 不保存，"
+            "亮屏时用兜底 %s。常见原因：PowerDevil 的调光值被读成了用户亮度"
+            % (v, _min, BL_MIN_PCT, BL_FALLBACK))
     else:
         log("  bl_save: 读不到背光，不保存")
 
@@ -545,19 +653,38 @@ _SCREEN_OFF_STOLEN = [0]
 
 
 def _enforce_screen_off():
-    """熄屏期间把 sysfs 背光钉在 0。返回 True 表示这次是"从别人手里抢回来"的。"""
+    """熄屏期间把背光钉在 0。返回 True 表示这次是"从别人手里抢回来"的。
+
+    ★ 2026-10-13 改成走 drmbl（DRM connector 属性）而不是 sysfs：
+      本机 sysfs 被内核 bypass（dmesg: `bypass bl 0`），写它完全无效，
+      所以旧版这个函数其实一直在做无用功（日志还刷 "背光被人写成 X"）。
+      现在读写的都是真正生效的那个属性。
+    """
     if not screen_is_off():
         return False
-    cur = bl_get()
+    d_rc, d_out = _drmbl('show')
+    cur = None
+    if d_rc == 0:
+        # 输出形如 "connector 67  brightness=2048  DPMS=0"
+        for _t in d_out.replace('\n', ' ').split():
+            if _t.startswith('brightness='):
+                try:
+                    cur = int(_t.split('=', 1)[1])
+                except ValueError:
+                    cur = None
+                break
     if cur == 0:
         return False
-    bl_set(0)
+    d_rc, d_out = _drmbl('blank')
+    if d_rc != 0:
+        # 回退 sysfs（本机无效，但换了面板可能有效）
+        bl_set(0)
     _SCREEN_OFF_STOLEN[0] += 1
     n = _SCREEN_OFF_STOLEN[0]
     # 只在第 1 次和每 20 次记日志，避免刷屏
     if n == 1 or n % 20 == 0:
-        log("  !! 熄屏期间背光被人写成 %s（第 %d 次）⇒ 已改回 0"
-            "（PowerDevil 在抢，见 drm-keys.py 顶部注释）" % (cur, n))
+        log("  !! 熄屏期间 DRM 亮度被人写成 %s（第 %d 次）⇒ 已改回 0"
+            "（PowerDevil/backlighthelper 在抢）" % (cur, n))
     return True
 
 
@@ -577,7 +704,60 @@ def set_screen_off_flag(off):
 
 
 def dpms(arg):
-    rc, out = as_user(['kscreen-doctor', '--dpms', arg])
+    """真正关/开面板：`drmbl dpms on|off`（**非原子** ioctl）。
+
+    ★★★ 2026-10-13 换掉 kscreen-doctor（原来是 `kscreen-doctor --dpms`）★★★
+
+    原因：`kscreen-doctor --dpms off` 返回 rc=0 但**根本没生效** ——
+    KWin 日志刷屏 `kwin_wayland_drm: Setting dpms mode failed!`，
+    之后连查 12 秒 DPMS 一直是 0（On），屏幕只"闪一下"。
+
+    根因在本内核的属性定义（kwinwrap.c:2213 有同样的结论）：
+        conn67 "DPMS"  flags=0x00000008   ← 只有 DRM_MODE_PROP_ENUM
+    **没有 DRM_MODE_PROP_ATOMIC**，而 KWin 只会把 DPMS 塞进原子提交
+    ⇒ 内核一律判 EINVAL ⇒ **KWin 在这台设备上永远关不掉屏**。
+
+    安卓不受影响：它走 CRTC 的 ACTIVE=0（原子属性，合法），整个 CRTC 停摆、
+    DSI 面板进睡眠 —— 比 DPMS 更彻底。我们照抄不了：那个 CRTC 的原子状态
+    在 KWin 手里。
+
+    ⇒ 只能用非原子 ioctl 写，而它要求 master 权限 ⇒ 由 drmbl 借 KWin 的 fd。
+    """
+    rc, out = _drmbl('dpms', arg, timeout=20)
+    if rc != 0:
+        log("!! drmbl dpms %s 失败 rc=%s（%s）—— 面板不会真正%s"
+            % (arg, rc, out.replace('\n', ' ')[:200],
+               '关闭' if arg == 'off' else '点亮'))
+    return rc, out
+
+
+def crtc(arg):
+    """CRTC 开关：`drmbl crtc-off` / `drmbl crtc-on` —— **安卓真正的息屏方式**。
+
+    ★★★ 2026-10-13 新增，是「唤醒后只亮半边」的最终解 ★★★
+
+    安卓的 SurfaceFlinger/HWC 息屏时把 **CRTC 的 ACTIVE 置 0**：整个 CRTC
+    停摆、DSI 面板进睡眠；亮屏时 MODE_ID 写回 + ACTIVE=1 ⇒ **完整 modeset**。
+
+    为什么光有 DPMS 不够：这块面板是**双 DSI + DSC**，左半走 DSI0、
+    右半走 DSI1。`dpms off`/`dpms on` 只切 connector 的电源状态，
+    **不重新初始化 DSI 链路** ⇒ 唤醒后有一条链路没起来
+    ⇒ **物理上左半块屏是黑的**。
+
+    实测排除过的方向（全部无效，别再试）：
+      · plane 级：kwinwrap 在 do_split 为真时本来就会补齐全部 4 条 plane
+      · scale / rotation / Compositing suspend-resume：要么被拒要么无变化
+      · 只有**完整 modeset** 能修 —— 重启 KWin 100% 恢复（但那太重）
+
+    ★ ACTIVE 属性带 ATOMIC 位（flags 0x80000002），但**非原子写照样成功**：
+      实测 crtc-off → ACTIVE=0 读回 0；crtc-on → ACTIVE=1 读回 1。
+      MODE_ID（blob，flags 0x80000010）也一样，本机值是 314。
+    """
+    rc, out = _drmbl('crtc-' + arg, timeout=20)
+    if rc != 0:
+        log("!! drmbl crtc-%s 失败 rc=%s（%s）—— 面板%s"
+            % (arg, rc, out.replace('\n', ' ')[:200],
+               '不会真正关闭' if arg == 'off' else '可能点不亮'))
     return rc, out
 
 
@@ -586,40 +766,68 @@ def screen_off():
     #   ① 先置标志：keepbright 每 5 秒回写背光，它靠 /run/drm-keys.screenoff
     #      判断"现在是熄屏状态，别把亮度钉回来"。如果先写背光 0 再置标志，
     #      中间那几毫秒里 keepbright 可能刚好把亮度钉回去 ⇒ 屏幕闪一下。
-    #   ② 背光 0（**同时把 PowerDevil 的亮度设成 0**，否则它会把背光写回来，
-    #      见 _bl_set_via_powerdevil 上面的长注释）
-    #   ③ DPMS off
+    #   ② ★★★ drmbl blank：把 DRM connector 的 brightness 写成 0。
+    #      这是本机唯一有效的"压到最暗"手段（sysfs 那条被内核 bypass 了）。
+    #   ③ 同步 PowerDevil 的内部状态（防止它解锁后从错的起点开始）
+    #   ④ 关 CRTC（ACTIVE=0）—— ★ 2026-10-13 改用 crtc 而不是 dpms：
+    #      双 DSI 面板在 dpms off/on 之后唤醒会只亮半边，CRTC 的完整
+    #      modeset 才能把两条 DSI 链路都重新初始化。见 crtc() 的注释。
+    #      用 PANEL_OFF_MODE=dpms 可切回旧路径。
+    #   ②+④ 一起才是真正的全黑；单独任何一个都只是「最暗」或「画面黑但背光亮」。
     set_screen_off_flag(True)
     bl_save()
-    ok = bl_set(0)
+    d_rc, d_out = _drmbl('blank')
+    ok = (d_rc == 0)
+    if not ok:
+        # 回退：sysfs（本机无效，但换了面板可能有效）
+        ok = bl_set(0)
+        log("  !! drmbl blank 失败 rc=%s（%s）⇒ 回退到 sysfs（本机无效）"
+            % (d_rc, d_out))
     if POWERDEVIL_BRIGHTNESS:
         _bl_set_via_powerdevil(0)
-    rc, out = dpms('off')
+    if PANEL_OFF_MODE == 'dpms':
+        rc, out = dpms('off')
+        _what = 'dpms off'
+    else:
+        rc, out = crtc('off')
+        _what = 'crtc-off'
     if rc != 0:
-        # ★ 不要静默：DPMS 失败时屏幕只是"黑"，背光已灭但管线还在扫，
+        # ★ 不要静默：失败时屏幕只是"黑"，背光已灭但管线还在扫，
         #   既费电又和"熄屏"不是一回事。必须留下证据。
-        log("!! 熄屏：dpms off 失败 rc=%s —— 只有背光灭了，管线仍在扫描" % rc)
-    log("熄屏：背光→0(ok=%s) dpms off rc=%s 原亮度=%s%s"
-        % (ok, rc, open(BL_SAVE).read().strip() if os.path.exists(BL_SAVE) else '?',
+        log("!! 熄屏：%s 失败 rc=%s —— 只有背光灭了，管线仍在扫描" % (_what, rc))
+    log("熄屏：drmbl blank rc=%s(ok=%s) %s rc=%s 原亮度=%s%s"
+        % (d_rc, ok, _what, rc,
+           open(BL_SAVE).read().strip() if os.path.exists(BL_SAVE) else '?',
            (' | ' + out.replace('\n', ' ')[:200]) if out else ''))
 
 
 def screen_on():
-    # ★ 顺序：① 先清标志（让 keepbright 恢复回写）② DPMS on ③ 恢复背光。
+    # ★ 顺序：① 先清标志（让 keepbright 恢复回写）② 开 CRTC ③ 恢复背光。
     #   反过来的话背光先亮、面板还没扫，会闪一下白。
     set_screen_off_flag(False)
-    rc, out = dpms('on')
-    bl_restore()
+    if PANEL_OFF_MODE == 'dpms':
+        rc, out = dpms('on')
+        _what = 'dpms on'
+    else:
+        rc, out = crtc('on')
+        _what = 'crtc-on'
+        # CRTC 回来了，但 connector 的 DPMS 可能还是 off（crtc-off 不碰它）⇒ 补一发
+        dpms('on')
+    d_rc, d_out = _drmbl('unblank')
+    if d_rc != 0:
+        bl_restore()
+        log("  !! drmbl unblank 失败 rc=%s（%s）⇒ 回退到 sysfs" % (d_rc, d_out))
     if rc != 0:
-        log("!! 亮屏：dpms on 失败 rc=%s" % rc)
+        log("!! 亮屏：%s 失败 rc=%s" % (_what, rc))
     # ★ 把"熄屏期间被抢次数"清零并汇报：>0 说明有别的进程（PowerDevil）
     #   在跟我们抢背光，这个数字是排查这类"偶尔失灵"的关键线索。
     _n = _SCREEN_OFF_STOLEN[0]
     if _n:
         log("亮屏：本次熄屏期间背光被抢 %d 次（已全部改回 0）" % _n)
         _SCREEN_OFF_STOLEN[0] = 0
-    log("亮屏：dpms on rc=%s 背光→%s%s"
-        % (rc, bl_get(), (' | ' + out.replace('\n', ' ')[:200]) if out else ''))
+    log("亮屏：%s rc=%s drmbl unblank rc=%s 背光→%s%s"
+        % (_what, rc, d_rc, bl_get(),
+           (' | ' + out.replace('\n', ' ')[:200]) if out else ''))
 
 
 def screen_toggle():
@@ -627,6 +835,171 @@ def screen_toggle():
         screen_on()
     else:
         screen_off()
+
+
+# ═══════════════════ 锁屏（电源键短按的新行为）═══════════════════
+#
+# 用户需求：「电源键改成锁屏并熄灭面板」。
+#
+# 和旧的 screen_toggle() 的区别：
+#   screen_toggle()  只熄面板 —— 按任意键就回到桌面，没有安全性
+#   lockscreen_lock() 先锁屏再熄面板 —— 必须输密码才能回到桌面
+#
+# 真正的锁屏逻辑在 input/lockscreen.sh 里（那里有完整的原因说明：
+# 为什么绕过 ksmserver、为什么必须 -platform wayland、为什么需要
+# 去掉 KWin 的 --no-lockscreen、为什么密码验证依赖 shadow 组）。
+# 这里只负责"调用它 + 维护熄屏标志"。
+#
+# ★ 熄屏标志（STATEF）必须跟着设：display/keepbright.sh 靠它决定
+#   "现在是熄屏状态，别把亮度钉回来"；_enforce_screen_off() 也靠它
+#   决定要不要每 0.5 秒把背光钉回 0。锁屏期间两者都必须生效。
+
+LOCK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'lockscreen.sh')
+
+# ★★★ drmbl：真正熄灭面板的唯一手段（2026-10-13）★★★
+#
+# 为什么需要它：本机 sysfs /sys/class/backlight 是**死的**（内核 dmesg 明说
+# `dsi_panel_set_backlight: bypass bl 0`，写 brightness=0 / bl_power=4 都无效），
+# 唯一生效的是 DRM connector 67 的 `brightness` 属性。而那个属性没有 ATOMIC 位、
+# 又要求 master 权限，从外面写一律 EACCES —— drmbl 用 pidfd_getfd(2) 从 KWin
+# 那里偷一份 master fd 出来解决。详见 tools/runtime/drmbl.c 顶部注释。
+#
+# ★ 真正的全黑 = drmbl blank（brightness=0）**加上** drmbl dpms off。
+#   缺一不可：单独 brightness=0 只是「很暗但看得见」（面板硬件下限），
+#   单独 dpms off 是「画面黑但背光还亮」。
+#
+# ★★★ DPMS 必须由 drmbl 写，**不能**用 kscreen-doctor ★★★
+#   本内核的 DPMS 属性 flags=0x08 只有 ENUM，没有 DRM_MODE_PROP_ATOMIC，
+#   而 KWin 只会把它塞进原子提交 ⇒ 内核一律判 EINVAL ⇒ 日志刷
+#   "Setting dpms mode failed!"，DPMS 纹丝不动（实测连查 12 秒仍是 On），
+#   屏幕只闪一下。安卓走的是 CRTC ACTIVE=0（原子属性，合法），我们照抄不了。
+#   详见 drmbl.c 里 DPMS 那一段。
+DRMBL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'drmbl')
+
+
+def _drmbl(*args, timeout=15):
+    """跑 drmbl 子命令。返回 (rc, 输出)。"""
+    _exe = DRMBL
+    if not os.path.exists(_exe):
+        for c in ('/usr/local/bin/drmbl',):
+            if os.path.exists(c):
+                _exe = c
+                break
+        else:
+            return 127, 'drmbl 不存在：%s' % DRMBL
+    try:
+        p = subprocess.run([_exe] + list(args),
+                           capture_output=True, timeout=timeout)
+        out = (p.stdout or b'').decode('utf-8', 'replace') + \
+              (p.stderr or b'').decode('utf-8', 'replace')
+        return p.returncode, out.strip()
+    except subprocess.TimeoutExpired:
+        return 124, '超时（%ss）' % timeout
+    except Exception as e:
+        return 1, str(e)
+
+
+def _lock_run(sub, timeout=30):
+    """调用 lockscreen.sh 的子命令。返回 (rc, 输出)。"""
+    if not os.path.exists(LOCK_SCRIPT):
+        return 127, 'lockscreen.sh 不存在：%s' % LOCK_SCRIPT
+    try:
+        p = subprocess.run(['sh', LOCK_SCRIPT, sub],
+                           capture_output=True, timeout=timeout)
+        out = (p.stdout or b'').decode('utf-8', 'replace') + \
+              (p.stderr or b'').decode('utf-8', 'replace')
+        return p.returncode, out.strip()
+    except subprocess.TimeoutExpired:
+        return 124, '超时（%ss）' % timeout
+    except Exception as e:
+        return 1, str(e)
+
+
+def lockscreen_locked():
+    """现在锁着吗？判据是 greeter 进程存在（不是标志文件）。"""
+    try:
+        for d in os.listdir('/proc'):
+            if not d.isdigit():
+                continue
+            try:
+                c = open('/proc/%s/comm' % d).read().strip()
+            except Exception:
+                continue
+            if c.startswith('kscreenlocker_g'):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def lockscreen_lock():
+    """锁屏 + 熄面板。"""
+    rc, out = _lock_run('lock')
+    if rc != 0:
+        log("!! 锁屏失败 rc=%s %s" % (rc, out.replace('\n', ' ')[:300]))
+        # ★ 失败时**不能**留下"标志=熄屏 但屏幕还亮着"的不一致状态，
+        #   否则看门狗会在 300 秒后莫名亮屏。所以回退成普通的熄屏。
+        log("   回退为普通熄屏（不锁屏）")
+        screen_off()
+        return False
+    # 标志必须在脚本成功之后设：脚本内部已经做了 bl_save()
+    set_screen_off_flag(True)
+    log("已锁屏 + 熄面板 %s" % (out.replace('\n', ' ')[:200] if out else ''))
+    return True
+
+
+def lockscreen_panel_on():
+    """锁屏期间点亮面板（让用户能看见密码框）。"""
+    rc, out = _lock_run('panel-on')
+    set_screen_off_flag(False)
+    log("锁屏中点亮面板 rc=%s %s" % (rc, out.replace('\n', ' ')[:200] if out else ''))
+    return rc == 0
+
+
+def lockscreen_panel_off():
+    """锁屏期间熄灭面板。"""
+    rc, out = _lock_run('panel-off')
+    set_screen_off_flag(True)
+    log("锁屏中熄灭面板 rc=%s %s" % (rc, out.replace('\n', ' ')[:200] if out else ''))
+    return rc == 0
+
+
+def lockscreen_unlock():
+    """紧急解除（逃生通道）。"""
+    rc, out = _lock_run('unlock')
+    set_screen_off_flag(False)
+    log("紧急解除锁屏 rc=%s %s" % (rc, out.replace('\n', ' ')[:200] if out else ''))
+    return rc == 0
+
+
+def lockscreen_watch():
+    """主循环每轮调用：发现"我们以为锁着，但 greeter 已经退了" ⇒ 亮面板。
+
+    ★ 这是解锁的**唯一**检测点。greeter 认证成功后会自己退出并打印
+      "Unlocked"，但它不会通知任何人，所以我们只能轮询进程是否存在。
+
+    ★★ 这个函数同时是"锁屏期间用户被锁在外面"的最后一道保险：
+      如果 greeter 因为渲染失败而立刻退出，我们会立刻亮面板，
+      用户至少能看到桌面，而不是黑屏。
+    """
+    if not screen_is_off():
+        return
+    if lockscreen_locked():
+        return
+    # 标志说熄屏，但 greeter 不在了 ⇒ 要么解锁了，要么它崩了。两种都该亮屏。
+    log("检测到锁屏已结束（greeter 退出）⇒ 点亮面板")
+    rc, out = _lock_run('panel-on')
+    set_screen_off_flag(False)
+    if rc != 0:
+        # 脚本失败就退回自带的亮屏逻辑，绝不让屏幕留在黑的状态
+        log("   lockscreen.sh panel-on 失败 rc=%s ⇒ 用内置逻辑亮屏" % rc)
+        screen_on()
+    else:
+        _n = _SCREEN_OFF_STOLEN[0]
+        if _n:
+            log("  本次熄屏期间背光被抢 %d 次" % _n)
+            _SCREEN_OFF_STOLEN[0] = 0
 
 
 # ─────────────────────── 设备探测 ───────────────────────
@@ -775,9 +1148,9 @@ def run(skip_lock=None):
     _vnames = ','.join('%s(%s)' % (d, n)
                        for kind, d, n in fds.values() if kind == 'vol')
     log("启动 pid=%d 用户=%s 音量设备=%s 电源设备=%s 步进=%d%% 长按阈值=%dms "
-        "熄屏看门狗=%ds 初始=%s"
+        "最短按下=%dms 熄屏看门狗=%ds 初始=%s"
         % (os.getpid(), resolve_user(), _vnames or '无',
-           pwr_dev or '无', VOL_STEP, LONG_MS, WATCHDOG_S,
+           pwr_dev or '无', VOL_STEP, LONG_MS, MIN_MS, WATCHDOG_S,
            '熄屏' if screen_is_off() else '亮屏'))
     for k, (kind, d, n) in fds.items():
         log("  监听 %s [%s] %s" % (d, kind, n))
@@ -801,6 +1174,9 @@ def run(skip_lock=None):
 
     down_ts = {}
     last_act = {}
+    # ★ 电源键「动作后冷却」的截止时刻（毫秒）。见 PWR_COOLDOWN_MS 定义处。
+    #   用 list 是为了在闭包/循环里能改（和 _SCREEN_OFF_STOLEN 同一个写法）。
+    pwr_cooldown_until = [0.0]
     off_since = time.time() if screen_is_off() else None
 
     while True:
@@ -826,6 +1202,14 @@ def run(skip_lock=None):
         # ★ 熄屏期间把背光钉在 0：PowerDevil 会不定期把它的缓存值写回来
         #   （实测 13~19 秒后），不钉的话现象就是"按电源键只闪一下"。
         _enforce_screen_off()
+
+        # ★★★ 锁屏状态监视：greeter 退出（用户解锁了，或它崩了）⇒ 亮面板 ★★★
+        #
+        # 这是解锁的唯一检测点。greeter 认证成功后自己退出并打印 "Unlocked"，
+        # 但它不通知任何人，只能轮询。
+        # ⚠️ 只在"标志=熄屏"时才做这个检查（函数内部第一行就返回），
+        #    所以正常亮屏期间零开销。
+        lockscreen_watch()
 
         if not r:
             continue
@@ -865,6 +1249,17 @@ def run(skip_lock=None):
                 if now - last_act.get(code, 0.0) < DEBOUNCE_MS:
                     continue
                 last_act[code] = now
+                # ★★★ 锁屏期间音量键的作用是「唤醒面板」，不是调音量 ★★★
+                #
+                # 理由：锁屏时面板是熄的，用户看不见任何东西。如果音量键
+                # 只默默改音量，用户会以为设备没反应。标准行为（Android、
+                # GNOME）也是锁屏下第一次按键只唤醒屏幕。
+                # 唤醒之后再按才真正调音量 —— 这样两个需求都不丢。
+                if lockscreen_locked() and screen_is_off():
+                    log("锁屏中按音量键 ⇒ 先点亮面板（不调音量）")
+                    lockscreen_panel_on()
+                    off_since = None
+                    continue
                 ok, desc = volume_action(code)
                 log("音量键 %s ⇒ %s（%s）"
                     % ('UP' if code == KEY_VOLUMEUP else 'DOWN',
@@ -887,12 +1282,48 @@ def run(skip_lock=None):
                     #    我们**不 grab** 设备，所以长按照样能走到 PMIC。
                     log("电源键长按 %.0fms ⇒ 忽略（留给硬件强制断电/重启）" % dur)
                     continue
+                # ★★★ 幽灵事件过滤：本机电源键会额外发出 0~1ms 的假配对，
+                #     不过滤的话一次真实按键会被当成 3~4 次，面板反复翻转。
+                #     详见 MIN_MS 定义处的实测日志。
+                if dur < MIN_MS:
+                    log("电源键 %.0fms 的极短配对 ⇒ 判定为硬件幽灵事件，忽略"
+                        "（真实按键不会短于 %dms）" % (dur, MIN_MS))
+                    continue
                 if now - last_act.get(KEY_POWER, 0.0) < DEBOUNCE_MS:
                     continue
+                # ★★★ 动作后冷却（2026-10-13）★★★
+                #
+                # 位置很关键：放在 MIN_MS 过滤**之后**、动作分支**之前**。
+                #   · 在 MIN_MS 之后 ⇒ 0~1ms 的幽灵配对不会续期冷却窗口
+                #     （否则幽灵会把窗口一直往后推，真实按键被吃掉）。
+                #   · 在动作之前 ⇒ 只有真的执行了动作才续期。
+                # 详见 PWR_COOLDOWN_MS 定义处的实测日志。
+                if now < pwr_cooldown_until[0]:
+                    log("电源键 %.0fms ⇒ 在动作冷却期内（还剩 %.0fms）⇒ 忽略"
+                        "（PMIC 释放瞬间重复上报的伪按键）"
+                        % (dur, pwr_cooldown_until[0] - now))
+                    continue
                 last_act[KEY_POWER] = now
-                log("电源键短按 %.0fms ⇒ 切换熄屏" % dur)
-                screen_toggle()
-                off_since = time.time() if screen_is_off() else None
+                pwr_cooldown_until[0] = now + PWR_COOLDOWN_MS
+                # ★★★ 2026-10-12 改动：短按从「切换熄屏」改为「锁屏 + 熄面板」★★★
+                #
+                # 旧行为：只熄面板，按任意键直接回桌面（无安全性）。
+                # 新行为：先锁屏（kscreenlocker_greet）再熄面板，必须输密码。
+                # 锁屏期间再按电源键**只切换面板明灭**，不会重复锁屏
+                # （重复调用会让 greeter 重来一遍，用户正在输的密码会丢）。
+                if lockscreen_locked():
+                    if screen_is_off():
+                        log("电源键短按 %.0fms ⇒ 锁屏中，点亮面板" % dur)
+                        lockscreen_panel_on()
+                        off_since = None
+                    else:
+                        log("电源键短按 %.0fms ⇒ 锁屏中，熄灭面板" % dur)
+                        lockscreen_panel_off()
+                        off_since = time.time()
+                else:
+                    log("电源键短按 %.0fms ⇒ 锁屏 + 熄面板" % dur)
+                    lockscreen_lock()
+                    off_since = time.time() if screen_is_off() else None
                 continue
 
 

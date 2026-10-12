@@ -177,7 +177,26 @@ DEV_ROUTE_PREF=31500
 # X11 应用一个都起不来）。本机是 KernelSU ⇒ 需要垫片。
 DEV_NEEDS_KSU_XWL_SHIM=1                                 # ✔实测
 DEV_MESA_OVERRIDE=""
-DEV_KWIN_EXTRA_ARGS="--no-lockscreen --xwayland"
+# ★★★ 2026-10-12：去掉了 `--no-lockscreen` ★★★
+#
+# 原来这里是 `--no-lockscreen --xwayland`。`--xwayland` 是必需的（KernelSU 的
+# Xwayland 垫片，见上），但 **`--no-lockscreen` 是早期防御性加的遗留，没有任何
+# 注释说明理由**，而且它正是锁屏功能坏掉的根因：
+#
+#   `--no-lockscreen` 让 KWin **不注册 ext-session-lock 协议**，于是
+#   kscreenlocker_greet 拿不到真正的会话锁 surface，后果实测有两条：
+#     · 锁屏界面**弹不出任何屏幕键盘** —— 密码根本输不进去
+#     · 锁屏只能以「普通全屏窗口」的形式存在，不是真正的锁
+#
+# 用户需求是「电源键锁屏并熄灭面板」，所以这个开关必须去掉。
+#
+# 实测证据（去掉前，读 /proc/<kwin>/cmdline）：
+#   kwin_wayland --drm --socket=taketest --no-lockscreen --xwayland
+# 去掉后 KWin 正常启动、面板正常、锁屏能拿到会话锁。
+#
+# ⚠️ 回退办法：如果去掉后桌面/面板出问题，把 `--no-lockscreen` 加回来即可
+#    （锁屏功能会随之失效，但桌面恢复正常）。
+DEV_KWIN_EXTRA_ARGS="--xwayland"
 
 # ⚠️⚠️ 保持**置空**！分屏是这台机器的**硬件必需**，不是可选优化。
 #

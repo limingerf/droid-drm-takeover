@@ -1134,6 +1134,37 @@ drm_start_kwin() {
 
     drm_log "kwinwrap 交接 → kwin_wayland --drm --socket=$_sock（会话 $DRM_SESSION_ID）"
     [ -n "$_nosplit_env" ] && drm_log "分屏改写已禁用（DEV_KWINWRAP_NO_SPLIT=1）：KWin 原始提交透传"
+    # ── ★★★ QT_IM_MODULES=qtvirtualkeyboard：让**合成器**提供 Qt 虚拟键盘 ────
+    #
+    # 起因：用户要「电源键锁屏」，但锁屏界面弹不出键盘，密码输不进去。
+    # kscreenlocker_greet 自己打印了原因：
+    #     qt.qpa.wayland: qtvirtualkeyboard currently is not supported at
+    #     client-side, use QT_IM_MODULES=qtvirtualkeyboard at compositor-side.
+    # ⇒ 锁屏跑在受限会话里，**够不着 maliit**（maliit 是 Wayland input-method
+    #   协议，锁屏时被隔离）；它唯一能用的键盘是 Qt 虚拟键盘，而那个必须在
+    #   **合成器侧**启用。注意是 **MODULES 复数**，不是 MODULE。
+    #
+    # ★ 为什么和 maliit 不冲突（设计如此，不是猜的）：
+    #   两条链的层次完全不同 ——
+    #     maliit     = Wayland input-method 协议，由 KWin fork，服务**非 Qt** 应用
+    #                  （Chrome 就是这一类，它只认 Wayland 输入法）
+    #     Qt 虚拟键盘 = Qt 进程内的 platforminputcontext 插件，服务 **Qt** 应用
+    #   所以这一行不会顶掉 maliit，而是给 Qt 应用多一条键盘路径。锁屏正是 Qt 应用。
+    #
+    # ★ 前提（缺一不可，均已实测存在）：
+    #   .../qt6/plugins/platforminputcontexts/libqtvirtualkeyboardplugin.so
+    #   .../qt6/qml/QtQuick/VirtualKeyboard
+    #
+    # ⚠️⚠️ 血泪教训：这段注释**必须**放在 `env` 命令**外面**。
+    #   我第一次把注释插进了 `env ... \` 的续行中间，`#` 会**终止续行**，
+    #   整条 env 命令被截断，症状是
+    #       display.sh: 1175: LANG=zh_CN.UTF-8: not found
+    #       kwinwrap 交接失败
+    #   ⇒ KWin 起不来、屏幕全黑。**续行中间绝不能有注释行。**
+    #
+    # ⚠️ 回退办法：删掉 env 里的 QT_IM_MODULES 那一行即可（锁屏将没有键盘，
+    #    但桌面键盘恢复正常）。
+    #
     # shellcheck disable=SC2086
     env KWINWRAP_HIJACK=1 KWINWRAP_SECCOMP=1 KWINWRAP_FILTER=1 \
         KWINWRAP_UID="$DESKTOP_UID" KWINWRAP_GID="$DESKTOP_GID" \
@@ -1148,6 +1179,7 @@ drm_start_kwin() {
             -u GALLIUM_DRIVER -u FD_FORCE_KGSL \
             -u MESA_DEBUG -u LIBGL_ALWAYS_SOFTWARE -u TU_DEBUG -u FD_MESA_DEBUG \
             MESA_LOADER_DRIVER_OVERRIDE=msm \
+            QT_IM_MODULES=qtvirtualkeyboard \
             QT_LOGGING_RULES="kwin_scene_opengl.debug=true;kwin_drm.debug=true" \
             $_loc_env \
             HOME="$DESKTOP_HOME" \

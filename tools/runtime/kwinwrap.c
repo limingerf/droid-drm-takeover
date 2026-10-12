@@ -1021,6 +1021,74 @@ static unsigned long long sc_sp;
 static __u32 sc_no, sc_np;
 static int sc_dumped;
 
+/* ══════════════════ DPMS-STRIP（2026-10-13 新增）══════════════════
+ *
+ * 干什么：把面板 connector 的 `DPMS` 属性从 KWin 的原子提交里**摘掉**。
+ *
+ * ══ 为什么必须摘（这条是"左半屏没画面 + 亮度写不进去"的总根因）══
+ *
+ * 本内核的 DPMS 属性**没有 DRM_MODE_PROP_ATOMIC 位**：
+ *     conn67 "DPMS"  flags=0x00000008   ← 只有 DRM_MODE_PROP_ENUM
+ * 而 KWin 只会把 DPMS 塞进 **atomic** 提交。内核的
+ * `drm_atomic_set_property()` 一看到"属性不支持原子"就直接 EINVAL，
+ * 于是**整个提交**（不只是 DPMS 那一条）全部失败。
+ *
+ * 后果是连锁的，而且症状完全不指向 DPMS，极难查：
+ *   ① CRTC 从未被真正激活 ⇒ 4 条 split plane 没重建
+ *      ⇒ **双 DSI 面板只有右半有画面，左半是黑的**
+ *   ② 面板的 `dsi_panel` 状态一直停在 off ⇒ `dsi_panel_set_backlight()`
+ *      走 bypass 分支（dmesg: `bypass bl 0`）⇒ **brightness 怎么写都读回旧值**
+ *   ③ KWin 日志刷屏 `atomic commit failed: 无效的参数` /
+ *      `Setting dpms mode failed!`
+ *
+ * 实测排除过的错路（都试过、都无效，别再走）：
+ *   · `kscreen-doctor --dpms off` —— 返回 rc=0 但 DPMS 纹丝不动
+ *     （连查 12 秒都是 On），屏幕只"闪一下"
+ *   · `kscreen-doctor output.DSI-1.disable` —— 被拒：
+ *     "不允许通过配置更改禁用所有输出"
+ *   · 改 mode/scale/rotation —— 要么报 "Output mode not found"，
+ *     要么反而把 DPMS 又拉回 Off
+ *   · `KWINWRAP_DPMS_INJECT=1` —— 往提交里**加** DPMS，同样 EINVAL（见下）
+ *
+ * ══ 摘掉之后为什么反而全好了 ══
+ *
+ *   · KWin 的提交恢复 ret=0 ⇒ CRTC 激活、plane 重建 ⇒ **左右两半都有画面**
+ *   · 面板进入正常 on 状态 ⇒ `set_backlight` 不再 bypass ⇒ **亮度可写**
+ *   · 提交里不再带 DPMS ⇒ KWin **不会覆盖**我们外部设的 DPMS
+ *     ⇒ `drmbl dpms off` 能稳定保持关闭，直到我们主动开回来
+ *   · KWin 以为自己管着 DPMS、且持续正常渲染 ⇒ 唤醒后它自己就会把
+ *     画面重新提交好，不需要重启 KWin
+ *
+ * ⇒ 所以真正关/开面板的职责移交给了 `tools/runtime/drmbl`（非原子 ioctl，
+ *   用 pidfd_getfd 借 KWin 的 master fd）。安卓走的是另一条路
+ *   （CRTC ACTIVE=0，原子属性合法），我们照抄不了 —— 那个 CRTC 的原子状态
+ *   在 KWin 手里，但"把非原子属性从提交里摘掉"我们做得到。
+ *
+ * ══ 副作用（已知、可接受）══
+ *
+ * KWin 自己的"空闲熄屏"从此失效（它的 DPMS 请求被丢弃）。这是本机原本
+ * 就有的状态 —— 在加这段之前 KWin 的 DPMS 从来没有成功过。熄屏由
+ * input/drm-keys.py + input/lockscreen.sh + drmbl 负责。
+ */
+static __u32 conn_dpms_strip_prop;   /* DPMS 属性 id，0 = 还没查 */
+static int dpms_stripped;            /* 本次提交摘掉了几条（仅用于日志） */
+
+/* 这条属性要不要从提交里摘掉？返回 1 = 摘掉（调用方必须跳过它）。
+ * 只摘面板 connector 的 DPMS，别的对象/属性一律不动。 */
+static int dpms_should_strip(__u32 obj, __u32 prop)
+{
+    if (!SPLIT_CONN || obj != SPLIT_CONN)
+        return 0;
+    if (!conn_dpms_strip_prop)
+        conn_dpms_strip_prop = find_prop(SPLIT_CONN,
+                                         DRM_MODE_OBJECT_CONNECTOR, "DPMS");
+    if (conn_dpms_strip_prop && prop == conn_dpms_strip_prop) {
+        dpms_stripped++;
+        return 1;
+    }
+    return 0;
+}
+
 static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
     struct drm_mode_atomic a;
     if (readmem(t, uptr, &a, sizeof a) != (ssize_t)sizeof a) return;
@@ -1466,12 +1534,15 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             continue;
         }
         if (do_split && (int)o == iconn) {
+            __u32 n0 = np;
             for (__u32 i = 0; i < oc; i++, off++) {
+                if (dpms_should_strip(s_objs[o], s_props[off]))
+                    continue;                    /* ★ DPMS-STRIP */
                 s_props2[np] = s_props[off];
                 s_vals2[np++] = (int)i == iconn_crtc ? SPLIT_CRTC : s_vals[off];
             }
             s_objs[no] = s_objs[o];
-            s_cnts[no] = oc;
+            s_cnts[no] = np - n0;
             no++;
             continue;
         }
@@ -1510,13 +1581,25 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             }
             if (planeish && !active) { off += oc; continue; }
         }
-        s_objs[no] = s_objs[o];
-        s_cnts[no] = oc;
-        no++;
-        for (__u32 i = 0; i < oc; i++, off++) {
-            s_props2[np] = s_props[off];
-            s_vals2[np]  = s_vals[off];
-            np++;
+        {
+            /* ★★★★ DPMS-STRIP ★★★★
+             * 摘掉 connector 的 DPMS 属性，否则整条提交被内核判 EINVAL
+             * （该属性没有 DRM_MODE_PROP_ATOMIC 位）。
+             * 后果连锁到"左半屏没画面 + 亮度写不进去"，详见本文件
+             * 顶部 DPMS-STRIP 那段注释。
+             * ★ 计数必须跟着改：s_cnts 是**摘完之后**的条数，
+             *   否则内核会读到越界的属性值。 */
+            __u32 n0 = np;
+            for (__u32 i = 0; i < oc; i++, off++) {
+                if (dpms_should_strip(s_objs[o], s_props[off]))
+                    continue;
+                s_props2[np] = s_props[off];
+                s_vals2[np]  = s_vals[off];
+                np++;
+            }
+            s_objs[no] = s_objs[o];
+            s_cnts[no] = np - n0;
+            no++;
         }
     }
     if (do_split) {
@@ -1775,6 +1858,16 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             fprintf(LOG, ")\n");
             fflush(LOG);
         }
+    }
+    if (dpms_stripped) {
+        static int nstrip;
+        if (++nstrip <= 5 || (nstrip & 127) == 1) {
+            fprintf(LOG, "DPMS-STRIP: 摘掉 conn%u 的 DPMS（prop=%u）"
+                    "—— 本内核该属性无 ATOMIC 位，不摘整条提交会被判 EINVAL\n",
+                    SPLIT_CONN, conn_dpms_strip_prop);
+            fflush(LOG);
+        }
+        dpms_stripped = 0;
     }
     static int nsplit;
     if (++nsplit <= 5 || (nsplit & 63) == 1) {
