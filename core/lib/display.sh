@@ -1687,6 +1687,61 @@ drm_start_input_methods() {
         [ "$_kwinrc_dirty" = 1 ] && chown "$DESKTOP_USER" "$_kwinrc" 2>/dev/null
     fi
 
+    # ── 关掉 KWin 的 slide 特效：屏幕键盘弹出拖影的根因 ──────────
+    #
+    # ★ 症状：键盘刚弹出那几秒，任务栏附近有一层拖影，之后自愈。
+    #
+    # ★ 根因：KWin 在窗口显示/隐藏时做「滑入/滑出」动画
+    #   （kwin_wayland 里有 SurfaceInterface::slideOnShowHideChanged、
+    #     KWindowEffects::SlideFromLocation、KWin::SlideEffect、kwin_slide、
+    #     slideIn/slideOut/slideInDuration/slideOutDuration 这些符号）。
+    #   键盘不是瞬间出现，而是从屏幕底部滑上来；滑动过程中前一帧留在屏幕上的
+    #   轨迹就是那个拖影。动画几百毫秒就结束，画面本身随即正确，但残留的帧要
+    #   等下一次全屏重绘才被彻底覆盖 —— 所以"几秒后自愈"。
+    #
+    # ★ 已排除的假设（别再回头查这些）：
+    #   1. /etc/environment 里 kgsl/msm 驱动选择冲突
+    #      —— 确有其事并已修（掉帧 8%→1%），但修完拖影仍在。
+    #   2. 双 maliit 实例互相覆盖
+    #      —— 确有其事并已修（现在只剩 KWin 拉起的那一个），但拖影仍在。
+    #   3. KWinWRAP_SPLIT_* 分屏裁切导致某一段没更新
+    #      —— 读 kwinwrap.c 确认 4 条 plane 是同一幅整宽帧缓冲按
+    #         SRC_X = i*SPLIT_W 硬件裁切，不存在"某段落后"。
+    #   4. Plasma 面板占位把键盘顶起来
+    #      —— 改成 panelVisibility=2 后拖影仍在（但那个改动本身是用户要的，
+    #         见下面那段，保留）。
+    #
+    # ★ 修法：卸载 slide / slideback 两个特效。D-Bus 立即生效，同时写进
+    #   kwinrc 的 [Plugins] 段让它持久。
+    #   ★ 注意 KWin 6.3 的 /Effects 接口**没有** isEffectActive（那是老版本的
+    #     方法名，调用会报 UnknownMethod），但 unloadEffect 是可用的，返回 ()。
+    _kwinrc_plugins=0
+    if [ -f "$_kwinrc" ]; then
+        for _e in slide slideback; do
+            if grep -aq "^${_e}Enabled=" "$_kwinrc" 2>/dev/null; then
+                grep -aq "^${_e}Enabled=false" "$_kwinrc" 2>/dev/null || {
+                    sed -i "s/^${_e}Enabled=.*/${_e}Enabled=false/" "$_kwinrc" 2>/dev/null
+                    _kwinrc_plugins=1
+                }
+            else
+                if grep -aq '^\[Plugins\]' "$_kwinrc" 2>/dev/null; then
+                    awk -v k="${_e}Enabled=false" \
+                        '/^\[Plugins\]$/ && !d {print; print k; d=1; next} {print}' \
+                        "$_kwinrc" > "$_kwinrc.new" 2>/dev/null \
+                        && mv "$_kwinrc.new" "$_kwinrc"
+                else
+                    printf '\n[Plugins]\n%sEnabled=false\n' "$_e" >> "$_kwinrc"
+                fi
+                _kwinrc_plugins=1
+            fi
+        done
+        [ "$_kwinrc_plugins" = 1 ] && chown "$DESKTOP_USER" "$_kwinrc" 2>/dev/null
+        if grep -aq '^slideEnabled=false' "$_kwinrc" 2>/dev/null; then
+            drm_log "kwinrc 已写入 slideEnabled=false / slidebackEnabled=false（消键盘弹出拖影）"
+            drm_state_set KWIN_NO_SLIDE 1
+        fi
+    fi
+
     # ── 面板可见性：让屏幕键盘盖住任务栏 ──────────────────────
     #
     # ★ 用户明确要的效果："要不键盘就直接覆盖任务栏好了"。
