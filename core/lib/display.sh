@@ -1290,24 +1290,49 @@ drm_start_desktop() {
     # 这些原本由 startplasma-wayland 负责；我们绕过它，就必须自己补。
     # ★★ 只设上游确认必需的那几条，**不要多设** ★★
     #
-    # 2026-10-12 事故复盘：这里曾经多设了
-    #     XDG_DATA_DIRS=/usr/local/share:/usr/share
-    #     XDG_CONFIG_DIRS=/etc/xdg
-    #     XDG_SESSION_DESKTOP / DESKTOP_SESSION / KDE_FULL_SESSION / KDE_SESSION_VERSION
-    # 本意是"补齐 KDE 会话变量好让应用菜单能用"。菜单确实修好了，
-    # 但**桌面从此开始持续烧 70~90% CPU、整个 KDE 掉帧**。
+    # ★★ 2026-10-12 第二次复盘：掉帧的真正根因是 **locale**，不是 XDG_* ★★
     #
-    # 根因（gdb 采样 + 文件观察定位）：KDE 的 sycoca 服务缓存数据库
-    #   /home/Gold/.cache/ksycoca6_<lang>_<hostkey>
-    # 被**反复重建**，且在两个不同大小之间来回震荡：
-    #     350877 字节 → 224925 字节 → 350877 字节 …（每 4 秒一轮）
-    # 两个写入者看到的服务集不同 ⇒ 各自覆盖对方的缓存 ⇒ 对方下次
-    # KSycocaPrivate::checkDatabase() 又判定过期 ⇒ 无限重建。
-    # 主线程因此永远停在 ppoll 里空转（每次重建完立刻又"过期"）。
-    # 而**服务集的差异只能来自 XDG_DATA_DIRS / XDG_CONFIG_DIRS** ——
-    # 多设这两个变量后，本会话与其它 KDE 进程（kded6/kactivitymanagerd/
-    # kscreen…）算出的搜索路径不一致，缓存互相作废。
+    # 这一段此前写过一版"XDG_DATA_DIRS/XDG_CONFIG_DIRS 让 sycoca 互相作废"的
+    # 解释 —— **那个结论是错的，已推翻**。错在测量方法：`ls ksycoca6_*` 会同时
+    # 列出两个文件，而 locale 是文件名的一部分：
+    #     ksycoca6_en_<hostkey>   ← en_US 会话用的库
+    #     ksycoca6_zh_<hostkey>   ← zh_CN 会话用的库
+    # 把这两个文件的尺寸交替出现误读成了"同一个库在 350877↔224925 之间震荡"。
+    # 实际上它们各自稳定，从未互相覆盖。
     #
+    # 真正可复现的事实（A/B 对照，同一台机、同一份配置）：
+    #     plasmashell  LANG=en_US.UTF-8   →  15 秒耗 0.00 秒 CPU（桌面空闲）
+    #     plasmashell  LANG=zh_CN.UTF-8   →  20 秒耗 14.61 秒 CPU（73%，满屏掉帧）
+    # 且 `LC_MESSAGES=zh_CN` 单独设置也会触发（它决定选哪个 sycoca 库），
+    # 所以"英文 locale + 中文文案"这条路走不通。
+    #
+    # gdb 抓到的现场（pid 停在重建里）：
+    #     #3 KBuildSycoca::recreate(bool)
+    #     #4 KSycocaPrivate::buildSycoca()
+    #     #5 KSycocaPrivate::checkDatabase(...)
+    #     #6 KSycoca::ensureCacheValid()
+    #     #7 KService::serviceByStorageId(QString const&)
+    #     #8 libkickerplugin.so          ← Kickoff 开始菜单
+    # 配合 /proc/<pid>/io：6 秒写 15.7 MB —— 确实在无限重建 sycoca。
+    #
+    # 已用实验否掉的两个候选判据（不要再往这两个方向查）：
+    #   · 文件 mtime 过旧：把库 mtime 推到 1 小时后，循环照旧（库被立刻覆盖回来）。
+    #   · 陈旧 .lock 残留：锁是 kwin_wayland 持有的**活锁**（内容是
+    #     21712/kwin_wayland/DEBIAN/…），删掉后 15 秒仍烧 10.88 秒且锁重现。
+    # 已定位的贡献者：Kickoff 占一半以上（把它从面板摘掉，73% → 35%），
+    # 剩余部分来自其它 applet（任务栏 icontasks 同样要解析 .desktop）。
+    # 容器根文件系统是 f2fs + `lazytime`（mtime 延迟落盘），是重要嫌疑但未定案。
+    #
+    # ⇒ 在 sycoca 循环被真正修掉之前，桌面会话**固定用 en_US.UTF-8**：
+    #   这是唯一实测 0% CPU、不掉帧的配置。中文界面暂时放弃，
+    #   代价换的是"能用"，而不是"能看中文但卡到不能用"。
+    #   ★ 想恢复中文，必须先解决 sycoca 无限重建，不要只把 _lang 改回去。
+    _lang=en_US.UTF-8
+    if [ "${DEV_DESKTOP_LANG:-}" ]; then
+        _lang=$DEV_DESKTOP_LANG
+        drm_warn "桌面 locale 被设备层覆盖为 $_lang（若非 en_US.* 可能触发 sycoca 无限重建、严重掉帧）"
+    fi
+
     # ★ 上游 display/desk-takeover.sh 的做法是：**只从 /etc/default/locale 与
     #   /etc/environment 里白名单 LANG=* / LC_*=* / XCURSOR_SIZE=* /
     #   QT_QPA_PLATFORMTHEME=* 四条**，其余一律不注入，并明确注释
@@ -1396,15 +1421,33 @@ drm_start_desktop() {
         _qtqb="QT_QUICK_BACKEND=$DEV_QT_QUICK_BACKEND"
         drm_log "Qt Quick 后端固定为 $DEV_QT_QUICK_BACKEND"
     fi
+
+    # ★★ 输入法环境（2026-10-12 新增）★★
+    # 重构前这里把 QT_IM_MODULE / GTK_IM_MODULE / XMODIFIERS 全部 `env -u` 摘掉，
+    # 后果是**装好 fcitx5 也永远不会被应用加载**（Qt/GTK 只认这几个变量）。
+    # 现在：装了 fcitx5 就指向它，没装才摘掉。
+    # ★ 注意 fcitx5 只负责"输入法引擎"（物理键盘打中文），
+    #   **不提供触摸屏虚拟键盘** —— 虚拟键盘是 maliit-keyboard，见
+    #   drm_start_input_methods()。触摸屏上输 WiFi 密码靠的是后者。
+    _im_env=""
+    if ds_exec 'command -v fcitx5 >/dev/null 2>&1' >/dev/null 2>&1; then
+        _im_env="QT_IM_MODULE=fcitx GTK_IM_MODULE=fcitx XMODIFIERS=@im=fcitx"
+        _im_env="$_im_env SDL_IM_MODULE=fcitx GLFW_IM_MODULE=ibus"
+        drm_log "输入法：fcitx5（QT/GTK/X11 均已指向）"
+    else
+        _im_env="-u QT_IM_MODULE -u GTK_IM_MODULE -u XMODIFIERS"
+        _im_env="$_im_env -u SDL_IM_MODULE -u GLFW_IM_MODULE"
+    fi
+
     setsid nohup runuser -u "$DESKTOP_USER" -- \
-        env -u DISPLAY -u QT_IM_MODULE -u GTK_IM_MODULE -u SDL_IM_MODULE \
-            -u GLFW_IM_MODULE -u XMODIFIERS $_unset_env \
+        env -u DISPLAY $_unset_env \
             WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
             XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
             QT_QPA_PLATFORM=wayland LANG="$_lang" \
             $_kde_env \
             $_qtqb \
+            $_im_env \
             ${DEV_PLASMA_ENV:-} \
         plasmashell --replace >>"${DRM_LOG_DIR}/plasmashell.log" 2>&1 &
 
@@ -1440,10 +1483,87 @@ drm_start_desktop() {
             xdg-desktop-portal >>"${DRM_LOG_DIR}/portal.log" 2>&1 &
     fi
 
+    drm_start_input_methods "$_sock" "$_lang" "$_im_env"
+
     return 0
 }
 
-# ── 等"本轮的" kwin 拿到 DRM ──────────────────────────────
+# ── 输入法进程 ────────────────────────────────────────────
+#
+# ★ 2026-10-12 新增。为什么必须单独拉起：
+#   上游 desk-takeover.sh 会起 kded6，kded6 里有输入法模块；
+#   本仓库没有 kded6（见待办），所以输入法进程没有任何人拉 ——
+#   现象就是用户实测的"**没有输入法弹出屏幕键盘我没法输入密码**"：
+#   容器里装了 fcitx5 和 maliit-keyboard，但一个都没在跑。
+#
+# ★ 两个东西职责完全不同，别混：
+#   · fcitx5        —— 输入法**引擎**，服务物理键盘打中文（拼音/五笔）。
+#                      不提供虚拟键盘，触摸屏上点了不会弹任何东西。
+#   · maliit-keyboard —— KDE 的**屏幕键盘**（OSK）。它注册 Wayland 的
+#                      zwp_input_method_v2，KWin 在触摸设备上聚焦文本框时
+#                      请求它弹出。**触摸屏输 WiFi 密码靠的是这个。**
+#
+# ⚠️ 已知冲突：两者都想当 Wayland input-method。本机优先保 maliit
+#   （触摸设备第一需求是"能打字"），所以 fcitx5 只用 -d 后台起引擎、
+#   靠 QT_IM_MODULE=fcitx 被应用加载，**不让它抢 input-method 协议**。
+#   若将来插了物理键盘要主打 fcitx5，应改成用 fcitx5 的虚拟键盘模块
+#   并停掉 maliit。
+drm_start_input_methods() {
+    _sock=$1
+    _lang=$2
+    _im=$3
+
+    _ok=0
+    for _c in fcitx5 maliit-keyboard; do
+        ds_exec "command -v $_c >/dev/null 2>&1" >/dev/null 2>&1 && _ok=1
+    done
+    if [ "$_ok" = 0 ]; then
+        drm_warn "容器里没装 fcitx5/maliit-keyboard，跳过输入法"
+        drm_warn "  装法：network/net-takeover.sh deps（或在容器里 apt-get install fcitx5 maliit-keyboard）"
+        return 0
+    fi
+
+    # 先把上轮的残留清掉，避免重复实例互相顶
+    ds_exec 'pkill -x fcitx5 2>/dev/null; pkill -x maliit-keyboard 2>/dev/null; true' >/dev/null 2>&1
+    sleep 1
+
+    # fcitx5：输入法引擎
+    if ds_exec 'command -v fcitx5 >/dev/null 2>&1' >/dev/null 2>&1; then
+        setsid nohup runuser -u "$DESKTOP_USER" -- \
+            env -u DISPLAY $_unset_env \
+                WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
+                XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
+                QT_QPA_PLATFORM=wayland LANG="$_lang" \
+                XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
+                $_im \
+            fcitx5 -d >>"${DRM_LOG_DIR}/fcitx5.log" 2>&1 &
+        drm_log "已拉起 fcitx5（引擎）"
+    fi
+
+    # maliit-keyboard：触摸屏屏幕键盘
+    if ds_exec 'command -v maliit-keyboard >/dev/null 2>&1' >/dev/null 2>&1; then
+        setsid nohup runuser -u "$DESKTOP_USER" -- \
+            env -u DISPLAY $_unset_env \
+                WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
+                XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
+                QT_QPA_PLATFORM=wayland LANG="$_lang" \
+                XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
+                QT_IM_MODULE=maliit \
+            maliit-keyboard >>"${DRM_LOG_DIR}/maliit.log" 2>&1 &
+        sleep 6
+        if drm_pids_by_comm maliit-keyboard >/dev/null 2>&1 && \
+           [ -n "$(drm_pids_by_comm maliit-keyboard | head -1)" ]; then
+            drm_log "已拉起 maliit-keyboard（屏幕键盘，触摸屏可打字）"
+            drm_state_set OSK_OK 1
+        else
+            drm_warn "maliit-keyboard 没起来，看 ${DRM_LOG_DIR}/maliit.log"
+            drm_state_set OSK_OK 0
+        fi
+    fi
+    return 0
+}
 #
 # ★ 不能用 pid 比较：容器与安卓是两个 pid 命名空间。
 #   判据三条：① 持有 dri/card0 ② 进程启动时间 >= 本轮开始时刻

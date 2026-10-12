@@ -389,12 +389,19 @@ DEV_KWINWRAP_TRACE=""
 # 能临时覆盖（含覆盖成空串），做驱动对照实验时不用改文件重打包。
 # 注意用 `-` 不是 `:-` —— 后者会把"显式设为空"也当成未设置。
 #
+# ★ 2026-10-12 追加 XDG_MENU_PREFIX=plasma-：KWin 也要有。
+#   原因：KWin 会去解析 .desktop（窗口类名 → 图标/名称、任务栏、KRunner），
+#   它内部同样走 ${XDG_CONFIG_DIRS}/menus/${XDG_MENU_PREFIX}applications.menu。
+#   只给 plasmashell 设、不给 KWin 设，两边看到的菜单根不一致。
+#   /etc/xdg/menus/ 下**只有 plasma-applications.menu**，缺这个前缀就找不到。
+#   它只影响菜单文件名查找，不参与 sycoca 搜索路径哈希，因此安全。
+#
 # ★ 2026-10-12 追加 touchabs.so：触摸方向的量程垫片（见上面触摸那段）。
 #   它必须进 **KWin 的**进程环境 —— libinput 是在 KWin 里读设备的。
 #   ⚠️ 这里的 LD_PRELOAD 会**覆盖** display.sh 里 _fmt_preload 那一份，
 #   所以必须把 drmfmt.so 一并写上，否则格式垫片就丢了。
 #   两个 .so 都在 /usr/local/lib/droid-drm-takeover/。
-DEV_KWIN_ENV="${DEV_KWIN_ENV-MESA_LOADER_DRIVER_OVERRIDE=msm LD_PRELOAD=/usr/local/lib/droid-drm-takeover/drmfmt.so:/usr/local/lib/droid-drm-takeover/touchabs.so TOUCHABS_X_MIN=$DEV_TOUCH_ABS_X_MIN TOUCHABS_X_MAX=$DEV_TOUCH_ABS_X_MAX}"
+DEV_KWIN_ENV="${DEV_KWIN_ENV-MESA_LOADER_DRIVER_OVERRIDE=msm XDG_MENU_PREFIX=plasma- LD_PRELOAD=/usr/local/lib/droid-drm-takeover/drmfmt.so:/usr/local/lib/droid-drm-takeover/touchabs.so TOUCHABS_X_MIN=$DEV_TOUCH_ABS_X_MIN TOUCHABS_X_MAX=$DEV_TOUCH_ABS_X_MAX}"
 
 # plasmashell 的 Qt Quick 后端。
 #
