@@ -240,3 +240,79 @@ jobs:
         with:
           name: drmswitch-apk
           path: android/build/drmswitch.apk
+
+  # ════════════════════════════════════════════════════════════════════
+  # 4) 蓝牙 HCI 桥（HIDL 客户端，bionic）
+  #
+  #    ★ 为什么**不能**并进 job 1：
+  #      job 1 出的是跑在 drm 容器里的 glibc 工具；而这个桥必须跑在
+  #      **安卓侧** —— 它要访问 hwservicemanager（/dev/hwbinder）和 vendor
+  #      HAL 的 /vendor/lib64/android.hardware.bluetooth@1.0.so，而安卓用户态
+  #      是 bionic。glibc 二进制在安卓上根本起不来。所以它单独用 NDK 编。
+  #
+  #    runner（ubuntu-24.04）自带 Android SDK/NDK，环境变量是
+  #    ANDROID_NDK_LATEST_HOME。bt/build.sh 自己会探测 NDK 并挑可用的最高
+  #    API level（不写死：runner 镜像换代时写死的 API 会直接找不到编译器）。
+  #
+  #    ★ 这个 job 跑在**宿主机**上的还有 h4framing 单测 —— H4 拆包和 pty
+  #      短写这两段逻辑是"内核 H4 解析器一旦跑偏就永久哑"的入口，
+  #      能在宿主机断言的事绝不带到设备上去试。
+  # ════════════════════════════════════════════════════════════════════
+  btbridge:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 定位 Android NDK
+        run: |
+          set -eu
+          for c in "${ANDROID_NDK_LATEST_HOME:-}" "${ANDROID_NDK_HOME:-}" \
+                   "${ANDROID_NDK_ROOT:-}" /usr/local/lib/android/sdk/ndk/*; do
+            if [ -n "$c" ] && [ -d "$c/toolchains/llvm" ]; then
+              echo "NDK=$c" >> "$GITHUB_ENV"
+              echo "用 NDK: $c"
+              ls "$c"
+              exit 0
+            fi
+          done
+          echo "::error::runner 上没有可用的 Android NDK"
+          exit 1
+
+      - name: 构建（含 h4framing 宿主机单测）
+        run: sh bt/build.sh
+
+      - name: 校验产物
+        run: |
+          set -eu
+          B=bt/out/bthci-bridge
+          [ -f "$B" ] || { echo "::error::没产出 $B"; exit 1; }
+
+          desc=$(file -b "$B")
+          echo "file: $desc"
+          case "$desc" in
+            *"ARM aarch64"*) ;;
+            *) echo "::error file=$B::不是 aarch64: $desc"; exit 1 ;;
+          esac
+
+          # NEEDED 只允许 bionic 自带的三个。多出 libc++_shared.so /
+          # libhidlbase.so / libbinder_ndk.so 说明构建方式变了 —— 那些库在
+          # 安卓侧能不能按我们的假设加载是另一回事，必须在这里挡住。
+          deps=$(readelf -d "$B" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sort)
+          echo "NEEDED:"; echo "$deps"
+          for d in $deps; do
+            case "$d" in
+              libdl.so|libm.so|libc.so) ;;
+              *) echo "::error file=$B::依赖了预期外的库: $d"; exit 1 ;;
+            esac
+          done
+
+          # 16K 页设备（安卓 15+）上，段对齐小于 16K 的 PIE 会加载失败。
+          # -Wl,-z,max-page-size=16384 的判据就是 LOAD 段 align 字段。
+          readelf -lW "$B" | awk '$1=="LOAD" {print "LOAD align:", $NF}' | sort -u
+
+          ls -l "$B"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: btbridge-aarch64
+          path: bt/out/bthci-bridge

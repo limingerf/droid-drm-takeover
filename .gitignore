@@ -2,6 +2,8 @@
 bin/
 build/
 android/build/
+# 蓝牙桥的 NDK 产物（bt/build.sh 产出；由 CI 的 btbridge job 上传成 artifact）
+bt/out/
 *.o
 *.so
 
