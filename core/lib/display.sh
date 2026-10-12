@@ -1644,18 +1644,47 @@ drm_start_input_methods() {
     # KWin 读 kwinrc 的 [Wayland] InputMethod=。
     # ★ 另一个实测结论：**fcitx5 不提供虚拟键盘**，弹不出来是正常的 ——
     #   它是输入法引擎（服务物理键盘），触摸屏要的是 maliit。
+    #
+    # ★★ 2026-10-12 第二次实测：KWin **自己会拉起** InputMethod ★★
+    # 只要 kwinrc 里有这两行，KWin 就会 fork 出 maliit 并持有它：
+    #     [Wayland]
+    #     InputMethod[$e]=/usr/share/applications/com.github.maliit.keyboard.desktop
+    #     VirtualKeyboardEnabled=true
+    # 实测此时 `pgrep -x maliit-keyboard` 的父进程就是 kwin_wayland。
+    # ★ 所以**绝不能再手工起一个** —— 两个键盘窗口重叠会合成出拖影，
+    #   症状是"任务栏那有一层拖影，只有刚弹出那几秒有，之后消失"
+    #   （两个实例里有一个随后被收走）。屏幕键盘的启动权归 KWin。
+    #
+    # ★ 匹配要用 '^InputMethod' 而不是 '^InputMethod=' ——
+    #   KDE 自己写的是带展开标记的 `InputMethod[$e]=`，用等号匹配会漏判，
+    #   于是我们**再追加一行** InputMethod=，和 KDE 那行冲突。
     _kwinrc="$DESKTOP_HOME/.config/kwinrc"
     if [ -d "$DESKTOP_HOME/.config" ] && [ -n "${DEV_OSK_BIN:-}" ]; then
-        if [ ! -f "$_kwinrc" ] || ! grep -aq '^InputMethod=' "$_kwinrc" 2>/dev/null; then
+        _kwinrc_dirty=0
+        if [ ! -f "$_kwinrc" ] || ! grep -aq '^InputMethod' "$_kwinrc" 2>/dev/null; then
             if grep -aq '^\[Wayland\]' "$_kwinrc" 2>/dev/null; then
                 awk '/^\[Wayland\]$/ && !d {print; print "InputMethod='"$DEV_OSK_BIN"'"; d=1; next} {print}' \
                     "$_kwinrc" > "$_kwinrc.new" && mv "$_kwinrc.new" "$_kwinrc"
             else
                 printf '\n[Wayland]\nInputMethod=%s\n' "$DEV_OSK_BIN" >> "$_kwinrc"
             fi
-            chown "$DESKTOP_USER" "$_kwinrc" 2>/dev/null
+            _kwinrc_dirty=1
             drm_log "kwinrc 已写入 InputMethod=$DEV_OSK_BIN"
+        else
+            drm_log "kwinrc 已有 InputMethod（KWin 会据此拉起屏幕键盘），不覆盖"
         fi
+        # VirtualKeyboardEnabled 必须为 true，否则 KWin 不会为文本框拉起 OSK
+        if ! grep -aq '^VirtualKeyboardEnabled=true' "$_kwinrc" 2>/dev/null; then
+            if grep -aq '^\[Wayland\]' "$_kwinrc" 2>/dev/null; then
+                awk '/^\[Wayland\]$/ && !d {print; print "VirtualKeyboardEnabled=true"; d=1; next} {print}' \
+                    "$_kwinrc" > "$_kwinrc.new" && mv "$_kwinrc.new" "$_kwinrc"
+            else
+                printf '\n[Wayland]\nVirtualKeyboardEnabled=true\n' >> "$_kwinrc"
+            fi
+            _kwinrc_dirty=1
+            drm_log "kwinrc 已写入 VirtualKeyboardEnabled=true"
+        fi
+        [ "$_kwinrc_dirty" = 1 ] && chown "$DESKTOP_USER" "$_kwinrc" 2>/dev/null
     fi
 
     _ok=0
@@ -1734,26 +1763,34 @@ drm_start_input_methods() {
         drm_warn "  装法：network/net-takeover.sh deps，或在容器里 apt-get install -y libglib2.0-bin"
     fi
 
-    # maliit-keyboard：触摸屏屏幕键盘
+    # ── maliit-keyboard：**交给 KWin 启动，我们不起** ──────────
+    #
+    # ★★ 2026-10-12 实测（拖影根因）★★
+    # 上面已经把 kwinrc 的 [Wayland] InputMethod= 与 VirtualKeyboardEnabled=true
+    # 配好，KWin 会自己 fork 出 maliit 并持有它（实测父进程就是 kwin_wayland）。
+    #
+    # 这里原本还会**再手工起一个** maliit —— 后果是两个键盘窗口重叠：
+    #     $ for P in $(pgrep -x maliit-keyboard); do awk '{print $4}' /proc/$P/stat; done
+    #     21712      ← kwin_wayland（KWin 拉起的）
+    #     6197       ← 我们的 wrapper（多余的）
+    # 用户看到的症状是"任务栏那有一层拖影，只有刚弹出那几秒有，之后消失" ——
+    # 两个实例里有一个随后被收走，画面就自愈了。
+    #
+    # 所以这里只做**校验**，不启动。屏幕键盘的启动权归 KWin。
+    # 校验点：KWin 知道用哪个 OSK（kwinrc 里有 InputMethod），且 maliit 装了。
     if ds_exec 'command -v maliit-keyboard >/dev/null 2>&1' >/dev/null 2>&1; then
-        setsid nohup runuser -u "$DESKTOP_USER" -- \
-            env -u DISPLAY $_unset_env \
-                WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
-                XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
-                DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
-                QT_QPA_PLATFORM=wayland LANG="$_lang" \
-                XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
-                QT_IM_MODULE=maliit \
-            maliit-keyboard >>"${DRM_LOG_DIR}/maliit.log" 2>&1 &
-        sleep 6
-        if drm_pids_by_comm maliit-keyboard >/dev/null 2>&1 && \
-           [ -n "$(drm_pids_by_comm maliit-keyboard | head -1)" ]; then
-            drm_log "已拉起 maliit-keyboard（屏幕键盘，触摸屏可打字）"
+        if ds_exec "grep -aq '^InputMethod' '$DESKTOP_HOME/.config/kwinrc' 2>/dev/null" >/dev/null 2>&1; then
+            drm_log "屏幕键盘归 KWin 管理（kwinrc 的 InputMethod + VirtualKeyboardEnabled）"
+            drm_state_set OSK_OWNER kwin
             drm_state_set OSK_OK 1
         else
-            drm_warn "maliit-keyboard 没起来，看 ${DRM_LOG_DIR}/maliit.log"
+            drm_warn "kwinrc 里没有 InputMethod ⇒ KWin 不会拉起屏幕键盘"
             drm_state_set OSK_OK 0
         fi
+        # 顺带报一下当前实例数：>1 就说明有残留，会拖影
+        _osk_n=$(drm_pids_by_comm maliit-keyboard 2>/dev/null | grep -c . )
+        [ -n "$_osk_n" ] && [ "$_osk_n" -gt 1 ] 2>/dev/null && \
+            drm_warn "maliit 实例数=$_osk_n（>1 会拖影），应只有 KWin 那一个"
     fi
     return 0
 }
