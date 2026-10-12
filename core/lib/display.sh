@@ -1513,6 +1513,64 @@ drm_start_input_methods() {
     _lang=$2
     _im=$3
 
+    # ── kded6 ────────────────────────────────────────────────
+    # ★★ 2026-10-12 实测：本仓库从来没起过 kded6 ★★
+    # 上游 desk-takeover.sh 的注释原话："没有它所有 kded 模块都不在 ——
+    # 蓝牙托盘图标、配对代理、很多 KDE 功能"。
+    # 本机实测缺它的直接后果：
+    #   · 系统托盘里没有蓝牙图标（bluedevil.so 是 kded 模块）
+    #   · 设备自动挂载、通知、剪贴板同步、触摸板配置全都不工作
+    # ⚠️ 但它**不能**解决 WiFi 密钥代理问题 —— 实测 kded6 跑起来、
+    #    `loadModule networkmanagement` 也返回 true，而
+    #    org.freedesktop.NetworkManager.SecretAgent 仍然 no such name。
+    #    那个 kded 模块提供的是小程序后端，不是密钥代理。
+    #    密钥代理的绕行办法见 network/net-takeover.sh 的 nt_fix_secrets。
+    # ★ 放在输入法检查之前：kded6 是独立需求，不能因为没装输入法就跳过。
+    if ds_exec 'command -v kded6 >/dev/null 2>&1' >/dev/null 2>&1; then
+        if ds_exec 'pgrep -x kded6 >/dev/null 2>&1' >/dev/null 2>&1; then
+            drm_log "kded6 已在跑，复用"
+        else
+            setsid nohup runuser -u "$DESKTOP_USER" -- \
+                env -u DISPLAY $_unset_env \
+                    WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
+                    XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
+                    QT_QPA_PLATFORM=wayland LANG="$_lang" \
+                    XDG_MENU_PREFIX=plasma- XDG_CURRENT_DESKTOP=KDE \
+                    XDG_SESSION_TYPE=wayland \
+                kded6 >>"${DRM_LOG_DIR}/kded6.log" 2>&1 &
+            sleep 6
+            if ds_exec 'pgrep -x kded6 >/dev/null 2>&1' >/dev/null 2>&1; then
+                drm_log "已拉起 kded6（蓝牙托盘/设备通知/自动挂载等 kded 模块就位）"
+            else
+                drm_warn "kded6 没起来，看 ${DRM_LOG_DIR}/kded6.log"
+            fi
+        fi
+    else
+        drm_warn "容器里没有 kded6，跳过"
+    fi
+
+    # ── 屏幕键盘：告诉 KWin 用哪个 ────────────────────────────
+    # ★★ 2026-10-12 实测：只把 maliit-keyboard 跑起来**不够** ★★
+    # 用户反馈"没有输入法弹出屏幕键盘我没法输入密码"。maliit 进程在跑、
+    # 也连上了 Wayland，但点文本框不弹 —— 因为 KWin 不知道用哪个 OSK。
+    # KWin 读 kwinrc 的 [Wayland] InputMethod=。
+    # ★ 另一个实测结论：**fcitx5 不提供虚拟键盘**，弹不出来是正常的 ——
+    #   它是输入法引擎（服务物理键盘），触摸屏要的是 maliit。
+    _kwinrc="$DESKTOP_HOME/.config/kwinrc"
+    if [ -d "$DESKTOP_HOME/.config" ] && [ -n "${DEV_OSK_BIN:-}" ]; then
+        if [ ! -f "$_kwinrc" ] || ! grep -aq '^InputMethod=' "$_kwinrc" 2>/dev/null; then
+            if grep -aq '^\[Wayland\]' "$_kwinrc" 2>/dev/null; then
+                awk '/^\[Wayland\]$/ && !d {print; print "InputMethod='"$DEV_OSK_BIN"'"; d=1; next} {print}' \
+                    "$_kwinrc" > "$_kwinrc.new" && mv "$_kwinrc.new" "$_kwinrc"
+            else
+                printf '\n[Wayland]\nInputMethod=%s\n' "$DEV_OSK_BIN" >> "$_kwinrc"
+            fi
+            chown "$DESKTOP_USER" "$_kwinrc" 2>/dev/null
+            drm_log "kwinrc 已写入 InputMethod=$DEV_OSK_BIN"
+        fi
+    fi
+
     _ok=0
     for _c in fcitx5 maliit-keyboard; do
         ds_exec "command -v $_c >/dev/null 2>&1" >/dev/null 2>&1 && _ok=1
@@ -1524,6 +1582,7 @@ drm_start_input_methods() {
     fi
 
     # 先把上轮的残留清掉，避免重复实例互相顶
+    # ★ 注意**不要**杀 kded6 —— 它是单例守护，杀了会连带 kded 模块一起掉。
     ds_exec 'pkill -x fcitx5 2>/dev/null; pkill -x maliit-keyboard 2>/dev/null; true' >/dev/null 2>&1
     sleep 1
 

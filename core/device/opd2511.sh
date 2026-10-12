@@ -438,6 +438,22 @@ DEV_QT_QUICK_BACKEND="${DEV_QT_QUICK_BACKEND-}"
 #   在 3200x2000@144Hz 上这足以造成"整个 KDE 掉帧"。
 DEV_PLASMA_ENV="${DEV_PLASMA_ENV-MESA_LOADER_DRIVER_OVERRIDE=msm}"
 
+# 屏幕键盘（OSK）的绝对路径。留空 = 不写 kwinrc 的 InputMethod。
+#
+# ★ 2026-10-12 实测：**光把 OSK 进程跑起来不够**。
+#   用户反馈"没有输入法弹出屏幕键盘我没法输入密码"。当时 maliit-keyboard
+#   进程在跑、也连上了 Wayland，但点文本框不弹 —— 因为 KWin 不知道用哪个 OSK。
+#   KWin 读 kwinrc 的 `[Wayland] InputMethod=`，写进去之后才弹。
+#
+# ★ 另一个实测结论：**fcitx5 不能当 OSK**。用户原话"屏幕键盘只有 maliit 能弹,
+#   fcitx5 不行"。这是正常的 —— fcitx5 是输入法引擎（服务物理键盘打中文），
+#   不实现 Wayland 的虚拟键盘协议；触摸屏要的是 maliit-keyboard。
+#
+# ⚠️ 两者都想注册 zwp_input_method_v2，会互相顶。本机优先保 maliit
+#   （触摸设备第一需求是"能打字"），所以 fcitx5 只用 -d 后台起引擎、
+#   靠 QT_IM_MODULE=fcitx 被应用加载，不去抢 input-method 协议。
+DEV_OSK_BIN="${DEV_OSK_BIN-/usr/bin/maliit-keyboard}"
+
 # LD_PRELOAD shim 路径（tools/runtime/drmfmt.c）。留空 = 用默认
 #   /usr/local/lib/droid-drm-takeover/drmfmt.so（deploy-all.sh 装到那儿）。
 # ★ 别指到 payload 的 bin/ 下：容器里 /root 是 700，而 kwin 以桌面账号

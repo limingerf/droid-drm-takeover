@@ -271,6 +271,225 @@ nt_proxy_bridge() {
     drm_warn "撤掉：adb reverse --remove-all"
 }
 
+# ── ★★ 出网兜底路由（没有它，WiFi 连上了也打不开网页）★★ ──
+#
+# 本次调试最关键的一环，症状极具欺骗性：
+#   · wlan0 拿到 IP、ping 得通网关、DNS 也解析得出来
+#   · 但 `ip route get 1.1.1.1` 报 `Network is unreachable`，浏览器打不开网页
+#
+# 根因：NetworkManager 把默认路由写进 **main 表**，而安卓 netd 的 rule 列表里
+# **根本没有 `32766: from all lookup main`**。实测本机 netd 的 rule 是：
+#
+#       0:     from all lookup local
+#   11000:     from all iif lo oif dummy0 uidrange 0-0 lookup 1002
+#   16000:     from all fwmark 0x10063/0x1ffff iif lo lookup 97
+#   17000:     from all iif lo oif dummy0 lookup 1002
+#   20000:     from all fwmark 0/0x10000 lookup 97
+#   32000:     from all unreachable          ← 直接不可达
+#
+# ⇒ main 表永远不被查 ⇒ NM 的默认路由形同不存在。
+#
+# 解法（与上游 net-fix.sh 的 do_route 一致）：**只加不改** ——
+# 建自己的一张表 + 一条优先级夹在 netd 的 20000 与 32000 之间的 rule。
+# `iif lo` 只匹配**本机发出**的包，和 netd 自己那条 31000 同形状，
+# 所以安卓侧的 tethering/转发流量不会被误引到我们这张表上。
+#
+# ⚠️ 红线：绝不 `ip rule flush`（会拆掉 netd 的策略路由地基）。
+#          也绝不删 netd 的任何 rule/table，只新增。
+nt_fix_route() {
+    _if=${DEV_WIFI_IF:-wlan0}
+    _tbl=${DEV_ROUTE_TABLE:-1042}
+    _pref=${DEV_ROUTE_PREF:-31500}
+
+    if ! ds_exec "ip -4 -o addr show $_if 2>/dev/null | grep -q 'inet '" >/dev/null 2>&1; then
+        drm_warn "出网兜底：$_if 还没有 IPv4，跳过"
+        return 0
+    fi
+
+    # 网关：优先从 netd 的 per-interface 表（表号 = 1000 + ifindex）读
+    _idx=$(ds_exec "cat /sys/class/net/$_if/ifindex 2>/dev/null" 2>/dev/null | tr -d '\r')
+    _gw=""
+    for _t in $((1000 + ${_idx:-0})) $_tbl; do
+        _g=$(ds_exec "ip -4 route show table $_t 2>/dev/null | awk '/^default/{print \$3; exit}'" 2>/dev/null | tr -d '\r')
+        [ -n "$_g" ] && { _gw=$_g; break; }
+    done
+    if [ -z "$_gw" ]; then
+        # 退一步：从同网段的 scope link 路由推（末位换 .1）
+        _g=$(ds_exec "ip -4 route show table all 2>/dev/null | grep 'dev $_if' | grep 'scope link' | head -1" 2>/dev/null | tr -d '\r')
+        _gw=$(printf '%s' "$_g" | awk '{print $1}' | sed 's|/.*||' | sed 's/\.[0-9]*$/.1/')
+    fi
+    if [ -z "$_gw" ]; then
+        drm_warn "出网兜底：探不到网关，跳过（网络可能还没起来）"
+        return 0
+    fi
+    _net=$(printf '%s' "$_gw" | sed 's/\.[0-9]*$/.0/')
+    drm_log "出网兜底：接口=$_if 网关=$_gw 网段=$_net 表=$_tbl pref=$_pref"
+
+    # 递归路由必须先建：网段直连（scope link），否则默认路由会被内核判
+    # "Nexthop invalid" 而拒绝。
+    ds_exec "ip -4 route replace $_net/24 dev $_if scope link table $_tbl 2>/dev/null
+             ip -4 route replace default via $_gw dev $_if onlink table $_tbl 2>/dev/null
+             ip -4 route show table $_tbl" 2>&1 | tr -d '\r' | sed 's/^/    /'
+
+    # rule：先删同 pref 的旧条目再建（`ip rule add` 会重复堆叠，
+    # 上游实测堆过 24600 条）。
+    ds_exec "while ip rule show 2>/dev/null | grep -q '^$_pref:'; do
+                 ip rule del pref $_pref 2>/dev/null || break
+             done
+             ip rule add pref $_pref iif lo lookup $_tbl 2>/dev/null
+             ip rule show 2>/dev/null | head -14" 2>&1 | tr -d '\r' | sed 's/^/    /'
+
+    if ds_exec "ip rule show 2>/dev/null | grep -q '^$_pref:.*lookup $_tbl'" >/dev/null 2>&1; then
+        drm_log "出网兜底已就位（$_pref iif lo → 表 $_tbl）"
+        drm_state_set NET_ROUTE_FIX 1
+    else
+        drm_warn "出网兜底 rule 未生效"
+        drm_state_set NET_ROUTE_FIX 0
+    fi
+}
+
+# DNS：NM 那边设了 dns=none，所以这里直接写死。
+# 容器原本的 /etc/resolv.conf 是指向 /run/droidspaces/resolv.conf 的符号链接，
+# 那个文件由 Droidspaces 启动时写、内容随安卓状态变 —— 接管后不可靠。
+nt_fix_dns() {
+    drm_log "写 DNS（223.5.5.5 / 119.29.29.29）"
+    ds_exec '[ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+             printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > /etc/resolv.conf
+             cat /etc/resolv.conf' 2>&1 | tr -d '\r' | sed 's/^/    /'
+}
+
+# ── ★★ 密钥代理缺失的绕行 ★★ ──────────────────────────────
+#
+# 本机实测：容器里**没有** NetworkManager 的密钥代理。
+#   · kded6 已在跑，`loadModule networkmanagement` 也返回 true，
+#     但 `org.freedesktop.NetworkManager.SecretAgent` 仍然 `no such name`
+#     ⇒ 那个 kded 模块提供的是小程序后端，**不是**密钥代理。
+#   · 后果：用户在 plasma-nm 图形界面里输的密码 NM 收不到，日志报
+#         device (wlan0): no secrets: No agents were available for this request.
+#         device (wlan0): state change: need-auth -> failed (reason 'no-secrets')
+#
+# 绕行办法（已验证有效）：让 NM **自己保存**密码 ——
+#   ① 把连接的 `psk-flags` 从 1（代理持有）改成 0（NM 持有）
+#   ② 用 `nmcli device wifi connect <SSID> password <PSK>` 连一次
+#      —— 密码直达 NM，不经过任何代理，然后被写进 .nmconnection
+#   ③ 之后托盘小程序再连就不需要代理了
+nt_fix_secrets() {
+    drm_log "让 NM 自己保存 WiFi 密码（绕开缺失的密钥代理）"
+    ds_exec 'for f in /etc/NetworkManager/system-connections/*.nmconnection; do
+                 [ -f "$f" ] || continue
+                 sed -i "s/^psk-flags=1$/psk-flags=0/" "$f"
+                 chmod 600 "$f"
+             done
+             systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager 2>/dev/null
+             sleep 5
+             systemctl is-active NetworkManager' 2>&1 | tr -d '\r' | sed 's/^/    /'
+}
+
+# 触摸屏上可用的连 WiFi 入口。
+# ★ 为什么需要：plasma-nm 的图形面板因为密钥代理缺失收不到密码（见上），
+#   而触摸屏上又没法方便地敲长命令。给一个"点图标 → 问 SSID → 问密码"的入口。
+# ★ 用 base64 传递脚本内容：ds_exec 把整条命令交给容器里的 shell 解析，
+#   直接内嵌带引号的脚本会被吃引号（本仓库反复踩过）。
+nt_install_helper() {
+    drm_log "安装触摸屏连 WiFi 入口"
+
+    _wc='#!/bin/sh
+# wifi-connect —— 触摸屏上连 WiFi：列热点 → 问 SSID → 问密码 → 交给 NM 保存
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+printf "\n\033[1;36m=== 可用热点 ===\033[0m\n"
+timeout 30 nmcli -f SSID,SIGNAL,SECURITY device wifi list --rescan yes 2>/dev/null | head -n 25
+printf "\n\033[1;33m请输入 WiFi 名称（SSID），直接回车取消: \033[0m"
+read -r SSID
+[ -n "$SSID" ] || { echo "已取消"; exit 0; }
+printf "\033[1;33m请输入密码（输入时不显示）: \033[0m"
+stty -echo 2>/dev/null; read -r PSK; stty echo 2>/dev/null; printf "\n"
+printf "\n\033[1;36m正在连接 %s ...\033[0m\n" "$SSID"
+if [ -n "$PSK" ]; then
+    timeout 90 nmcli device wifi connect "$SSID" password "$PSK" 2>&1
+else
+    timeout 90 nmcli device wifi connect "$SSID" 2>&1
+fi
+RC=$?
+printf "\n\033[1;36m=== 结果 ===\033[0m\n"
+nmcli -f DEVICE,STATE,CONNECTION device status 2>/dev/null | grep -E "DEVICE|wlan0"
+ip -4 -o addr show wlan0 2>/dev/null || echo "  （还没拿到 IP）"
+
+# ★★ 关键：连上之后必须补出网兜底路由，否则"拿到 IP 但打不开网页" ★★
+# 原因见 network/README.md：安卓 netd 的 rule 里没有 32766 lookup main，
+# 所以 NetworkManager 写进 main 表的默认路由永远不会被查。
+if ip -4 -o addr show wlan0 2>/dev/null | grep -q "inet "; then
+    printf "\n\033[1;36m=== 补出网路由 ===\033[0m\n"
+    TBL=1042; PREF=31500; IFACE=wlan0
+    IDX=$(cat /sys/class/net/$IFACE/ifindex 2>/dev/null)
+    GW=""
+    for t in $((1000 + ${IDX:-0})) $TBL; do
+        g=$(ip -4 route show table "$t" 2>/dev/null | awk "/^default/{print \$3; exit}")
+        [ -n "$g" ] && { GW=$g; break; }
+    done
+    if [ -z "$GW" ]; then
+        r=$(ip -4 route show table all 2>/dev/null | grep "dev $IFACE" | grep "scope link" | head -1)
+        GW=$(printf "%s" "$r" | awk "{print \$1}" | sed "s|/.*||" | sed "s/\.[0-9]*$/.1/")
+    fi
+    if [ -n "$GW" ]; then
+        NET=$(printf "%s" "$GW" | sed "s/\.[0-9]*$/.0/")
+        ip -4 route replace "$NET/24" dev "$IFACE" scope link table "$TBL" 2>/dev/null
+        ip -4 route replace default via "$GW" dev "$IFACE" onlink table "$TBL" 2>/dev/null
+        while ip rule show 2>/dev/null | grep -q "^$PREF:"; do
+            ip rule del pref "$PREF" 2>/dev/null || break
+        done
+        ip rule add pref "$PREF" iif lo lookup "$TBL" 2>/dev/null
+        echo "  网关 $GW → 表 $TBL，rule $PREF"
+    fi
+    printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" > /etc/resolv.conf 2>/dev/null
+    printf "\n\033[1;36m=== 出网自证 ===\033[0m\n"
+    timeout 8 ping -c 2 -W 2 223.5.5.5 >/dev/null 2>&1 && echo "  PING-OK" || echo "  PING-FAIL"
+    timeout 10 getent hosts www.baidu.com >/dev/null 2>&1 && echo "  DNS-OK" || echo "  DNS-FAIL"
+    timeout 20 curl -sS -o /dev/null -w "  HTTP %{http_code}\n" http://www.baidu.com 2>&1
+fi
+
+printf "\n\033[1;33m按回车关闭\033[0m\n"; read -r _
+exit $RC
+'
+    _desk='[Desktop Entry]
+Type=Application
+Name=连接 WiFi
+Name[en]=Connect WiFi
+Comment=列出热点并输入密码连接
+Exec=/usr/bin/konsole -e /usr/local/bin/wifi-connect
+Icon=network-wireless
+Terminal=false
+Categories=Network;Settings;
+'
+    _wc_b64=$(printf '%s' "$_wc" | base64 -w0 2>/dev/null || printf '%s' "$_wc" | base64 | tr -d '\n')
+    _desk_b64=$(printf '%s' "$_desk" | base64 -w0 2>/dev/null || printf '%s' "$_desk" | base64 | tr -d '\n')
+
+    ds_exec "printf '%s' '$_wc_b64' | base64 -d > /usr/local/bin/wifi-connect
+             chmod 755 /usr/local/bin/wifi-connect
+             printf '%s' '$_desk_b64' | base64 -d > /usr/share/applications/wifi-connect.desktop
+             chmod 644 /usr/share/applications/wifi-connect.desktop" >/dev/null 2>&1
+
+    # 刷新应用菜单缓存，否则新图标不会出现在启动器里
+    _uhome="/home/${DEV_USER:-Gold}"
+    ds_exec "runuser -u ${DEV_USER:-Gold} -- env HOME=$_uhome \
+                 LANG=en_US.UTF-8 XDG_MENU_PREFIX=plasma- \
+                 kbuildsycoca6 --noincremental" >/dev/null 2>&1
+
+    if ds_exec 'test -x /usr/local/bin/wifi-connect' >/dev/null 2>&1; then
+        drm_log "已安装 /usr/local/bin/wifi-connect + 桌面图标「连接 WiFi」"
+    else
+        drm_warn "wifi-connect 安装失败"
+    fi
+}
+
+# 自证：真的能上网了吗（而不是"配置看起来对"）
+nt_verify_egress() {
+    drm_log "自证出网"
+    ds_exec 'timeout 8 ping -c 2 -W 2 223.5.5.5 >/dev/null 2>&1 && echo "PING-OK" || echo "PING-FAIL"
+             timeout 10 getent hosts www.baidu.com >/dev/null 2>&1 && echo "DNS-OK" || echo "DNS-FAIL"
+             timeout 20 curl -sS -o /dev/null -w "HTTP %{http_code}\n" http://www.baidu.com 2>&1' \
+        2>&1 | tr -d '\r' | sed 's/^/    /'
+}
+
 # ── 总入口 ────────────────────────────────────────────────
 
 nt_status() {
@@ -305,10 +524,18 @@ nt_takeover() {
     nt_stop_android_wifi
     nt_write_nm_conf
     nt_write_polkit
+    nt_fix_secrets
+    nt_install_helper
+    nt_fix_dns
     nt_start_nm
     nt_verify || true
 
-    drm_log "接管完成 —— 托盘网络图标里选热点，凭据在图形界面输（脚本不经手密码）"
+    # ★ 出网兜底要在 wlan0 **拿到 IP 之后**才能建，所以这里只试一次；
+    #   真正的时机是用户连上之后 —— wifi-connect 会自动补（见 nt_install_helper）。
+    nt_fix_route || true
+
+    drm_log "接管完成 —— 用桌面图标「连接 WiFi」输密码（脚本不经手凭据）"
+    drm_log "  连上后 wifi-connect 会自动补出网路由；也可手工跑：net-takeover.sh route"
 }
 
 nt_restore() {
@@ -348,16 +575,26 @@ case "${1:-status}" in
     deps)         nt_install_deps ;;
     tray)         nt_add_tray_applets ;;
     glibc-fix)    nt_fix_glibc_ipv4 ;;
+    route)        nt_fix_route ;;
+    dns)          nt_fix_dns ;;
+    secrets)      nt_fix_secrets ;;
+    helper)       nt_install_helper ;;
+    egress)       nt_verify_egress ;;
     proxy-bridge) shift; nt_proxy_bridge "$@" ;;
     *)
         cat <<'USAGE'
 用法: net-takeover.sh <子命令>
 
-  takeover       接管 wlan0（停安卓 WiFi 栈 + 起容器 NetworkManager + polkit + 托盘）
+  takeover       接管 wlan0（停安卓 WiFi 栈 + 起容器 NetworkManager + polkit + 触摸入口）
   status         只读状态（安卓服务 / 链路 / 容器 NM）
   restore        交还给安卓
   deps           在容器里装 WiFi/蓝牙/输入法/屏幕键盘依赖（需容器能上网）
   tray           只把网络+蓝牙小程序加进系统托盘
+  route          ★ 补出网兜底路由（拿到 IP 后必须做，否则打不开网页）
+  dns            写 DNS（223.5.5.5 / 119.29.29.29）
+  secrets        把 psk-flags 改成 0，让 NM 自己保存密码（绕开缺失的密钥代理）
+  helper         只装触摸屏连 WiFi 入口（/usr/local/bin/wifi-connect + 桌面图标）
+  egress         自证出网（ping / DNS / HTTP，不是"配置看起来对"）
   glibc-fix      修 glibc AI_ADDRCONFIG（容器没非环回 IPv4 时 apt 解析失败）
   proxy-bridge [端口]
                  打印"用 adb reverse 给容器开临时代理通道"的步骤（默认 7897）

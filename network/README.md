@@ -147,7 +147,139 @@ HCI 桥（`bthci-bridge`）**尚未移植**。
 
 ---
 
-## 8. 实测状态（2026-10-12）
+## 8. ★★ 最容易漏的一步：出网兜底路由 ★★
+
+**症状极具欺骗性 —— WiFi 连上了、拿到 IP 了，但浏览器打不开任何网页。**
+
+实测现场：
+
+```
+wlan0    inet 192.168.31.23/24              ← 有 IP
+ping 192.168.31.1   → 0% 丢包               ← 通网关
+getent hosts www.baidu.com → 解析成功       ← DNS 也正常
+ip route get 1.1.1.1 → RTNETLINK answers: Network is unreachable   ← 但出不去
+```
+
+**根因**：NetworkManager 把默认路由写进 **main 表**，而安卓 netd 的 rule
+列表里**根本没有 `32766: from all lookup main`**：
+
+```
+netd 的 rule（实测本机）：
+    0:     from all lookup local
+    11000: from all iif lo oif dummy0 uidrange 0-0 lookup 1002
+    16000: from all fwmark 0x10063/0x1ffff iif lo lookup 97
+    17000: from all iif lo oif dummy0 lookup 1002
+    20000: from all fwmark 0/0x10000 lookup 97
+    32000: from all unreachable          ← 没有任何 lookup main
+```
+
+⇒ **main 表永远不被查，NM 的默认路由形同不存在。**
+
+**解法**（与上游 `net-fix.sh` 的 `do_route` 一致，**只加不改**）：
+
+```sh
+TBL=1042; PREF=31500; IFACE=wlan0
+ip -4 route replace $NET/24 dev $IFACE scope link table $TBL
+ip -4 route replace default via $GW dev $IFACE onlink table $TBL
+ip rule add pref $PREF iif lo lookup $TBL
+```
+
+```
+结果：
+  表 1042:  default via 192.168.31.1 dev wlan0 onlink
+            192.168.31.0/24 dev wlan0 scope link
+  rule:     31500: from all iif lo lookup 1042      ← 夹在 20000 与 32000 之间
+```
+
+**三个要点**：
+
+1. **递归路由必须先建** —— 网段直连（`scope link`）要在默认路由之前，
+   否则内核判 `Nexthop invalid` 直接拒绝。
+2. **`iif lo` 不能省** —— 它只匹配**本机发出**的包，和 netd 自己那条 31000
+   同形状，所以安卓侧的 tethering/转发流量不会被误引到我们这张表上。
+3. **`ip rule add` 会重复堆叠** —— 必须先 `while ... grep -q "^$PREF:"; do
+   ip rule del pref $PREF; done`。上游实测堆过 24600 条。
+
+⚠️ 红线：**绝不 `ip rule flush`**（会拆掉 netd 的策略路由地基）；
+也绝不删 netd 的任何 rule/table，只新增。
+
+**执行时机**：必须在 wlan0 **拿到 IP 之后**，所以它不在 `takeover` 里完成，
+而是由 `wifi-connect` 在连上之后自动补。也可手工跑：
+
+```sh
+sh network/net-takeover.sh route
+sh network/net-takeover.sh egress     # 自证：ping / DNS / HTTP
+```
+
+修好后的自证结果：
+
+```
+HTTP  200   0.064s  -> http://www.baidu.com/
+HTTPS 200   0.103s
+```
+
+---
+
+## 9. ★★ 密钥代理缺失：图形界面输的密码 NM 收不到 ★★
+
+**症状**：在 plasma-nm 图形面板里输入了密码、点了连接，但连不上。
+
+**日志里的决定性一行**：
+
+```
+device (wlan0): Activation: (wifi) access point 'ImmortalWrt' has security, but secrets are required.
+device (wlan0): state change: config -> need-auth (reason 'none')
+device (wlan0): no secrets: No agents were available for this request.    ← ★
+device (wlan0): state change: need-auth -> failed (reason 'no-secrets')
+```
+
+**根因**：容器里**没有** NetworkManager 的密钥代理（secret agent）。
+
+排查过程（都排除掉了）：
+
+| 检查 | 结果 |
+|---|---|
+| `kded6` 在跑吗 | ✓ 在跑（但本仓库从来没人起过它，是本次新加的） |
+| kded 有 `networkmanagement.so` 吗 | ✓ 有 |
+| 强制 `loadModule networkmanagement` | ✓ 返回 `boolean true` |
+| `org.freedesktop.NetworkManager.SecretAgent` | ✗ **no such name** |
+| 全盘找 `plasmanm_secretagent` | ✗ 不存在 |
+| `plasma-nm` 包里带的可执行 | ✗ 只有 plasmoid，没有代理二进制 |
+
+⇒ **kded 的 `networkmanagement` 模块提供的是小程序后端，不是密钥代理。**
+Plasma 6 里那个代理不在 kded 里。
+
+**绕行办法（已验证有效）—— 让 NM 自己保存密码**：
+
+1. 把连接的 `psk-flags` 从 `1`（代理持有）改成 `0`（NM 持有）：
+
+   ```sh
+   sh network/net-takeover.sh secrets
+   ```
+
+2. 用 `nmcli` 连一次 —— 密码**直达 NM，不经过任何代理**，然后被写进
+   `.nmconnection`：
+
+   ```sh
+   nmcli device wifi connect "ImmortalWrt" password "<密码>"
+   ```
+
+3. 之后托盘小程序再连就**不需要代理**了（NM 自己手里有密码）。
+
+为了让触摸屏上也能方便地做第 2 步，脚本会装一个入口：
+
+```sh
+sh network/net-takeover.sh helper
+# 装出：
+#   /usr/local/bin/wifi-connect                    （列热点→问 SSID→问密码→连接→补路由→自证）
+#   /usr/share/applications/wifi-connect.desktop   （应用菜单里的「连接 WiFi」图标）
+```
+
+`wifi-connect` 会顺带把**第 8 节的出网路由**也补上，所以用户只需要点一次图标。
+
+---
+
+## 10. 实测状态（2026-10-12）
 
 容器内已验证可用：
 
