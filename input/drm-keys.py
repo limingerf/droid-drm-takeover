@@ -155,6 +155,9 @@ BL_FALLBACK = int(os.environ.get('BL_FALLBACK', '2048'))
 # 保存亮度时的最小可用值：低于它的读数视为"脏值"（安卓关机残留），
 # 不作为"用户原亮度"保存，亮屏时改用 BL_FALLBACK。
 BL_MIN = int(os.environ.get('BL_MIN', '10'))
+# 是否在设背光时同时同步 PowerDevil 的亮度（见下面 _bl_set_via_powerdevil 注释）。
+# 关掉它只是让熄屏"更容易被 PowerDevil 抢回去"，一般不要关。
+POWERDEVIL_BRIGHTNESS = os.environ.get('POWERDEVIL_BRIGHTNESS', '1') != '0'
 LOCKF = '/run/drm-keys.lock'            # 单例锁
 
 RUNDIR = os.environ.get('RUNDIR', '/run/user/1000')
@@ -403,6 +406,19 @@ def bl_set(v):
         return False
 
 
+def bl_max():
+    """背光节点的 max_brightness（本机 4095）。读不到返回 None。
+
+    ★ 用途：把 sysfs 亮度换算到 PowerDevil 的 0..10000 量程。
+    """
+    if not BLDIR:
+        return None
+    try:
+        return int(open(BLDIR + '/max_brightness').read().strip())
+    except Exception:
+        return None
+
+
 def bl_save():
     """把**当前**背光保存为"用户原亮度"，供亮屏时恢复。
 
@@ -449,6 +465,100 @@ def bl_restore():
         log("背光保存值不可用（%s）⇒ 用兜底 %d" % (v, BL_FALLBACK))
         v = BL_FALLBACK
     bl_set(v)
+    # ★ 同时把 PowerDevil 的亮度设回同一个值（见 bl_set_via_powerdevil 的注释）
+    if POWERDEVIL_BRIGHTNESS:
+        _bl_set_via_powerdevil(_sysfs_to_pd(v))
+
+
+# ═══════════════ 与 PowerDevil 抢背光的对策（2026-10-12 实测） ═══════════════
+#
+# 症状：按电源键熄屏，屏幕黑一下又自己亮回来 ⇒ "只会闪一下，无法息屏"。
+#
+# 根因（实测，不是猜）：
+#   另一个线程刚把 PowerDevil 跑起来了（display/powerdevil-enable.sh），
+#   它现在**管着背光** —— 通过 KWin 的 kde_external_brightness_v1 写 sysfs。
+#   我们直接写 sysfs 把背光置 0 时，**PowerDevil 的缓存值不变**，
+#   它随后（实测 13~19 秒后，不定期）把背光写回自己的值 ⇒ 屏幕又亮。
+#   实测轨迹（每 0.3s 采样 sysfs）：
+#     0.3s 2048→420  0.6s 420→5  2.1s 5→1  13.2s 1→2048  14.1s→0  16.2s→2048
+#   注意 13.2s 那次 1→2048 不是我们写的，也不是 keepbright（它没在跑）。
+#   用 busctl monitor 看到反复问 org.freedesktop.ScreenSaver 的正是
+#   org_kde_powerdevil（pid 13790）。
+#
+# 对策（两层，缺一不可）：
+#   ① **把 PowerDevil 的亮度也设成 0**（走它的 D-Bus 接口
+#      org.kde.ScreenBrightness.Display.SetBrightness），这样它的缓存值
+#      和我们一致，它就没有"要恢复的值"了。
+#      ★ 实测：PowerDevil 对**内置屏**有 clamp，设 0 会变成 1（最低 1）。
+#        所以光靠①不够 —— 1/4095 虽然几乎全黑，但严格说不是 0。
+#   ② **熄屏期间持续把 sysfs 钉在 0**（_enforce_screen_off，每轮主循环一次）。
+#      这是最终保证：不管谁写回，我们 0.5s 内改回 0。
+#      带"被抢次数"计数并记日志，这样"有人跟我们抢"这件事**看得见**，
+#      而不是变成"偶尔失灵"的幽灵 bug。
+#
+# ★ 为什么不在熄屏时把 PowerDevil 停掉：那会影响用户正在用的亮度滑块，
+#   而且 stop 会让背光被 reset 到 0（powerdevil-enable.sh 的注释里记了这个坑）。
+#   钉住 + 同步缓存是侵入性最小的做法。
+
+def _sysfs_to_pd(v):
+    """sysfs 亮度 → PowerDevil 的 0..10000 量程。"""
+    m = bl_max()
+    if not m:
+        return v
+    try:
+        return int(round(float(v) * 10000.0 / float(m)))
+    except Exception:
+        return v
+
+
+def _bl_set_via_powerdevil(value):
+    """通过 PowerDevil 的 D-Bus 接口设亮度（0..10000）。返回 True/False。"""
+    rc, out = as_user(['gdbus', 'call', '--session',
+                       '--dest', 'org.kde.ScreenBrightness',
+                       '--object-path', '/org/kde/ScreenBrightness/display0',
+                       '--method',
+                       'org.kde.ScreenBrightness.Display.SetBrightness',
+                       str(int(value)), '0'])
+    if rc != 0:
+        log("  !! 通过 PowerDevil 设亮度失败 rc=%s %s" % (rc, out[:120]))
+    return rc == 0
+
+
+def _powerdevil_brightness():
+    """读 PowerDevil 当前的亮度值（0..10000）。读不到返回 None。"""
+    rc, out = as_user(['gdbus', 'call', '--session',
+                       '--dest', 'org.kde.ScreenBrightness',
+                       '--object-path', '/org/kde/ScreenBrightness/display0',
+                       '--method', 'org.freedesktop.DBus.Properties.Get',
+                       'org.kde.ScreenBrightness.Display', 'Brightness'])
+    if rc != 0:
+        return None
+    try:
+        # 形如 (<5000>,)
+        return int(out.strip().strip('()<>,').split(',')[0])
+    except Exception:
+        return None
+
+
+# 熄屏期间"有人把背光写回来"的计数。>0 就说明有别的进程在抢。
+_SCREEN_OFF_STOLEN = [0]
+
+
+def _enforce_screen_off():
+    """熄屏期间把 sysfs 背光钉在 0。返回 True 表示这次是"从别人手里抢回来"的。"""
+    if not screen_is_off():
+        return False
+    cur = bl_get()
+    if cur == 0:
+        return False
+    bl_set(0)
+    _SCREEN_OFF_STOLEN[0] += 1
+    n = _SCREEN_OFF_STOLEN[0]
+    # 只在第 1 次和每 20 次记日志，避免刷屏
+    if n == 1 or n % 20 == 0:
+        log("  !! 熄屏期间背光被人写成 %s（第 %d 次）⇒ 已改回 0"
+            "（PowerDevil 在抢，见 drm-keys.py 顶部注释）" % (cur, n))
+    return True
 
 
 def screen_is_off():
@@ -472,15 +582,18 @@ def dpms(arg):
 
 
 def screen_off():
-    # ★ 顺序（和 display/keepbright.sh 的协作有关，别调）：
+    # ★ 顺序（和 display/keepbright.sh、PowerDevil 的协作有关，别调）：
     #   ① 先置标志：keepbright 每 5 秒回写背光，它靠 /run/drm-keys.screenoff
     #      判断"现在是熄屏状态，别把亮度钉回来"。如果先写背光 0 再置标志，
     #      中间那几毫秒里 keepbright 可能刚好把亮度钉回去 ⇒ 屏幕闪一下。
-    #   ② 背光 0
+    #   ② 背光 0（**同时把 PowerDevil 的亮度设成 0**，否则它会把背光写回来，
+    #      见 _bl_set_via_powerdevil 上面的长注释）
     #   ③ DPMS off
     set_screen_off_flag(True)
     bl_save()
     ok = bl_set(0)
+    if POWERDEVIL_BRIGHTNESS:
+        _bl_set_via_powerdevil(0)
     rc, out = dpms('off')
     if rc != 0:
         # ★ 不要静默：DPMS 失败时屏幕只是"黑"，背光已灭但管线还在扫，
@@ -499,6 +612,12 @@ def screen_on():
     bl_restore()
     if rc != 0:
         log("!! 亮屏：dpms on 失败 rc=%s" % rc)
+    # ★ 把"熄屏期间被抢次数"清零并汇报：>0 说明有别的进程（PowerDevil）
+    #   在跟我们抢背光，这个数字是排查这类"偶尔失灵"的关键线索。
+    _n = _SCREEN_OFF_STOLEN[0]
+    if _n:
+        log("亮屏：本次熄屏期间背光被抢 %d 次（已全部改回 0）" % _n)
+        _SCREEN_OFF_STOLEN[0] = 0
     log("亮屏：dpms on rc=%s 背光→%s%s"
         % (rc, bl_get(), (' | ' + out.replace('\n', ' ')[:200]) if out else ''))
 
@@ -686,7 +805,10 @@ def run(skip_lock=None):
 
     while True:
         try:
-            r, _, _ = select.select(list(fds), [], [], 5.0)
+            # ★ 超时从 5.0 缩到 0.5：熄屏期间要每轮把背光钉回 0
+            #   （_enforce_screen_off），5 秒一次的话屏幕会明显亮 5 秒。
+            #   0.5s 的代价只是一次 sysfs 读（只在熄屏时读，亮屏时只看标志文件）。
+            r, _, _ = select.select(list(fds), [], [], 0.5)
         except InterruptedError:
             continue
 
@@ -700,6 +822,10 @@ def run(skip_lock=None):
                 off_since = None
         else:
             off_since = None
+
+        # ★ 熄屏期间把背光钉在 0：PowerDevil 会不定期把它的缓存值写回来
+        #   （实测 13~19 秒后），不钉的话现象就是"按电源键只闪一下"。
+        _enforce_screen_off()
 
         if not r:
             continue
@@ -971,12 +1097,39 @@ def selftest(stp=''):
     check("长按被忽略", screen_is_off() and bl_get() == 0,
           "背光=%s 标志=%s" % (bl_get(), screen_is_off()))
 
+    # ── 3b) ★ 关键：熄屏必须**扛过 PowerDevil 的抢写窗口** ──
+    #   2026-10-12 用户实测症状"按电源键只闪一下，无法息屏"。
+    #   根因：PowerDevil 在 13~19 秒后把它的缓存亮度写回 sysfs。
+    #   所以只检查"按下去那一刻是黑的"**根本不够** —— 必须持续观察。
+    #   这里盯 26 秒（覆盖实测的 13~19 秒窗口），要求全程背光=0。
+    print("\n[3b] 熄屏保持 26 秒（扛过 PowerDevil 抢写窗口，实测它在 13~19s 动手）")
+    _hold_bad = []
+    _t0 = time.time()
+    while time.time() - _t0 < 26:
+        _v = bl_get()
+        if _v != 0:
+            _hold_bad.append((round(time.time() - _t0, 1), _v))
+        time.sleep(0.3)
+    check("熄屏 26 秒内始终为 0", not _hold_bad,
+          ("中途被写成 %s（已由守护改回）" % _hold_bad[:5]) if _hold_bad
+          else "全程 0，被抢 %d 次" % _SCREEN_OFF_STOLEN[0])
+
     # ── 4) 再短按：亮屏并恢复原亮度 ──
     print("\n[4] 再短按：期望亮屏 + 背光恢复 %s" % orig_bl)
     press(KEY_POWER, 120)
     time.sleep(3.0)
-    check("短按 ⇒ 亮屏", (not screen_is_off()) and bl_get() == orig_bl,
-          "背光=%s（原 %s）标志=%s" % (bl_get(), orig_bl, screen_is_off()))
+    # ★ 判据用**容差**而不是严格相等（2026-10-12 实测）：
+    #   亮屏时我们除了写 sysfs，还会把亮度同步给 PowerDevil
+    #   （org.kde.ScreenBrightness，量程 0..10000）。这一路要走
+    #   sysfs(0..4095) → pd(0..10000) → sysfs 两次取整，
+    #   实测 1500 会回到 1501 —— 差 1，肉眼完全一样，
+    #   但严格相等会让判据假失败。差 1/4095 不是"恢复失败"。
+    _now_bl = bl_get()
+    _ok_bl = (_now_bl is not None and orig_bl is not None
+              and abs(_now_bl - orig_bl) <= 2)
+    check("短按 ⇒ 亮屏", (not screen_is_off()) and _ok_bl,
+          "背光=%s（原 %s，容差 2）标志=%s"
+          % (_now_bl, orig_bl, screen_is_off()))
 
     # ── 5) 单例 ──
     print("\n[5] 单例保护：再起一个实例应当拒绝")
