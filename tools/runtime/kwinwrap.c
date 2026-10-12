@@ -12,6 +12,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <grp.h>
+#include <pwd.h>
 #include <signal.h>
 #include <time.h>
 #include <sys/ptrace.h>
@@ -75,34 +77,70 @@ static char propnames[512][16];
  * 为什么不是 2 段 —— 本机面板 conn67 的 topology_name = 13 =
  * **sde_quadpipe_dscmerge**（IMMUTABLE，驱动按面板能力定），
  * 即"四管 + DSC 合并"。Android 侧实测（容器里 kmsdump 读，不需要 master）
- * 它在 CRTC 200 上同时挂 **4 个 Primary 平面**，每个 CRTC_W=800：
+ * 它在 CRTC 200 上同时挂 **4 个 Primary 平面**，每个 CRTC_W=800。
  *
- *     PLANE 131   CRTC_X=0     SRC_X=0
- *     PLANE 127   CRTC_X=800   SRC_X=800
- *     PLANE 123   CRTC_X=0     SRC_X=1600
- *     PLANE 92    CRTC_X=800   SRC_X=2400
+ * ★ 注意 kmsdump 读到的是**驱动归一化之后**的值：驱动会把全局 CRTC_X 里
+ *   ≥1600 的那些减掉 1600（见下面 _sde_crtc_check_plane_layout），
+ *   所以读回来才显示成"链路内"的 0/800：
  *
- * 也就是双 DSI **每条链路 2 管**，链路内的目的坐标是 0/800；
- * 而源坐标就是整块 3200 宽帧缓冲上的真实列。
+ *     PLANE 131   提交 CRTC_X=0     读回 0     SRC_X=0
+ *     PLANE 127   提交 CRTC_X=800   读回 800   SRC_X=800
+ *     PLANE 123   提交 CRTC_X=1600  读回 0     SRC_X=1600
+ *     PLANE 92    提交 CRTC_X=2400  读回 800   SRC_X=2400
+ *
+ * 也就是双 DSI **每条链路 2 管**；提交时给的是整块 3200 面板的全局坐标，
+ * 由驱动自己拆成两条链路的本地 0/800。源坐标就是整幅帧缓冲上的真实列。
  *
  * 之前实现用 2 个 Overlay 平面各 1600 宽 —— 四管里两管拿不到数据，
  * 屏幕就是细密交织噪声（实测照片：满屏横条纹 + 彩虹色偏，无任何图形）。
  *
  * 几何规则（对任意 N 段、段宽 SPLIT_W 通用）：
  *     SRC_X  = i * SPLIT_W           源：整幅图里的第 i 段
- *     CRTC_X = i * SPLIT_W           目的：**单调递增**
+ *     CRTC_X = i * SPLIT_W           目的：**整屏全局、单调递增**
  * N = 2 时正好退化成旧行为，所以老设备配置不用改。
  *
- * ★ 目的坐标为什么必须单调（实测教训）：
- *   一开始照抄 Android 的 CRTC_X = 0,800,0,800（"链路内地址"），
- *   提交被内核判 -22：
- *       [_sde_crtc_validate_src_split_order] invalid coordinates,
- *           stage:0 l:0-800 r:0-800
- *       [_sde_crtc_atomic_check] crtc200 failed pstate check -22
- *   那个 l/r 用的就是**目的**矩形：同一 stage 上第 1、3 个平面的目的
- *   都是 0-800，SDE 认为左右两管坐标重复 ⇒ 拒绝。
- *   改成 0,800,1600,2400 单调之后提交全过、CRTC 200 mode_valid=1。
- *   （2 个平面时 CRTC_X = 0,800 本来就单调，所以那时一直是过的。）
+ * ★ 目的坐标为什么**必须**是整屏全局的单调值（2026-10-12 定论）：
+ *   拿到厂商驱动源码后彻底搞清了。SM8650/pineapple 的 SDE 在
+ *   quadpipe 拓扑下有一条硬规则 —— `_sde_crtc_check_plane_layout()`
+ *   （sde_crtc.c，设备日志行号 6221，与本机 dmesg 完全对上）：
+ *
+ *       if (!sde_rm_topology_is_group(rm, crtc_state, QUADPIPE))
+ *           return 0;                                 // 非四管拓扑直接跳过
+ *       sde_crtc_get_resolution(crtc, crtc_state, mode, &crtc_width, ...);
+ *                                     // = mode->hdisplay = 3200，**整块面板**
+ *       layout_split = crtc_width >> 1;               // 1600
+ *       if (plane_state->crtc_x >= layout_split) {    // ★ 入口是全局坐标
+ *           plane_state->crtc_x -= layout_split;      // 驱动自己减 1600
+ *           pstate->layout_offset = layout_split;
+ *           pstate->layout = SDE_LAYOUT_RIGHT;
+ *       } else {
+ *           pstate->layout_offset = -1;
+ *           pstate->layout = SDE_LAYOUT_LEFT;
+ *       }
+ *       if (CHECK_LAYER_BOUNDS(plane_state->crtc_x, plane_state->crtc_w,
+ *                              layout_split))        // 减完必须落 0~1600
+ *           return -E2BIG;
+ *
+ *   然后 `_sde_crtc_blend_setup_mixer()` 用 layout 选 LM 组：
+ *       if (pstate->layout <= SDE_LAYOUT_LEFT) layout_idx = 0;  // LM0/LM1
+ *       else                                   layout_idx = 1;  // LM2/LM3
+ *   sde_plane.h 的 enum sde_layout 注释也直说 "LEFT: staged on left two LMs /
+ *   RIGHT: staged on right two LMs"；最后 `_sde_crtc_blend_setup()` 按
+ *   lm_layout = mixer_idx / MAX_MIXERS_PER_LAYOUT 把 stage_cfg[0] 发给
+ *   LM0/LM1、stage_cfg[1] 发给 LM2/LM3。
+ *
+ *   ⇒ 给链路内的 (0,800,0,800) 会让 4 条平面**全部 < 1600** ⇒ 全部判成
+ *     SDE_LAYOUT_LEFT ⇒ 全塞进 LM0/LM1 ⇒ 只有 DSI0 有图层，LM2/LM3
+ *     （右半屏）永远空着 ⇒ **右半屏全黑**。用户报的正是这个。
+ *   ⇒ 给整屏全局的 (0,800,1600,2400)：减完 1600 后是 (0,800,0,800)，
+ *     131/127 判 LEFT、123/92 判 RIGHT ⇒ 左右各两条 ⇒ 两块 LM 组都有图层。
+ *
+ *   ⚠️ 曾经记的"1600~3200 超出单条 DSI 链路本地地址范围、跑 20s 会 panic"
+ *      是**误判**：kmsdump 读到的 0/800/0/800 是驱动**减完之后**的值
+ *      （get 取的就是 plane_state->crtc_x），把它当"安卓提交的原样"反推，
+ *      因果正好搞反。安卓提交的就是全局坐标，驱动减完才变成 0/800。
+ *      驱动自己的 evtlog 也证实了这点：安卓 4 条 logo 平面的 layout_idx
+ *      是 1,1,0,0（按源段 3,2 → RIGHT），而 src/dst 与我们完全一致。
  *
  * ⚠️ 平面顺序必须与 SRC_X 递增一致：数组下标 i 同时决定 SRC_X=i*W，
  *    所以 SPLIT_PLANE[] 要按源列从左到右排。 */
@@ -116,15 +154,59 @@ static unsigned SPLIT_H           = 2000u;
 static unsigned SPLIT_W_FULL      = 3200u;  /* 面板整宽（发现时从 mode 读） */
 static int SPLIT_DISCOVERED;               /* 1 = 运行时发现成功 */
 /* 目的坐标方案：
- *   0 = 单调 i*SPLIT_W（0,800,1600,2400）—— 整块面板的全局坐标
- *   1 = 链路内地址 (i%2)*SPLIT_W（0,800,0,800）—— **Android 实测用的就是这个**
- * 为什么会有这个开关：见文件头"目的坐标"那段。单调形式能让 SDE 的
- * _sde_crtc_validate_src_split_order 通过，但目的坐标 1600~3200 很可能
- * 超出单条 DSI 链路的本地地址范围，跑一会儿就内核 BUG。
- * 而 Android 的链路内形式当初被那条校验拒了 —— 怀疑是因为当时
- * blend_op/alpha/zpos/rotation 这 4 个非原子属性还没设（alpha=0 全透明），
- * 校验可能只对"不透明层"生效。补上属性后值得重测链路内形式。 */
+ *   0 = ✔**唯一正确**：单调 i*SPLIT_W（0,800,1600,2400）—— 整块面板的全局坐标
+ *   1 = ✘禁用：链路内地址 (i%2)*SPLIT_W（0,800,0,800）
+ * 为什么 1 是错的：见文件头"目的坐标"那段 —— 驱动靠 crtc_x >= 1600 判
+ * SDE_LAYOUT_RIGHT（右半屏那对 LM）。给链路内坐标会让 4 条平面全判 LEFT，
+ * 全挤进 LM0/LM1，右半屏（LM2/LM3 → DSI1）永远拿不到图层 ⇒ 右半屏全黑。
+ * 这个开关留着只为了能做 A/B 对照复现症状，正式配置必须是 0。 */
 static int SPLIT_DST_INTERLEAVE;
+
+/* ★★ zpos 分组模式（KWINWRAP_SPLIT_ZPOS）—— 决定 SDE 的 **stage** 归属。
+ *
+ * 背景（2026-10-12 定论，依据厂商驱动源码 + 设备 evtlog）：
+ *   SDE 的 `_sde_crtc_check_zpos()` 把 **zpos 属性值**换算成 stage：
+ *       pstate->stage = zpos + SDE_STAGE_0        （SDE_STAGE_0 == 1）
+ *   并强制 **每个 (stage, layout) 最多 2 条平面**，超了直接 -EINVAL。
+ *   layout 也参与分组 —— 它由 `_sde_crtc_check_plane_layout()` 按
+ *   "整屏全局 CRTC_X 是否 ≥ 面板半宽(1600)"判定（见文件头）。
+ *
+ *   `_sde_crtc_validate_src_split_order()` 只校验**同一 stage 且同一 layout**
+ *   的相邻平面：按 CRTC_X 排序后配对，要求 right.x == left.x + left.w。
+ *
+ *   0 = 不动 zpos（由 DRM core 的 normalized_zpos 决定）
+ *   1 = 每 2 段一个 zpos：s/2（131,127 → 0；123,92 → 1）
+ *       实测（2026-10-12）：能过校验、面板**出画面**，但那时 dst 还是
+ *       链路内坐标 ⇒ 4 条平面全判 LEFT ⇒ 全挤进 LM0/LM1 ⇒
+ *       现象"只有左半屏、右半内容跑到左边、右半不亮"。
+ *   2 = 每段一个 zpos：s（0,1,2,3）
+ *   3 = **全部 0** —— 与安卓 logo 图层**完全同形**：4 条同 stage，
+ *       按 layout 分成 LEFT{131,127} 与 RIGHT{123,92} 两组，
+ *       组内 CRTC_X 减完 1600 后是 0/800，"左<右" ⇒ 校验通过；
+ *       同时会触发 SDE 的 source-split 配对（131↔127、123↔92）。
+ *       旧记录说这个组合会 panic，但那是在"链路内坐标"的误判下做的，
+ *       归因不可信；若模式 5 不成，这是第一顺位的对照实验。
+ *   4 = 反转配对：zv = (NSEG-1-s)/2
+ *   5 = **当前采用**：zv = NSEG-1-s（NSEG=4 → {131,127,123,92} = 3,2,1,0）
+ *       4 条各占一个 stage ⇒ 没有任何"同 stage 同 layout"的相邻对 ⇒
+ *       不做 source-split 配对，每条 SSPP 都是单 LM 取数。
+ *       这与"已经证明能正确出左半屏"的形态只差 dst 一个变量，改动面最小。
+ *
+ *   ── 安卓现场基准的正确读法（2026-10-12 修正）──
+ *   debug/dump 里 _sde_crtc_blend_setup_mixer 第二条 EVT32 的字段是
+ *   （对应 sde_crtc.c:1977）：
+ *       crtc, plane, stage_idx, sspp, stage, multirect_index,
+ *       multirect_mode, format, modifier, layout_idx
+ *   安卓 4 条 logo 平面解出来：
+ *       plane 92  sspp=VIG0 stage=1 stage_idx=0 layout=1
+ *       plane 123 sspp=VIG1 stage=1 stage_idx=1 layout=1
+ *       plane 127 sspp=VIG2 stage=1 stage_idx=0 layout=0
+ *       plane 131 sspp=VIG3 stage=1 stage_idx=1 layout=0
+ *   ⇒ **stage 全是 1**（raw zpos 全是 0），而之前当成"stage 顺序"的
+ *     0/1/2/3 其实是 **stage_idx**（同 stage 内的第几条，按 plane id 发号）。
+ *   ⇒ 同时证实 layout_idx 才是左右半屏的开关：123/92 → RIGHT(LM2/LM3)、
+ *     131/127 → LEFT(LM0/LM1)，与 src 段号 0/1 vs 2/3 完全对应。 */
+static int SPLIT_ZPOS_MODE;
 /* 逐帧调试痕迹总开关。默认关：FBSCAN / DROP-CAND / NOACTIVE / EVDROP /
  * BUILT 这些每帧都会打，正常运行时会把 kwinatomic.log 撑到几十 MB。
  * 真机上没法接调试器，所以不删掉，改成 KWINWRAP_TRACE=1 按需打开。 */
@@ -455,6 +537,8 @@ static void init_split(void)
     if ((e = getenv("KWINWRAP_SPLIT_W_FULL"))){ SPLIT_W_FULL = (unsigned)strtoul(e, NULL, 0); from_env = 1; }
     if ((e = getenv("KWINWRAP_SPLIT_DST_INTERLEAVE")))
         SPLIT_DST_INTERLEAVE = atoi(e) ? 1 : 0;
+    if ((e = getenv("KWINWRAP_SPLIT_ZPOS")))
+        SPLIT_ZPOS_MODE = atoi(e);
     if ((e = getenv("KWINWRAP_SPLIT_PLANES"))) {
         /* 接受任意段数（1..SPLIT_MAX_SEG）的逗号列表，按**源列从左到右**排列。
          * 旧的 "L,R" 两段写法自然兼容：N=2 时几何退化成 0/1600 与 0/1600。 */
@@ -896,6 +980,7 @@ static long relay_atomic(struct drm_mode_atomic *la) {
 static __u32 s_objs[64], s_cnts[64], s_props[2048], s_props2[2048];
 static __u64 s_vals[2048], s_vals2[2048];
 static __u32 pl_fb, pl_crtc, pl_sx, pl_sy, pl_sw, pl_sh, pl_cx, pl_cy, pl_cw, pl_ch;
+static __u32 pl_zpos;   /* ★ stage 分组的关键，见 SPLIT_ZPOS_MODE */
 /* ★★ connector DPMS 属性 id + "本次提交里见过 SPLIT_CONN" 标记。
  *
  * 为什么必须自己注入 DPMS（实测根因，2026-10-12）：
@@ -1299,8 +1384,11 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
             s_props2[np] = pl_fb;   s_vals2[np++] = fb;
             /* 几何规则（与 Android 基线一致）：
              *   源列 = 段号 * 段宽（整幅 3200 图上的真实列）
-             *   目的 = (段号 % 2) * 段宽（双 DSI 每条链路内的地址 0/800）
-             * Android 实测：131→(0,0) 127→(800,800) 123→(0,1600) 92→(800,2400)
+             *   目的 = 段号 * 段宽（**整屏全局**坐标 0,800,1600,2400）
+             *     —— 驱动 _sde_crtc_check_plane_layout() 靠 crtc_x >= 1600
+             *        判定 SDE_LAYOUT_RIGHT（右半屏那对 LM2/LM3），并自己减掉
+             *        1600 得到链路内地址；kmsdump 读回的就是减完的值。
+             * Android 实测：131→提交(0,0) 127→(800,800) 123→(1600,1600) 92→(2400,2400)
              * 正是 (crtc_x, src_x)，完全吻合。 */
             s_props2[np] = pl_sx; s_vals2[np++] = (__u64)hidx * SPLIT_W << 16;
             s_props2[np] = pl_sy; s_vals2[np++] = 0;
@@ -1459,6 +1547,107 @@ static void split_commit(pid_t t, unsigned long long uptr, struct ptregs *r) {
                 s_objs[no] = SPLIT_CRTC;
                 s_cnts[no] = np - n0;
                 no++;
+            }
+        }
+    }
+
+    /* ★★★ 面板 connector 必须在提交里，而且必须带 CRTC_ID。
+     *
+     * 为什么（2026-10-12 定论，厂商源码 + 设备实测双重印证）：
+     *
+     *   `_sde_crtc_check_plane_layout()`（sde_crtc.c）的**第一件事**就是
+     *       if (!sde_rm_topology_is_group(&kms->rm, crtc_state,
+     *               SDE_RM_TOPOLOGY_GROUP_QUADPIPE))
+     *           return 0;
+     *   而 `sde_rm_topology_is_group()` 是**遍历 crtc_state 上的 connector**
+     *   去问每个 connector state 的 topology：
+     *       for (i = 0; i < cstate->num_connectors; i++) {
+     *           conn_state = drm_atomic_get_new_connector_state(state->state, conn);
+     *           if (!conn_state) continue;              ← 没有 state 就跳过
+     *           sde_connector_state_get_topology(conn_state, &topology);
+     *           if (TOPOLOGY_QUADPIPE_MODE(name)) return true;
+     *       }
+     *       return false;
+     *
+     *   而 `cstate->num_connectors` 来自 `crtc_state->connector_mask`，后者
+     *   **只在提交里真的写了 connector 的 CRTC_ID 时**才会被
+     *   `drm_atomic_set_crtc_for_connector()` 置位。KWin 的页翻转提交是
+     *   纯 plane+CRTC 的增量提交，**不带 connector** ⇒ mask=0 ⇒
+     *   num_connectors=0 ⇒ 拓扑判 false ⇒ 布局检查整段 return 0。
+     *
+     *   后果（kmsdump 实证，2026-10-12 16:0x）：
+     *       plane 92  CRTC_X=2400  SRC_X=2400<<16   ← 提交什么就读回什么，
+     *       plane 123 CRTC_X=1600  SRC_X=1600<<16      驱动**没有**减 1600
+     *       plane 127 CRTC_X=800   SRC_X=800<<16
+     *       plane 131 CRTC_X=0     SRC_X=0
+     *   ⇒ `pstate->layout` 恒为 SDE_LAYOUT_NONE/LEFT ⇒ 4 条平面全进
+     *     `stage_cfg[0]` ⇒ 只有 LM0/LM1 拿到图层，LM2/LM3（DSI1=右半屏）
+     *     空转；同时 dst 1600/2400 的平面落在 LM0/LM1 的 ROI(0..1600) 之外，
+     *     取数越界 ⇒ evtlog 出现 399 次 underrun、整屏彩色噪声。
+     *   evtlog 旁证：安卓侧 `sde_encoder_virt_atomic_check` 出现 82 次，
+     *   我们这边 **0 次** —— 编码器的 atomic_check 也是靠"提交里有
+     *   connector"才会被 DRM core 调起来的，同一个缺席原因。
+     *
+     * 修法：本次提交里若没有 SPLIT_CONN，就补一个只带 CRTC_ID 的对象；
+     * 若有但它这条没带 CRTC_ID，就在它属性末尾插一条。这样内核才会为
+     * connector 建 state、置 connector_mask，拓扑与布局检查才会真正执行，
+     * `_sde_crtc_check_plane_layout()` 才能把 123/92 判成 SDE_LAYOUT_RIGHT
+     * 并把 CRTC_X 各减 1600（变回链路内 0/800），交给 LM2/LM3。
+     *
+     * ⚠️ 只写 CRTC_ID：DPMS 在本内核 flags 里没有 DRM_MODE_PROP_ATOMIC，
+     *    塞进原子提交会被判 EINVAL（见下面 DPMS-INJECT 那段血泪注释）。 */
+    if (SPLIT_CONN && np < 2048 && no < 64) {
+        static __u32 conn_crtc_prop;
+        if (!conn_crtc_prop)
+            conn_crtc_prop = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR,
+                                       "CRTC_ID");
+        if (conn_crtc_prop) {
+            int ci = -1;
+            for (__u32 i = 0; i < no && ci < 0; i++)
+                if (s_objs[i] == SPLIT_CONN) ci = (int)i;
+            if (ci < 0) {
+                /* 提交里完全没有 connector —— 追加一个只带 CRTC_ID 的对象 */
+                s_props2[np] = conn_crtc_prop;
+                s_vals2[np++] = SPLIT_CRTC;
+                s_objs[no] = SPLIT_CONN;
+                s_cnts[no] = 1;
+                no++;
+                static int nadd;
+                if (TRACE && ++nadd <= 5) {
+                    fprintf(LOG, "CONN-ADD: 提交无 conn%u，已追加 CRTC_ID=%u"
+                            "（prop=%u）\n", SPLIT_CONN, SPLIT_CRTC,
+                            conn_crtc_prop);
+                    fflush(LOG);
+                }
+            } else {
+                /* connector 在，但本帧没带 CRTC_ID ⇒ connector_mask 仍为 0 */
+                unsigned begin = 0, end;
+                for (int i = 0; i < ci; i++) begin += s_cnts[i];
+                end = begin + s_cnts[ci];
+                int has = 0;
+                for (unsigned k = begin; k < end; k++)
+                    if (s_props2[k] == conn_crtc_prop) {
+                        if (s_vals2[k] != SPLIT_CRTC) s_vals2[k] = SPLIT_CRTC;
+                        has = 1;
+                        break;
+                    }
+                if (!has) {
+                    for (unsigned k = np; k > end; k--) {
+                        s_props2[k] = s_props2[k - 1];
+                        s_vals2[k] = s_vals2[k - 1];
+                    }
+                    s_props2[end] = conn_crtc_prop;
+                    s_vals2[end] = SPLIT_CRTC;
+                    np++;
+                    s_cnts[ci]++;
+                    static int ncrtc;
+                    if (TRACE && ++ncrtc <= 5) {
+                        fprintf(LOG, "CONN-CRTC: conn%u 本帧缺 CRTC_ID，已插 "
+                                "CRTC_ID=%u（prop=%u）\n", SPLIT_CONN,
+                                SPLIT_CRTC, conn_crtc_prop);
+                        fflush(LOG);
+                    }
+                }
             }
         }
     }
@@ -2052,20 +2241,56 @@ int main(int argc, char **argv) {
          * 本机面板是 **DSC 面板**：
          *   - 内核 cmdline: msm_drm.dsi_display0=qcom,mdss_dsi_nt36532_wqhd_dual_dsi_dsc_vid
          *   - conn67 的 topology_name = 13 = sde_quadpipe_dscmerge（只读，驱动定）
-         * 但接管时 conn67 的 dsc_mode 停在 0(none)：DSI 链路按**未压缩**送数据，
+         * 接管时 conn67 的 dsc_mode 停在 0(none)：DSI 链路按**未压缩**送数据，
          * 面板却按 DSC 解 → 满屏细密横条纹 + 彩虹色偏（实测照片，看不出任何图形）。
          *
          * dsc_mode 与 DPMS 一样 **flags 里没有 DRM_MODE_PROP_ATOMIC**，
          * 所以只能走非原子 DRM_IOCTL_MODE_OBJ_SETPROPERTY，
          * 且必须赶在 DROP_MASTER 之前（之后一律 EACCES）。
-         * 时机正好：此刻预关闭提交已把 CRTC 关掉、KWin 还没 exec，
-         * 面板处于熄灭态 ⇒ 先告诉它"要收 DSC"，再由 KWin 的 modeset
-         * 重新初始化 DSI，链路才会按 DSC 建起来。
+         *
+         * ★★ 顺序至关重要：必须"面板断电 → 设 dsc_mode → 面板上电" ★★
+         *
+         *   实测踩坑（2026-10-12）：原来是在上面那段 `DPMS=On` **之后**才设
+         *   dsc_mode —— 顺序反了。面板已经上电、DSI 链路已按**未压缩**建好，
+         *   此时再改 dsc_mode 只是改了个属性值，**不会触发链路重建**。
+         *   于是现象照旧：fbdump 读出来的缓冲是**完整正确的 KDE 桌面**
+         *   （采样点全是蓝色壁纸的正确 RGB），物理面板却是彩色噪声。
+         *
+         *   更隐蔽的一点：kwinwrap 选中的 mode 与 Android 基线**完全相同**
+         *   （3200x2000x120vid）⇒ KWin 随后的 modeset 是**无操作**，
+         *   内核不会因为"模式没变"而重建 DSI 链路。所以**不能指望
+         *   KWin 的 modeset 去把 DSC 建起来**，必须自己先把链路弄成
+         *   "需要重建"的状态：显式 DPMS=Off，设完 dsc_mode 再 DPMS=On。
+         *   （DPMS 走非原子 ioctl，不需要 modeset 权限，实测 ret=0。）
+         *
          * KWINWRAP_NO_DSC=1 可关掉（对照实验用）。 */
         if (!getenv("KWINWRAP_NO_DSC")) {
             __u32 dsc_prop = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR,
                                        "dsc_mode");
+            __u32 dpms_for_dsc = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR,
+                                           "DPMS");
             if (dsc_prop) {
+                /* ① 先断电，让链路处于"待重建"状态 */
+                if (dpms_for_dsc) {
+                    struct drm_mode_obj_set_property off = {
+                        .obj_id = SPLIT_CONN, .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+                        .prop_id = dpms_for_dsc, .value = 3,  /* DRM_MODE_DPMS_OFF */
+                    };
+                    errno = 0;
+                    int or_ = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &off);
+                    fprintf(LOG, "kwinwrap: DSC 前置 DPMS=Off(prop=%u) ret=%d %s\n",
+                            dpms_for_dsc, or_, or_ ? strerror(errno) : "OK");
+                }
+                /* ② 面板熄着的时候告诉它"要收 DSC"，并设置每分量位深。
+                 *
+                 * ★ bpp_mode 为什么必须一起设：面板驱动是
+                 *   qcom,mdss_dsi_nt36532_wqhd_dual_dsi_dsc_vid（双 DSI + DSC），
+                 *   而本机缓冲是 **10 位 AR30**。实测接管后 bpp_mode 停在
+                 *   0(none) —— 若 DSC 编码器按 8bpc 编码而面板按 10bpc 解，
+                 *   解出来就是彩色噪声。所以这里跟 dsc_mode 一起设成
+                 *   dsi_30bpp(2)，与 10 位缓冲对齐。
+                 *   （enum: none=0, dsi_24bpp=1, dsi_30bpp=2）
+                 *   可用 KWINWRAP_BPP_MODE 覆盖做对照实验；设成 none 可跳过。 */
                 struct drm_mode_obj_set_property dq = {
                     .obj_id = SPLIT_CONN, .obj_type = DRM_MODE_OBJECT_CONNECTOR,
                     .prop_id = dsc_prop, .value = 1,   /* dsc_enabled */
@@ -2074,6 +2299,42 @@ int main(int argc, char **argv) {
                 int qr = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &dq);
                 fprintf(LOG, "kwinwrap: DSC=dsc_enabled(conn%u prop=%u) ret=%d %s\n",
                         SPLIT_CONN, dsc_prop, qr, qr ? strerror(errno) : "OK");
+
+                {
+                    const char *be = getenv("KWINWRAP_BPP_MODE");
+                    if (!be || strcmp(be, "none")) {
+                        unsigned long bv = be ? strtoul(be, NULL, 0) : 2UL; /* dsi_30bpp */
+                        __u32 bp = find_prop(SPLIT_CONN, DRM_MODE_OBJECT_CONNECTOR,
+                                             "bpp_mode");
+                        if (bp) {
+                            struct drm_mode_obj_set_property bq = {
+                                .obj_id = SPLIT_CONN,
+                                .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+                                .prop_id = bp, .value = bv,
+                            };
+                            errno = 0;
+                            int br = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &bq);
+                            fprintf(LOG, "kwinwrap: DSC bpp_mode=%lu(conn%u prop=%u) ret=%d %s\n",
+                                    bv, SPLIT_CONN, bp, br, br ? strerror(errno) : "OK");
+                        } else {
+                            fprintf(LOG, "kwinwrap: 找不到 conn%u 的 bpp_mode 属性\n",
+                                    SPLIT_CONN);
+                        }
+                    } else {
+                        fprintf(LOG, "kwinwrap: KWINWRAP_BPP_MODE=none —— 不设 bpp_mode\n");
+                    }
+                }
+                /* ③ 再上电 —— 这一次链路会带上 DSC 重建 */
+                if (dpms_for_dsc) {
+                    struct drm_mode_obj_set_property on = {
+                        .obj_id = SPLIT_CONN, .obj_type = DRM_MODE_OBJECT_CONNECTOR,
+                        .prop_id = dpms_for_dsc, .value = 0,  /* DRM_MODE_DPMS_ON */
+                    };
+                    errno = 0;
+                    int nr = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &on);
+                    fprintf(LOG, "kwinwrap: DSC 后置 DPMS=On(prop=%u) ret=%d %s\n",
+                            dpms_for_dsc, nr, nr ? strerror(errno) : "OK");
+                }
                 fflush(LOG);
             } else {
                 fprintf(LOG, "kwinwrap: 找不到 conn%u 的 dsc_mode 属性\n",
@@ -2099,17 +2360,21 @@ int main(int argc, char **argv) {
          *   那样走非原子 DRM_IOCTL_MODE_OBJ_SETPROPERTY，且必须赶在
          *   DROP_MASTER 之前（之后一律 EACCES）。
          *
-         *   为什么怀疑它跟"四管 panic"有关：alpha=0 且 blend_op=not_defined
-         *   时 SDE 把这条 layer 当"全透明 + 混合方式未定义"。实测现象：
-         *   4 平面配置下提交**全部成功**、CRTC mode_valid=1，但约 20s 后
-         *   内核 panic（cpufreq_panic_callback / kgsl snapshot / ufs dump）。
-         *   而 2 平面配置不 panic —— 差别正是"四管合并路径有没有被真正走通"。
-         *   KWINWRAP_NO_PLANE_PROPS=1 可关掉（对照实验用）。 */
+         *   关于旧记录里"4 平面 + 单调坐标 → 约 20s 后内核 panic"：那条归因
+         *   建立在"目的坐标 1600~3200 超出单条链路本地地址范围"这个**误判**上
+         *   （见文件头：kmsdump 读回的是驱动减完 1600 的值，不是提交值）。
+         *   驱动源码证明全局坐标才是正确输入。KWINWRAP_NO_PLANE_PROPS=1
+         *   仍可关掉这组属性做对照，但 alpha=0（全透明）本来就必须补上。 */
         if (!getenv("KWINWRAP_NO_PLANE_PROPS")) {
             static const struct { const char *n; __u64 v; } pprops[] = {
                 { "blend_op", 1u },     /* opaque */
                 { "alpha",    255u },
-                { "zpos",     0u },
+                /* ★ zpos 不在这里 —— 它按段索引算，见下面 split_zpos()。
+                 *   原来这里硬写 0：4 条平面同 zpos ⇒ 同 stage，配合当时的
+                 *   链路内 CRTC_X，_sde_crtc_validate_src_split_order 会把它们
+                 *   排成 0,0,800,800 并配成 (0,0)/(800,800) ⇒ 全被拒。
+                 *   （安卓也是 zpos 全 0，但它的 CRTC_X 是全局坐标，减完 1600
+                 *    后同一 stage 内按 layout 分成两组，各自 0/800 才成立。） */
                 { "rotation", 1u },     /* DRM_MODE_ROTATE_0（bit0），不是"转 90°" */
             };
             for (int s = 0; s < SPLIT_NSEG; s++) {
@@ -2133,6 +2398,41 @@ int main(int argc, char **argv) {
                             SPLIT_PLANE[s], pprops[k].n,
                             (unsigned long long)pprops[k].v, pr,
                             pr ? strerror(errno) : "OK");
+                }
+
+                /* ── zpos：SDE stage 分组的关键（KWINWRAP_SPLIT_ZPOS）─────
+                 * 模式 1：zpos = s/2 —— 每 2 段共用一个 stage，正好对应
+                 *         "双 DSI 每条链路 2 管"：
+                 *             s=0,1 → zpos 0（链路0: 131 dst0-800 + 127 dst800-1600）
+                 *             s=2,3 → zpos 1（链路1: 123 dst0-800 + 92  dst800-1600）
+                 *         这样 stage0 内按 CRTC_X 排序得 0,800 → 左<右 ✓
+                 * 模式 2：zpos = s —— 每段独立 stage。 */
+                if (SPLIT_ZPOS_MODE) {
+                    unsigned zv;
+                    if (SPLIT_ZPOS_MODE == 1)      zv = (unsigned)(s / 2);
+                    else if (SPLIT_ZPOS_MODE == 3) zv = 0u;   /* 单一图层 */
+                    else if (SPLIT_ZPOS_MODE == 4)            /* 反转配对 */
+                        zv = (unsigned)((SPLIT_NSEG - 1 - s) / 2);
+                    else if (SPLIT_ZPOS_MODE == 5)            /* ★ 严格对齐安卓 */
+                        zv = (unsigned)(SPLIT_NSEG - 1 - s);
+                    else                           zv = (unsigned)s;
+                    __u32 pz = find_prop(SPLIT_PLANE[s], DRM_MODE_OBJECT_PLANE,
+                                         "zpos");
+                    if (pz) {
+                        struct drm_mode_obj_set_property zq = {
+                            .obj_id   = SPLIT_PLANE[s],
+                            .obj_type = DRM_MODE_OBJECT_PLANE,
+                            .prop_id  = pz,
+                            .value    = zv,
+                        };
+                        errno = 0;
+                        int zr = ioctl(DRMFD, DRM_IOCTL_MODE_OBJ_SETPROPERTY, &zq);
+                        fprintf(LOG, "kwinwrap: plane%u zpos=%u(模式%d) ret=%d %s\n",
+                                SPLIT_PLANE[s], zv, SPLIT_ZPOS_MODE, zr,
+                                zr ? strerror(errno) : "OK");
+                    } else {
+                        fprintf(LOG, "kwinwrap: plane%u 没有 zpos 属性\n", SPLIT_PLANE[s]);
+                    }
                 }
             }
             fflush(LOG);
@@ -2162,7 +2462,137 @@ int main(int argc, char **argv) {
         }
         char *u = getenv("KWINWRAP_UID");
         char *g = getenv("KWINWRAP_GID");
-        if (u && g) { setgid(atoi(g)); setuid(atoi(u)); }
+        if (u && g) {
+            /* ★★ 必须补上附加组，不能只 setgid() ★★
+             *
+             * 实测踩坑（2026-10-12）：原来这里只有 `setgid(g); setuid(u);`。
+             * setgid() 只设**主组**，不会去读 /etc/group 加载附加组 ⇒
+             * 子进程的 `Groups:` 是**空的**（/proc/<pid>/status 实测）：
+             *     Uid: 1000  Gid: 1000  Groups: (空)
+             * 而本机 /dev/input/event* 是 `crw-rw---- root:input`，
+             * 桌面账号 Gold 本来就在 input 组（/etc/group: input:x:996:root,Gold）
+             * —— 附加组一丢，KWin 就打不开这些节点。
+             *
+             * 现象正是这样：KWin 只打开了触摸屏 event5（那个节点恰好
+             * 权限允许），**电源键 pmic_pwrkey(event3) / gpio-keys(event0) /
+             * hall_irq(event2) 全部没打开** ⇒ 电源键不能开关屏幕。
+             *
+             * ★ 为什么不用 initgroups()/getpwuid()：实测在本容器里
+             *   getpwuid() 直接返回 NULL，errno=ENOSYS("Function not
+             *   implemented") —— NSS 后端在这个精简容器里不可用。
+             *   所以这里**自己解析 /etc/group**，完全不依赖 NSS。
+             *
+             * 顺序要紧：setgroups() 需要 root，**必须在 setuid() 之前**。 */
+            uid_t uid = (uid_t)atoi(u);
+            gid_t gid = (gid_t)atoi(g);
+            /* 用户名：优先用环境变量；没有就从 /etc/passwd 按 uid 查
+             *（同样不依赖 NSS，getpwuid 在本容器里是 ENOSYS）。 */
+            char ubuf[64];
+            const char *uname = getenv("KWINWRAP_USER");
+            if (!uname || !*uname) {
+                uname = NULL;
+                FILE *pf = fopen("/etc/passwd", "re");
+                if (pf) {
+                    char line[1024];
+                    while (fgets(line, sizeof line, pf)) {
+                        /* name:x:uid:gid:... */
+                        char *c1 = strchr(line, ':');
+                        if (!c1) continue;
+                        char *c2 = strchr(c1 + 1, ':');
+                        if (!c2) continue;
+                        if ((uid_t)atoi(c2 + 1) == uid) {
+                            size_t L = (size_t)(c1 - line);
+                            if (L < sizeof ubuf) {
+                                memcpy(ubuf, line, L);
+                                ubuf[L] = 0;
+                                uname = ubuf;
+                            }
+                            break;
+                        }
+                    }
+                    fclose(pf);
+                }
+                if (!uname) uname = "Gold";
+            }
+
+            /* ★ 组列表来源有优先级，因为 kwinwrap 跑在**宿主**侧：
+             *   它读到的 /etc/group 是 Android 宿主的，里面根本没有
+             *   容器桌面账号 Gold ⇒ 自己解析 /etc/group 这条路在宿主上
+             *   必然失败（实测：setgroups OK —— 1 个组: 1000，而容器里
+             *   `id Gold` 明明有 9 个组，含 996(input)）。
+             *   所以首选 display.sh 从**容器内**算好的 KWINWRAP_GROUPS
+             *   （逗号/空格分隔的 gid 列表）。其次才退回解析 /etc/group。 */
+            gid_t gs[64];
+            int ngs = 0;
+            gs[ngs++] = gid;                 /* 主组一定要在列表里 */
+            const char *glist = getenv("KWINWRAP_GROUPS");
+            if (glist && *glist) {
+                const char *p = glist;
+                while (*p && ngs < 64) {
+                    while (*p == ',' || *p == ' ' || *p == '\t') p++;
+                    if (!*p) break;
+                    char *end = NULL;
+                    long v = strtol(p, &end, 10);
+                    if (end == p) break;
+                    gid_t eg = (gid_t)v;
+                    int dup = 0;
+                    for (int i = 0; i < ngs; i++) if (gs[i] == eg) dup = 1;
+                    if (!dup) gs[ngs++] = eg;
+                    p = end;
+                }
+                fprintf(LOG, "kwinwrap: 组列表来自 KWINWRAP_GROUPS=%s\n", glist);
+            } else {
+            FILE *gf = fopen("/etc/group", "re");
+            if (gf) {
+                char line[1024];
+                while (fgets(line, sizeof line, gf) && ngs < 64) {
+                    /* 格式：name:x:gid:member1,member2 */
+                    char *c1 = strchr(line, ':');
+                    if (!c1) continue;
+                    char *c2 = strchr(c1 + 1, ':');
+                    if (!c2) continue;
+                    char *c3 = strchr(c2 + 1, ':');
+                    if (!c3) continue;
+                    gid_t eg = (gid_t)atoi(c2 + 1);
+                    /* 在成员列表里按"整名匹配"找（避免 Gold 命中 GoldX） */
+                    char *m = c3 + 1;
+                    int found = 0;
+                    while (*m) {
+                        while (*m == ',' || *m == ' ' || *m == '\t' || *m == '\n')
+                            m++;
+                        if (!*m) break;
+                        char *e = m;
+                        while (*e && *e != ',' && *e != '\n' && *e != ' ' && *e != '\t')
+                            e++;
+                        size_t L = (size_t)(e - m);
+                        if (L == strlen(uname) && !strncmp(m, uname, L)) { found = 1; break; }
+                        m = e;
+                    }
+                    if (found) {
+                        int dup = 0;
+                        for (int i = 0; i < ngs; i++) if (gs[i] == eg) dup = 1;
+                        if (!dup) gs[ngs++] = eg;
+                    }
+                }
+                fclose(gf);
+            }
+            }
+            if (setgroups((size_t)ngs, gs) != 0)
+                fprintf(LOG, "kwinwrap: setgroups(%d 个) 失败: %s\n", ngs, strerror(errno));
+            else {
+                fprintf(LOG, "kwinwrap: setgroups OK —— %d 个组:", ngs);
+                for (int i = 0; i < ngs; i++) fprintf(LOG, " %u", (unsigned)gs[i]);
+                fprintf(LOG, "\n");
+            }
+
+            if (setgid(gid) != 0)
+                fprintf(LOG, "kwinwrap: setgid(%u) 失败: %s\n",
+                        (unsigned)gid, strerror(errno));
+            if (setuid(uid) != 0)
+                fprintf(LOG, "kwinwrap: setuid(%u) 失败: %s\n",
+                        (unsigned)uid, strerror(errno));
+            fflush(LOG);
+        }
         execvp(argv[di], argv + di);
         perror("execvp");
         _exit(3);

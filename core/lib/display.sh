@@ -58,11 +58,20 @@ drm_desktop_user_resolve() {
 
     DESKTOP_UID=$(id -u "$DESKTOP_USER" 2>/dev/null)
     DESKTOP_GID=$(id -g "$DESKTOP_USER" 2>/dev/null)
+    # ★ 附加组列表必须在**容器内**算好再传给 kwinwrap。
+    #   原因：kwinwrap 跑在 Android **宿主**侧，它读到的 /etc/group 是宿主的，
+    #   里面没有容器桌面账号 ⇒ 靠 kwinwrap 自己解析 /etc/group 拿不到
+    #   996(input) 这些组。实测后果：KWin 的 `Groups:` 为空，
+    #   /dev/input/event*（root:input 660）打不开，**电源键不响应**。
+    #   这里用 id -G 拿到全部组，kwinwrap 直接 setgroups() 用。
+    DESKTOP_GROUPS=$(id -G "$DESKTOP_USER" 2>/dev/null | tr ' ' ',')
+    [ -n "$DESKTOP_GROUPS" ] || DESKTOP_GROUPS="$DESKTOP_GID"
     DESKTOP_HOME=$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6)
     [ -n "$DESKTOP_HOME" ] || DESKTOP_HOME="/home/$DESKTOP_USER"
     DESKTOP_RUNTIME_DIR=${DESKTOP_RUNTIME_DIR:-/run/user/$DESKTOP_UID}
 
     drm_log "桌面账号：$DESKTOP_USER (uid=$DESKTOP_UID gid=$DESKTOP_GID home=$DESKTOP_HOME)"
+    drm_log "桌面附加组：$DESKTOP_GROUPS"
     drm_state_set DESKTOP_USER "$DESKTOP_USER"
     drm_state_set DESKTOP_UID "$DESKTOP_UID"
 }
@@ -166,6 +175,52 @@ drm_ensure_drm_nodes() {
     for _n in /dev/uhid /dev/uinput /dev/rfkill; do
         drm_node_own "$_n" "${DEV_TOUCH_GROUP:-}"
     done
+
+    drm_ensure_input_nodes
+}
+
+# ── 建出内核**全部**输入设备节点 ─────────────────────────────
+#
+# ★★ 2026-10-12 实测根因：**电源键不响应** ★★
+#
+#   原来这里只给触摸屏建节点（见下面的 drm_touch_*）。容器里
+#   /dev/input 实际只有：
+#       crw-rw---- root input 13,69  event5     ← 就这一个
+#   而内核 /sys/class/input 里 event0..event9 全都在：
+#       event0 gpio-keys        event3 pmic_pwrkey   ← 电源键
+#       event2 hall_irq         event5 NVTCapacitiveTouchScreen
+#   节点不存在 ⇒ KWin/libinput 根本打不开 ⇒ **按电源键毫无反应**
+#   （实测：KWin 只打开了 event5，journal.log 里也只有"触摸节点：event5"）。
+#
+#   所以这里把 /sys/class/input/event* 全部 mknod 出来。
+#   主次号从 /sys/class/input/eventN/dev 实读（"13:69" 形式），
+#   不写死 —— eventN 的编号每次 boot 都会变。
+#
+#   为什么放这儿而不是只建触摸的：电源键、hall 开关这些都是标准
+#   input 设备，libinput/logind 需要节点存在才能枚举。
+#   建多了无害（内核没有的设备 sysfs 里也不会出现）。
+drm_ensure_input_nodes() {
+    mkdir -p /dev/input 2>/dev/null
+    _made=0
+    for _d in /sys/class/input/event*; do
+        [ -e "$_d" ] || continue
+        _ev=$(basename "$_d")
+        _node=/dev/input/$_ev
+        [ -c "$_node" ] && continue
+        _dev=$(cat "$_d/dev" 2>/dev/null)
+        [ -n "$_dev" ] || continue
+        _maj=${_dev%%:*}
+        _min=${_dev##*:}
+        [ -n "$_maj" ] && [ -n "$_min" ] || continue
+        drm_mknod_if_missing "$_node" "$_maj" "$_min"
+        [ -c "$_node" ] && _made=$((_made + 1))
+    done
+    # 权限与触摸节点一致（root:<input 组> 660），桌面账号靠附加组访问
+    for _d in /dev/input/event*; do
+        [ -c "$_d" ] || continue
+        drm_node_own "$_d" "${DEV_TOUCH_GROUP:-}"
+    done
+    drm_log "输入节点：新建 $_made 个，/dev/input 现有 $(ls /dev/input/event* 2>/dev/null | wc -l) 个"
 }
 
 # ── 触摸节点 ──────────────────────────────────────────────
@@ -563,13 +618,37 @@ KWINWRAP_SPLIT_PLANES=$DEV_KWINWRAP_SPLIT_PLANES"
         drm_log "split 平面顺序由设备适配层固定：$DEV_KWINWRAP_SPLIT_PLANES"
     fi
 
-    # ★ 目的坐标方案也由设备层定：1 = 链路内地址 (0,800,0,800)，
-    #   与 Android 实测一致；0 = 全局单调 (0,800,1600,2400)。
-    #   取舍理由见 tools/runtime/kwinwrap.c 里 SPLIT_DST_INTERLEAVE 的注释。
+    # ★ 目的坐标方案也由设备层定：
+    #   0 = **唯一正确**：整屏全局单调 (0,800,1600,2400)。驱动
+    #       _sde_crtc_check_plane_layout() 靠 crtc_x >= 1600 判
+    #       SDE_LAYOUT_RIGHT（右半屏那对 LM2/LM3），并自己减掉 1600 得到
+    #       链路内地址。给链路内坐标会让 4 条平面全判 LEFT ⇒ 全挤进
+    #       LM0/LM1 ⇒ 右半屏（DSI1）永远拿不到图层 ⇒ 右半屏全黑。
+    #   1 = ✘禁用：链路内地址 (0,800,0,800)，只留作 A/B 对照复现症状。
+    #   详见 tools/runtime/kwinwrap.c 文件头"目的坐标"那段。
     if [ -n "${DEV_KWINWRAP_SPLIT_DST_INTERLEAVE:-}" ]; then
         _raw="$_raw
 KWINWRAP_SPLIT_DST_INTERLEAVE=$DEV_KWINWRAP_SPLIT_DST_INTERLEAVE"
-        drm_log "split 目的坐标方案：$DEV_KWINWRAP_SPLIT_DST_INTERLEAVE（1=链路内地址）"
+        drm_log "split 目的坐标方案：$DEV_KWINWRAP_SPLIT_DST_INTERLEAVE（0=整屏全局坐标，唯一正确值）"
+    fi
+
+    # ★ zpos 分组（决定 SDE 的 stage 归属：stage = zpos + SDE_STAGE_0）。
+    #   硬约束是"每个 (stage, layout) 最多 2 条平面"。本机 4 条平面用 5
+    #   （每条各占一个 stage ⇒ 不做 source-split 配对），改动面最小。
+    #   详见 tools/runtime/kwinwrap.c 里 SPLIT_ZPOS_MODE 的注释。
+    if [ -n "${DEV_KWINWRAP_SPLIT_ZPOS:-}" ]; then
+        _raw="$_raw
+KWINWRAP_SPLIT_ZPOS=$DEV_KWINWRAP_SPLIT_ZPOS"
+        drm_log "split zpos 分组模式：$DEV_KWINWRAP_SPLIT_ZPOS（本机 4 平面用 5）"
+    fi
+
+    # ★ 逐帧调试痕迹（BUILT/FBSCAN/DROP-CAND/CONN-ADD…）。
+    #   默认关：这些每帧都打，会把 kwinatomic.log 撑到几十 MB。
+    #   设备适配层用 DEV_KWINWRAP_TRACE=1 临时打开，查完就撤。
+    if [ -n "${DEV_KWINWRAP_TRACE:-}" ]; then
+        _raw="$_raw
+KWINWRAP_TRACE=$DEV_KWINWRAP_TRACE"
+        drm_log "kwinwrap 逐帧调试痕迹：KWINWRAP_TRACE=$DEV_KWINWRAP_TRACE"
     fi
 
     drm_log "kwinwrap split 几何（运行时发现）："
@@ -680,6 +759,89 @@ drm_install_polkit_rules() {
     return 0
 }
 
+# ── 触摸屏校准矩阵（必须走 udev 规则，只写 udev db 是无效的）──────
+#
+# ★★ 2026-10-12 血泪根因（现象：改 DEV_TOUCH_CALIB 毫无反应，触摸位置一直不对）
+#
+#   display.sh 原先只把 LIBINPUT_CALIBRATION_MATRIX 写进自己合成的
+#   /run/udev/data/c13:69 记录里，**但紧接着就触发了 udev**：
+#       drm_write_udev_records 里  udevadm trigger --action=add    --subsystem-match=input
+#       drm_input_settle 里        udevadm trigger --action=change --subsystem-match=input
+#   容器的 systemd-udevd 收到事件后**重新生成这条记录并覆盖我们的**。实测
+#   覆盖后的内容是：
+#       I:1791793460000000
+#       E:ID_INPUT=1 / E:ID_INPUT_TOUCHSCREEN=1 / E:ID_INPUT_KEY=1
+#       E:XKBMODEL=pc105 / E:XKBLAYOUT=us / E:BACKSPACE=guess
+#       E:LIBINPUT_DEVICE_GROUP=1c/0/0:input/ts
+#   —— 是 udevd 的 input_id / keyboard 内建生成的键盘风味记录，
+#   **里面没有 LIBINPUT_CALIBRATION_MATRIX** ⇒ 矩阵从来没送到 libinput。
+#   （注意它自己也置了 ID_INPUT_TOUCHSCREEN=1，所以触摸"能用但位置错"，
+#     很容易误判成"矩阵值算错了"，其实是矩阵压根没生效。）
+#
+#   正确做法：写成 udev 规则，让 udevd 在生成记录时自己带上这个属性。
+#   libinput 读的就是 udev 属性 LIBINPUT_CALIBRATION_MATRIX。
+drm_install_touch_udev_rule() {
+    _dir=/etc/udev/rules.d
+    _f="$_dir/79-droid-drm-takeover-touch.rules"
+
+    if [ -z "${DEV_TOUCH_CALIB:-}" ]; then
+        # ★ 必须把旧规则删掉：否则上一次留下的矩阵会一直生效，
+        #   "把 DEV_TOUCH_CALIB 清空" 这个动作就变成了静默无效。
+        if [ -e "$_f" ]; then
+            rm -f "$_f" 2>/dev/null && drm_log "已移除触摸校准规则（DEV_TOUCH_CALIB 为空）：$_f"
+            command -v udevadm >/dev/null 2>&1 && {
+                udevadm control --reload-rules >/dev/null 2>&1
+                udevadm trigger --action=change --subsystem-match=input >/dev/null 2>&1
+                udevadm settle --timeout=5 >/dev/null 2>&1
+            }
+        else
+            drm_log "未配置 DEV_TOUCH_CALIB，且无遗留规则，跳过触摸校准"
+        fi
+        return 0
+    fi
+
+    [ -d "$_dir" ] || {
+        drm_warn "容器里没有 $_dir —— 触摸校准矩阵无法生效"
+        return 1
+    }
+
+    # 按设备名匹配（DEV_TOUCH_NAME 实测 NVTCapacitiveTouchScreen）。
+    # 名字留空时退化为"所有触摸屏"——对只有一块触摸屏的本机等价。
+    # ATTRS{name} 会向上遍历父设备找 name，input5 上就有。
+    if [ -n "${DEV_TOUCH_NAME:-}" ]; then
+        _match="ATTRS{name}==\"$DEV_TOUCH_NAME\""
+    else
+        _match="ENV{ID_INPUT_TOUCHSCREEN}==\"1\""
+    fi
+
+    _f="$_dir/79-droid-drm-takeover-touch.rules"
+    _want="# 由 droid-drm-takeover 生成 —— 触摸校准矩阵
+# 设备名: ${DEV_TOUCH_NAME:-<任意触摸屏>}
+# 矩阵  : $DEV_TOUCH_CALIB
+SUBSYSTEM==\"input\", $_match, ENV{LIBINPUT_CALIBRATION_MATRIX}=\"$DEV_TOUCH_CALIB\"
+"
+
+    if [ -r "$_f" ] && [ "$(cat "$_f" 2>/dev/null)" = "$_want" ]; then
+        drm_log "触摸校准规则已是最新（$_f）"
+    else
+        printf '%s' "$_want" >"$_f" 2>/dev/null || {
+            drm_warn "写 udev 规则失败：$_f"
+            return 1
+        }
+        chmod 644 "$_f" 2>/dev/null
+        drm_log "已安装触摸校准规则（$DEV_TOUCH_CALIB）：$_f"
+    fi
+
+    # 重载规则并立刻重打一次 input，让属性马上进 udev db。
+    # （drm_input_settle 后面还会再重打若干轮，规则已在，不会被冲掉。）
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules >/dev/null 2>&1
+        udevadm trigger --action=change --subsystem-match=input >/dev/null 2>&1
+        udevadm settle --timeout=5 >/dev/null 2>&1
+    fi
+    return 0
+}
+
 DRM_SESSION_ID=""
 
 drm_logind_session_start() {
@@ -778,6 +940,8 @@ drm_start_kwin() {
     #   ① polkit 放行 chvt/manage —— 否则 Activate 被拒（见上面的长注释）
     #   ② 一个绑 seat0 的 user 类 logind 会话 —— 否则 TakeDevice 被拒
     drm_install_polkit_rules || drm_warn "polkit 规则没装上，KWin 的 Activate 很可能失败"
+    # ★ 触摸校准矩阵必须走 udev 规则（只写 udev db 会被 udevd 覆盖，见函数注释）
+    drm_install_touch_udev_rule || drm_warn "触摸校准规则没装上，触摸位置会不对"
     if ! drm_logind_session_start; then
         drm_err "拿不到 logind 会话，KWin 无法打开 $DEV_DRM_CARD"
         return 1
@@ -867,11 +1031,104 @@ drm_start_kwin() {
 
     _split_env=$(drm_kwinwrap_split_env 2>/dev/null | head -1)
 
+    # ── ★ 摘掉 10 位像素格式（防御性措施，不是条纹的修复）──────────
+    #
+    # ⚠️ 先说清楚：**面板密集彩色条纹的真正修复是
+    #    DEV_QT_QUICK_BACKEND=software**（见 core/device/opd2511.sh）。
+    #    早先一度把根因判成"位深"，那是**误判** —— 变量隔离实验证明：
+    #    KWin 的 freedreno 硬件 GL + 8 位 AR24 缓冲，只要 plasmashell 也走
+    #    硬件 GL，fbdump 出来的照样是满屏垂直条纹。位深不是决定因素。
+    #
+    # 那为什么还留着这个 shim？因为它解决的是一个**真实但次要**的问题：
+    #   KWin 的 filterAndSortFormats()
+    #   （src/backends/drm/drm_egl_layer_surface.cpp:77）在 AR24 与 AR30
+    #   同为 32bpp、前面几条判据全平手时，最后一条按 bitsPerColor 选大的
+    #   ⇒ **必然**选 10 位。而本设备的 10 位缓冲内容确实是坏的
+    #   （fbdump 读同一个 fb 确认：每 4096 字节只有几十字节非零）。
+    #   colorPowerTradeoff 是 PreferEfficiency 还是 PreferAccuracy 都一样，
+    #   **没有任何 KWin 配置项能改掉这个偏好**：
+    #     KWIN_DRM_PREFER_COLOR_DEPTH 只写连接器 max bpc，不改缓冲格式（已实测无效）。
+    #   8 位则是确定健康的（软件合成路径用 AR24，出的桌面完全正确）。
+    #   既然 8 位无论如何都够用，就没理由让 KWin 去走那条已知会坏的 10 位路径。
+    #
+    # 做法：LD_PRELOAD 一个 shim，把 10 位格式从平面的 IN_FORMATS 里摘掉
+    #   ⇒ KWin 拿不到 AR30，只能选 AR24。
+    #
+    # ★ 注意 shim 拦的是 drmModeGetPropertyBlob，不是 drmModeGetPlane：
+    #   DrmPlane::updateProperties()（drm_plane.cpp:118-135）在
+    #   addFB2ModifiersSupported() 为真时**只读 IN_FORMATS blob**，
+    #   p->formats 被完全忽略。本设备实测 DRM_CAP_ADDFB2_MODIFIERS=1，
+    #   所以改 p->formats 是空操作。详见 tools/runtime/drmfmt.c 顶部注释。
+    #
+    # 逃生开关（都在 shim 里读）：DRMFMT_KEEP_10BIT=1 保留 10 位做对照；
+    #   DRMFMT_LOG=<path> 落盘每次改写的摘要。
+    #
+    # ★★ .so 的位置极其要紧：**不能**用 payload 自己的 bin/ ★★
+    #   kwinwrap 是 fork 之后 setgid/setuid 到桌面账号（uid 1000）再 exec
+    #   kwin_wayland 的，而容器里 /root 是 drwx------（700）。
+    #   把 LD_PRELOAD 指到 /root/... 下 ⇒ 桌面账号读不到 ⇒ ld.so 报
+    #     `object '...' from LD_PRELOAD cannot be preloaded: ignored`
+    #   然后**静默**退化成 10 位（实测踩到：格式仍是 ARGB2101010）。
+    #   所以优先用安装到 /usr/local/lib 的那份（全用户可读）。
+    #
+    # ★ DEV_DRMFMT_DISABLE=1 完全关掉注入（保留 10 位缓冲）。
+    #   实测需要这个开关：本机面板是 10 位 DSC 面板，若 DSC 链路按 10 位
+    #   配置而缓冲是 8 位，面板解出来就是噪声 —— 所以必须能单独验证
+    #   "10 位缓冲 + DSC" 这条路。DEV_DRMFMT_SO 指到不存在的路径**不行**，
+    #   那会掉进下面的兜底分支又把它装回来（踩过）。
+    _fmt_preload=""
+    _fmt_so=""
+    if [ "${DEV_DRMFMT_DISABLE:-0}" = "1" ]; then
+        drm_log "DEV_DRMFMT_DISABLE=1 —— 不注入 drmfmt.so（保留 KWin 默认位深）"
+    else
+        for _c in "$DEV_DRMFMT_SO" /usr/local/lib/$DRM_PROJECT/drmfmt.so; do
+            [ -n "$_c" ] || continue
+            [ -f "$_c" ] || continue
+            _fmt_so=$_c
+            break
+        done
+    fi
+    # 兜底：payload 自带的那份。只在桌面账号**确实**读得到时才用
+    #（比如有人把 payload 装到 /root 之外，或改了 /root 权限）。
+    # ★ 关掉注入时**必须也跳过这个兜底**，否则会从 bin/ 里又把它装回来
+    #   （实测踩过：DEV_DRMFMT_SO 指到不存在的路径，结果兜底分支生效）。
+    if [ -z "$_fmt_so" ] && [ "${DEV_DRMFMT_DISABLE:-0}" != "1" ]; then
+        _kw_bin_dir=$(dirname "$_kw" 2>/dev/null)
+        if [ -n "$_kw_bin_dir" ] && [ -f "$_kw_bin_dir/drmfmt.so" ]; then
+            _fmt_so="$_kw_bin_dir/drmfmt.so"
+            drm_warn "drmfmt.so 只找到 payload 里那份（$_fmt_so）"
+            case "$_fmt_so" in
+                /root/*)
+                    drm_warn "它在 /root 下，而 kwin 以桌面账号运行 —— 大概率读不到，"
+                    drm_warn "ld.so 会静默忽略 LD_PRELOAD。请跑一次 deploy-all.sh 装到 /usr/local/lib。"
+                    ;;
+            esac
+        fi
+    fi
+
+    if [ -n "$_fmt_so" ]; then
+        _fmt_preload="LD_PRELOAD=$_fmt_so"
+        # shim 现在干的是**限制 KWin 能看到的刷新率**（见 tools/runtime/drmfmt.c
+        # 头部注释）。它通过 DRM_MODE_KEEP_HZ 读白名单，所以那个变量必须
+        # 跟着 LD_PRELOAD 一起进 kwin 进程 —— 否则 shim 装上了却不作为。
+        _fmt_hz=""
+        if [ -n "${DEV_DRM_MODE_KEEP_HZ:-}" ]; then
+            _fmt_hz="DRM_MODE_KEEP_HZ=$DEV_DRM_MODE_KEEP_HZ"
+            drm_log "限制 KWin 候选刷新率：只留 ${DEV_DRM_MODE_KEEP_HZ}Hz"
+        else
+            drm_log "注入 LD_PRELOAD=$_fmt_so（未设 DEV_DRM_MODE_KEEP_HZ，shim 不干预模式）"
+        fi
+    else
+        # 不致命：只是回到「面板可能有噪声」的旧行为，别让接管整体失败。
+        drm_warn "找不到 drmfmt.so，无法限制 KWin 候选刷新率，面板可能仍是彩色条纹"
+    fi
+
     # 设备适配层可以往 kwin 进程里注入环境变量（空格分隔的 K=V），
     # 专门留给对照实验用，例如：
     #   DEV_KWIN_ENV="KWIN_COMPOSE=Q"            强制软件合成
     #   DEV_KWIN_ENV="MESA_LOADER_DRIVER_OVERRIDE=freedreno"  换 GL 驱动
     # 注意别把 KWIN_DRM_DEVICES / HOME / XDG_* 覆盖掉。
+    # ★ 设备层排在 _fmt_preload 之后：万一有人显式设了 LD_PRELOAD，以设备层为准。
     _kwin_env="${DEV_KWIN_ENV:-}"
     [ -n "$_kwin_env" ] && drm_log "注入 kwin 环境变量：$_kwin_env"
 
@@ -880,6 +1137,8 @@ drm_start_kwin() {
     # shellcheck disable=SC2086
     env KWINWRAP_HIJACK=1 KWINWRAP_SECCOMP=1 KWINWRAP_FILTER=1 \
         KWINWRAP_UID="$DESKTOP_UID" KWINWRAP_GID="$DESKTOP_GID" \
+        KWINWRAP_USER="$DESKTOP_USER" \
+        KWINWRAP_GROUPS="$DESKTOP_GROUPS" \
         KWINWRAP_BRIGHTNESS="$DEV_BRIGHTNESS" \
         $_nosplit_env \
         $_split_env \
@@ -887,17 +1146,18 @@ drm_start_kwin() {
         env -u DISPLAY -u WAYLAND_DISPLAY -u ANLAND -u ANLAND_SOCKET \
             -u ANLAND_DRM_DEVICE \
             -u GALLIUM_DRIVER -u FD_FORCE_KGSL \
-            -u MESA_DEBUG -u LIBGL_ALWAYS_SOFTWARE -u TU_DEBUG \
-            MESA_LOADER_DRIVER_OVERRIDE=kgsl \
+            -u MESA_DEBUG -u LIBGL_ALWAYS_SOFTWARE -u TU_DEBUG -u FD_MESA_DEBUG \
+            MESA_LOADER_DRIVER_OVERRIDE=msm \
             QT_LOGGING_RULES="kwin_scene_opengl.debug=true;kwin_drm.debug=true" \
             $_loc_env \
             HOME="$DESKTOP_HOME" \
             KWIN_DRM_DEVICES="$DEV_DRM_CARD" \
-            FD_MESA_DEBUG=noubwc \
             KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 \
             XDG_SESSION_ID="$DRM_SESSION_ID" \
             XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
+            $_fmt_preload \
+            $_fmt_hz \
             $_kwin_env \
             kwin_wayland --drm --socket="$_sock" $DEV_KWIN_EXTRA_ARGS \
         >>"${DRM_LOG_DIR}/kwin.log" 2>&1 &
@@ -1015,6 +1275,73 @@ drm_start_desktop() {
     [ -n "$_lang" ] || _lang=$(sed -n 's/^LANG=//p' /etc/environment 2>/dev/null | head -1)
     [ -n "$_lang" ] || _lang=C.UTF-8
 
+    # ★★ 补齐 KDE 会话环境（2026-10-12 根因）★★
+    # 本仓库是**直接 exec plasmashell**，绕过了 startplasma-wayland，
+    # 于是整套会话环境变量从来没被建立过。最直接的后果：
+    #   · /etc/xdg/menus/ 下**只有 plasma-applications.menu**，没有
+    #     applications.menu。KDE 解析菜单名是
+    #         ${XDG_CONFIG_DIRS}/menus/${XDG_MENU_PREFIX}applications.menu
+    #     缺 XDG_MENU_PREFIX 就去找 applications.menu ⇒ 找不到 ⇒ **启动器全空**。
+    #     现象是"输入法/设置/终端/预装软件全不见了"，但实测 102 个 .desktop
+    #     与 ksycoca 缓存都在，只是没人去读 —— 不是软件丢了。
+    #   · XDG_DATA_DIRS / XDG_CONFIG_DIRS 缺失让 KDE 找不到 share 与配置根。
+    #   · KDE_FULL_SESSION / KDE_SESSION_VERSION / DESKTOP_SESSION 影响
+    #     部分 KDE 组件的会话判定与面板布局。
+    # 这些原本由 startplasma-wayland 负责；我们绕过它，就必须自己补。
+    # ★★ 只设上游确认必需的那几条，**不要多设** ★★
+    #
+    # 2026-10-12 事故复盘：这里曾经多设了
+    #     XDG_DATA_DIRS=/usr/local/share:/usr/share
+    #     XDG_CONFIG_DIRS=/etc/xdg
+    #     XDG_SESSION_DESKTOP / DESKTOP_SESSION / KDE_FULL_SESSION / KDE_SESSION_VERSION
+    # 本意是"补齐 KDE 会话变量好让应用菜单能用"。菜单确实修好了，
+    # 但**桌面从此开始持续烧 70~90% CPU、整个 KDE 掉帧**。
+    #
+    # 根因（gdb 采样 + 文件观察定位）：KDE 的 sycoca 服务缓存数据库
+    #   /home/Gold/.cache/ksycoca6_<lang>_<hostkey>
+    # 被**反复重建**，且在两个不同大小之间来回震荡：
+    #     350877 字节 → 224925 字节 → 350877 字节 …（每 4 秒一轮）
+    # 两个写入者看到的服务集不同 ⇒ 各自覆盖对方的缓存 ⇒ 对方下次
+    # KSycocaPrivate::checkDatabase() 又判定过期 ⇒ 无限重建。
+    # 主线程因此永远停在 ppoll 里空转（每次重建完立刻又"过期"）。
+    # 而**服务集的差异只能来自 XDG_DATA_DIRS / XDG_CONFIG_DIRS** ——
+    # 多设这两个变量后，本会话与其它 KDE 进程（kded6/kactivitymanagerd/
+    # kscreen…）算出的搜索路径不一致，缓存互相作废。
+    #
+    # ★ 上游 display/desk-takeover.sh 的做法是：**只从 /etc/default/locale 与
+    #   /etc/environment 里白名单 LANG=* / LC_*=* / XCURSOR_SIZE=* /
+    #   QT_QPA_PLATFORMTHEME=* 四条**，其余一律不注入，并明确注释
+    #   "MESA_* / TU_DEBUG 一律不由本脚本注入"。这里对齐上游。
+    #
+    # ★ 菜单那条继续用 XDG_MENU_PREFIX=plasma- 解决 —— 它只影响菜单文件
+    #   的查找名，不参与 sycoca 的搜索路径哈希，因此安全。
+    _kde_env="XDG_MENU_PREFIX=plasma-"
+    _kde_env="$_kde_env XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland"
+
+    # ★★ 摘掉容器 /etc/environment 里给**原始 Anland 显示桥**写的那批变量 ★★
+    # 那份文件被 desktop-session.service 用 `EnvironmentFile=-/etc/environment`
+    # 注入每个会话进程，内容是：
+    #     MESA_LOADER_DRIVER_OVERRIDE=kgsl
+    #     GALLIUM_DRIVER=kgsl
+    #     FD_FORCE_KGSL=1
+    #     WAYLAND_DISPLAY=wayland-0            ← 残留死 socket
+    #     ANLAND=1 / ANLAND_SOCKET=/run/display.sock   ← 原始桥的 socket，已死
+    #     ANLAND_DRM_DEVICE=/dev/dri/renderD128
+    #     ANLAND_SKIP_IMPLICIT_SYNC_WAIT=1
+    # 我们的接管把 Anland 换成了 DRM 直驱，但这份设置还在污染每个进程：
+    #   · kgsl 那条 Gallium 路径在本机写出来的 buffer 布局是错的（fbdump 只有
+    #     约 1% 字节非零）—— 当年"面板彩色条纹"就是它造成的，**不是** plasmashell
+    #     的硬件 GL（那个结论已在 2026-10-12 推翻，见设备层注释）。
+    #   · ANLAND=1 会让 Anland 感知的组件去找**已经死掉的** /run/display.sock，
+    #     拿不到显示/GL ⇒ 应用自己回退软件渲染（现象：系统监视器提示
+    #     "已回退软件渲染"）。
+    #   · WAYLAND_DISPLAY=wayland-0 指向残留死 socket（我们的会话是 taketest）。
+    # ⇒ 全部显式摘掉，别让它们漏进桌面会话和从菜单拉起的应用。
+    #   注意 WAYLAND_DISPLAY 不在这里摘 —— 下面每处都显式赋成 $_sock。
+    _unset_env="-u GALLIUM_DRIVER -u FD_FORCE_KGSL"
+    _unset_env="$_unset_env -u ANLAND -u ANLAND_SOCKET"
+    _unset_env="$_unset_env -u ANLAND_DRM_DEVICE -u ANLAND_SKIP_IMPLICIT_SYNC_WAIT"
+
     _kactiv=$(for c in /usr/lib/aarch64-linux-gnu/libexec/kactivitymanagerd \
                      /usr/lib/*/libexec/kactivitymanagerd \
                      /usr/libexec/kactivitymanagerd /usr/bin/kactivitymanagerd; do
@@ -1025,10 +1352,12 @@ drm_start_desktop() {
         drm_log "拉起 kactivitymanagerd（plasmashell 的硬依赖）"
         setsid nohup runuser -u "$DESKTOP_USER" -- \
             env -u DISPLAY -u QT_IM_MODULE -u GTK_IM_MODULE -u XMODIFIERS \
+                $_unset_env \
                 WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
                 XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
                 QT_QPA_PLATFORM=wayland LANG="$_lang" \
+                $_kde_env \
             "$_kactiv" >>"${DRM_LOG_DIR}/kactivitymanagerd.log" 2>&1 &
 
         _i=0
@@ -1050,20 +1379,32 @@ drm_start_desktop() {
     fi
 
     drm_log "拉起 plasmashell"
-    # ★ Plasma 自己也要 GL：KWin 走软件合成（KWIN_COMPOSE=Q）时它仍会去要
-    #   OpenGL 2，失败就弹"Plasma 启动失败"对话框然后退出。
-    #   QT_QUICK_BACKEND=software 让 Qt Quick 用自带软件渲染器，
-    #   这样整条桌面链路都不依赖 kgsl GL（实测 kgsl 的 GL 输出是竖条噪声）。
+    # ★★ QT_QUICK_BACKEND=software —— 这是"面板密集彩色条纹"的真正修复 ★★
+    #   实测变量隔离：KWin 保持 freedreno 硬件 GL 合成、输出 8 位 AR24 不变，
+    #   只把 plasmashell 从硬件 GL 换成软件渲染 ⇒ 条纹消失、出完整 KDE 桌面。
+    #   反过来（plasmashell 硬件 GL）就是满屏垂直彩色条纹。
+    #   所以设备层默认把 DEV_QT_QUICK_BACKEND 设成 software（见
+    #   core/device/opd2511.sh 里的长注释与对照表）。
     #   设备层可用 DEV_PLASMA_ENV 追加/覆盖。
     [ -n "${DEV_PLASMA_ENV:-}" ] && drm_log "注入 plasma 环境变量：$DEV_PLASMA_ENV"
+    # ★ 只在显式配置时才注入 QT_QUICK_BACKEND。
+    #   早先写成 QT_QUICK_BACKEND="${DEV_QT_QUICK_BACKEND:-software}"，
+    #   结果是**永远**注入，硬件 GL 可用时也强行让 Qt Quick 走软件渲染，
+    #   白白丢掉加速。现在设备层留空 = 不注入（用 Qt 自己的默认，即 GL）。
+    _qtqb=""
+    if [ -n "${DEV_QT_QUICK_BACKEND:-}" ]; then
+        _qtqb="QT_QUICK_BACKEND=$DEV_QT_QUICK_BACKEND"
+        drm_log "Qt Quick 后端固定为 $DEV_QT_QUICK_BACKEND"
+    fi
     setsid nohup runuser -u "$DESKTOP_USER" -- \
         env -u DISPLAY -u QT_IM_MODULE -u GTK_IM_MODULE -u SDL_IM_MODULE \
-            -u GLFW_IM_MODULE -u XMODIFIERS \
+            -u GLFW_IM_MODULE -u XMODIFIERS $_unset_env \
             WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
             XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
             QT_QPA_PLATFORM=wayland LANG="$_lang" \
-            QT_QUICK_BACKEND="${DEV_QT_QUICK_BACKEND:-software}" \
+            $_kde_env \
+            $_qtqb \
             ${DEV_PLASMA_ENV:-} \
         plasmashell --replace >>"${DRM_LOG_DIR}/plasmashell.log" 2>&1 &
 
@@ -1090,11 +1431,12 @@ drm_start_desktop() {
     # 才有 KDE 后端（否则点图标没反应）
     if command -v xdg-desktop-portal >/dev/null 2>&1; then
         setsid nohup runuser -u "$DESKTOP_USER" -- \
-            env -u DISPLAY WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
+            env -u DISPLAY $_unset_env WAYLAND_DISPLAY="$_sock" HOME="$DESKTOP_HOME" \
                 XDG_RUNTIME_DIR="$DESKTOP_RUNTIME_DIR" \
                 DBUS_SESSION_BUS_ADDRESS="unix:path=$DESKTOP_RUNTIME_DIR/bus" \
                 XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
                 QT_QPA_PLATFORM=wayland LANG="$_lang" \
+                $_kde_env \
             xdg-desktop-portal >>"${DRM_LOG_DIR}/portal.log" 2>&1 &
     fi
 

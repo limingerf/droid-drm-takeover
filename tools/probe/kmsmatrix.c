@@ -6,7 +6,7 @@
  * state this vendor KMS driver accepts, optionally performs one real commit,
  * and prints every ioctl result.
  *
- * usage: kmsmatrix [card] [--commit-seconds=N] [--no-plane2]
+ * usage: kmsmatrix [card] [--commit-seconds=N] [--no-plane2] [--dual]
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -39,6 +39,8 @@ static uint32_t p_fb_id, p_crtc_id, p_sx, p_sy, p_sw, p_sh;
 static uint32_t p_cx, p_cy, p_cw, p_ch, p_zpos;
 static uint32_t conn_id, crtc_id, fb_id, fb_w, fb_h, plane1, plane2;
 static bool have_plane2;
+/* --crtc=N：显式指定 CRTC（停掉 KWin 后自动查找会失败，见下面的注释） */
+static uint32_t crtc_override;
 static uint32_t blob_current, blob_120;
 static unsigned plane_count;
 
@@ -207,11 +209,16 @@ int main(int argc, char **argv) {
     const char *path = "/dev/dri/card0";
     int commit_secs = 0;
     bool allow_plane2 = true;
+    bool dual = false;
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--commit-seconds=", 17) == 0)
             commit_secs = atoi(argv[i] + 17);
+        else if (strncmp(argv[i], "--crtc=", 7) == 0)
+            crtc_override = (uint32_t)strtoul(argv[i] + 7, NULL, 0);
         else if (strcmp(argv[i], "--no-plane2") == 0)
             allow_plane2 = false;
+        else if (strcmp(argv[i], "--dual") == 0)
+            dual = true;
         else if (argv[i][0] != '-')
             path = argv[i];
     }
@@ -276,6 +283,15 @@ int main(int argc, char **argv) {
             if (pc)
                 drmModeFreeCrtc(pc);
         }
+    }
+    /* --crtc=N 显式指定。
+     * ★ 为什么需要：把 KWin 杀掉之后，connector 的 encoder_id/crtc_id 被内核
+     *   清零、所有 CRTC 的 mode_valid 也变 0，上面两条自动查找都会失败
+     *   （现象是 "no CRTC for DSI connector"）。做接管后的几何实验时
+     *   必须先停 KWin 才能拿 master，所以必然踩到 ⇒ 留个显式开关。 */
+    if (crtc_override) {
+        crtc_id = crtc_override;
+        printf("crtc 用 --crtc=%u 指定\n", crtc_id);
     }
     if (!crtc_id) {
         printf("no CRTC for DSI connector\n");
@@ -432,7 +448,11 @@ int main(int argc, char **argv) {
     if (commit_secs > 0) {
         printf("\n== REAL COMMIT ==\n");
         drmModeAtomicReq *req = drmModeAtomicAlloc();
-        build_full_req(req, false);
+        /* --dual：按 KWin 接管时的**双平面拆分**几何提交（而不是单平面全宽）。
+         * 这是区分"KMS 链路（拆分几何/DSC）有问题"与"渲染有问题"的关键对照：
+         * 缓冲里是同 8 条纯色横带，唯一变量是提交几何。 */
+        build_full_req(req, dual);
+        printf("real commit: %s\n", dual ? "双平面拆分（KWin 几何）" : "单平面全宽");
         errno = 0;
         int ret = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
         printf("real full-frame commit ret=%d errno=%d (%s)\n", ret, errno,

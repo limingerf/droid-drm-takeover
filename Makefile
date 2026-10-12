@@ -49,12 +49,15 @@ BLD ?= build
 #   crtcstate   取证
 #   connprops   取证
 #   atomicspy.so LD_PRELOAD 钩子，录每次 atomic commit
+#   drmfmt.so   LD_PRELOAD 钩子，摘掉 10 位像素格式（面板噪声修复，见下）
+#   touchabs.so LD_PRELOAD 钩子，改写触摸位置轴的 EVIOCGABS 量程
+#               （触摸方向修复，见下 —— 与 drmfmt.so 一起进 KWin 的 LD_PRELOAD）
 RUNTIME_TOOLS := kwinwrap setbright setprop crtcstate connprops
-RUNTIME_LIBS  := $(BIN)/atomicspy.so
+RUNTIME_LIBS  := $(BIN)/atomicspy.so $(BIN)/drmfmt.so $(BIN)/touchabs.so
 
 # ── probe：设备适配期用，不参与日常流程 ──
 #   前三个是**设备无关**的（运行时发现 conn/crtc/mode/plane），换设备先跑它们。
-PROBE_DYNAMIC := kmsdump kmsmatrix atomiccheck
+PROBE_DYNAMIC := kmsdump kmsmatrix atomiccheck fbinfo dscset kmspaint modelist moderead conntest frameseq kmsmode blobdump
 #   其余默认对着 piano 的 ID（crtc 206 / conn 67 / plane 157,161），
 #   在别的设备上结果无意义，只在 DIAG_LEGACY_PROBES=1 时被调用。
 PROBE_LEGACY  := drmatomic planecrtc informats masterprobe rawprobe kwinprobe \
@@ -112,6 +115,37 @@ $(addprefix $(BIN)/,$(WAYLAND_TOOLS)): $(BIN)/%: $(SRC_PROBE)/%.c $(PROT_OBJS) |
 #   带 main() 的 ptrace 程序 —— 完全不是那个意思。
 $(BIN)/atomicspy.so: $(SRC_RUNTIME)/atomicspy.c | $(BIN)
 	$(CC) $(CFLAGS) $(PKG_CFLAGS) -shared -fPIC $< -o $@ $(DRM_LIBS) -ldl
+
+# ★ drmfmt.so —— 面板密集彩色条纹噪声的修复。
+#   根因：KWin 的 filterAndSortFormats() 在 AR24 与 AR30（同为 32bpp）
+#   平手时按 bitsPerColor 选大的，**必然**选 10 位；而本设备 10 位渲染
+#   产出的缓冲就是垃圾。没有任何 KWin 配置项能改掉这个偏好，所以只能
+#   在能力列表这一层把 10 位格式摘掉。
+#
+#   注意它拦的是 drmModeGetPropertyBlob（IN_FORMATS blob），**不是**
+#   drmModeGetPlane —— KWin 的 DrmPlane::updateProperties() 在
+#   addFB2ModifiersSupported() 为真时只读 blob，p->formats 被完全忽略。
+#   本设备实测 DRM_CAP_ADDFB2_MODIFIERS=1 ⇒ 必须拦 blob。
+#   详见 tools/runtime/drmfmt.c 顶部注释。
+$(BIN)/drmfmt.so: $(SRC_RUNTIME)/drmfmt.c | $(BIN)
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) -shared -fPIC $< -o $@ $(DRM_LIBS) -ldl
+
+# ★ touchabs.so —— 触摸方向修复（绕屏幕中心 90° 旋转）。
+#   本机触摸屏的坐标系与显示差一个旋转：需要 n_x = v, n_y = 1 - u。
+#   正路是 LIBINPUT_CALIBRATION_MATRIX，但实测本容器 libinput 1.28.1
+#   **只用矩阵的 2×2 部分，平移项被完全忽略**（4 组变体、6/9 值都试过），
+#   而 90° 旋转的 "+1" 恰恰必须靠平移 ⇒ 校准矩阵在数学上表达不了它。
+#   （上游参考机能用一个矩阵搞定，是因为它跑 libinput ≥1.31。）
+#
+#   修法：libinput 归一化是 U = (raw - min) / (max - min)。把 X 轴量程
+#   报成 [20000, 40000] 就有 U = u - 1，于是**纯 2×2** 矩阵
+#   "0 -1 0 1 0 0" 就给出 n = (v, 1-u)。量程由本垫片在 EVIOCGABS 上改写，
+#   值来自设备层的 DEV_TOUCH_ABS_X_MIN / _MAX。
+#   已验证 libinput **不会**把原始值 clamp 到 [min,max]（把量程报成
+#   [-20000,0] 时日志坐标精确随注入点变化）。
+#   详见 tools/runtime/touchabs.c 顶部注释与 core/device/opd2511.sh。
+$(BIN)/touchabs.so: $(SRC_RUNTIME)/touchabs.c | $(BIN)
+	$(CC) $(CFLAGS) $(PKG_CFLAGS) -shared -fPIC $< -o $@ -ldl
 
 clean:
 	rm -rf $(BLD)
