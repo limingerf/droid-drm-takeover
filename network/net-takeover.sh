@@ -486,15 +486,49 @@ nt_fix_dns() {
 #   ② 用 `nmcli device wifi connect <SSID> password <PSK>` 连一次
 #      —— 密码直达 NM，不经过任何代理，然后被写进 .nmconnection
 #   ③ 之后托盘小程序再连就不需要代理了
+#
+# ★★★ 2026-10-12 严重事故：**只做①不做②会把 WiFi 彻底弄坏** ★★★
+#
+# 我上次就是只跑了这一步，结果：
+#   · 连接的 `psk-flags` 变成 0（NM 认为"密码应该由我自己保管"）
+#   · 但文件里**根本没有 `psk=` 这一行**（密码原本在代理里）
+#   · 于是 NM 既不去问代理、文件里又没有 ⇒ 永远连不上：
+#         device (wlan0): no secrets: No agents were available for this request.
+#         state change: need-auth -> failed (reason 'no-secrets')
+#   · 而且**图形界面也不会再提示输密码**（NM 认为密码已经有了）
+#   · 备份文件里同样没有 psk（备份是 19:48 的，那时就是 flags=1），救不回来
+#   ⇒ 只能靠用户重新输一次密码。
+#
+# 所以现在这个函数**只做安全检查，不做破坏性修改**：
+#   · 已经有 psk 的连接 → 确保 flags=0（NM 持有，最稳）
+#   · 还没有 psk 的连接 → **保持 flags=1 不动**，只提示用户走 wifi-connect
+#     （那条路会把密码直接交给 NM，之后自动落盘）
 nt_fix_secrets() {
-    drm_log "让 NM 自己保存 WiFi 密码（绕开缺失的密钥代理）"
-    ds_exec 'for f in /etc/NetworkManager/system-connections/*.nmconnection; do
+    drm_log "检查 WiFi 密钥存放方式（不做破坏性修改）"
+    ds_exec 'has_psk=0; no_psk=""
+             for f in /etc/NetworkManager/system-connections/*.nmconnection; do
                  [ -f "$f" ] || continue
-                 sed -i "s/^psk-flags=1$/psk-flags=0/" "$f"
-                 chmod 600 "$f"
+                 if grep -q "^psk=" "$f"; then
+                     has_psk=1
+                     # 有密码 ⇒ 让 NM 自己持有，最稳
+                     sed -i "s/^psk-flags=1$/psk-flags=0/" "$f"
+                     chmod 600 "$f"
+                     echo "  [OK] $(basename "$f")：文件里有 psk，flags=0（NM 持有）"
+                 else
+                     # 没密码 ⇒ 绝不改 flags，否则会把连接弄坏
+                     no_psk="$no_psk $(basename "$f")"
+                     echo "  [注意] $(basename "$f")：文件里没有 psk，保持 flags=$(grep -o "psk-flags=." "$f" | head -1 | cut -d= -f2) 不动"
+                 fi
              done
-             systemctl reload NetworkManager 2>/dev/null || systemctl restart NetworkManager 2>/dev/null
-             sleep 5
+             if [ -n "$no_psk" ]; then
+                 echo ""
+                 echo "  ★ 下面这些连接没有保存密码，需要用户输一次："
+                 for n in $no_psk; do echo "      $n"; done
+                 echo "  ★ 请用触摸屏入口输密码（密码会直接交给 NM 并落盘）："
+                 echo "      sh /usr/local/bin/wifi-connect     （或点桌面图标）"
+                 echo "  ★ 千万不要手工把 psk-flags 改成 0 —— 那会让图形界面也不再提示密码，"
+                 echo "    连接彻底连不上（2026-10-12 踩过）。"
+             fi
              systemctl is-active NetworkManager' 2>&1 | tr -d '\r' | sed 's/^/    /'
 }
 
@@ -576,21 +610,34 @@ Categories=Network;Settings;
     _wc_b64=$(printf '%s' "$_wc" | base64 -w0 2>/dev/null || printf '%s' "$_wc" | base64 | tr -d '\n')
     _desk_b64=$(printf '%s' "$_desk" | base64 -w0 2>/dev/null || printf '%s' "$_desk" | base64 | tr -d '\n')
 
+    # ★ 同时放一份到**桌面**（~/Desktop）。
+    #   为什么：应用菜单项在启动器里，用户要先打开启动器再找；而触摸屏上
+    #   最直接的入口是桌面图标。实测 Folder View 的 url 就是 ~/Desktop
+    #   （appletsrc 里 positions 有 "desktop:/usb-manager.desktop"），
+    #   所以放这里一定会显示出来。
+    #   桌面的 .desktop 需要可执行位（755）且属主是桌面用户，否则 KDE
+    #   会把它当成"未信任的快捷方式"。
+    _uhome="${DEV_USER:-Gold}"
     ds_exec "printf '%s' '$_wc_b64' | base64 -d > /usr/local/bin/wifi-connect
              chmod 755 /usr/local/bin/wifi-connect
              printf '%s' '$_desk_b64' | base64 -d > /usr/share/applications/wifi-connect.desktop
-             chmod 644 /usr/share/applications/wifi-connect.desktop" >/dev/null 2>&1
+             chmod 644 /usr/share/applications/wifi-connect.desktop
+             _d=/home/${_uhome}/Desktop
+             mkdir -p \"\$_d\"
+             printf '%s' '$_desk_b64' | base64 -d > \"\$_d/wifi-connect.desktop\"
+             chmod 755 \"\$_d/wifi-connect.desktop\"
+             chown ${_uhome}:${_uhome} \"\$_d/wifi-connect.desktop\"
+             ls -l \"\$_d/wifi-connect.desktop\"" 2>&1 | tr -d '\r' | sed 's/^/    /'
 
     # 刷新应用菜单缓存，否则新图标不会出现在启动器里
-    _uhome="/home/${DEV_USER:-Gold}"
     ds_exec "runuser -u ${DEV_USER:-Gold} -- env HOME=$_uhome \
                  LANG=en_US.UTF-8 XDG_MENU_PREFIX=plasma- \
                  kbuildsycoca6 --noincremental" >/dev/null 2>&1
 
-    if ds_exec 'test -x /usr/local/bin/wifi-connect' >/dev/null 2>&1; then
-        drm_log "已安装 /usr/local/bin/wifi-connect + 桌面图标「连接 WiFi」"
+    if ds_exec "test -x /usr/local/bin/wifi-connect && test -f /home/${_uhome}/Desktop/wifi-connect.desktop" >/dev/null 2>&1; then
+        drm_log "已安装 /usr/local/bin/wifi-connect + 启动器图标 + 桌面图标「连接 WiFi」"
     else
-        drm_warn "wifi-connect 安装失败"
+        drm_warn "wifi-connect 安装不完整（脚本或桌面图标缺失）"
     fi
 }
 
@@ -705,7 +752,12 @@ case "${1:-status}" in
   tray           只把网络+蓝牙小程序加进系统托盘
   route          ★ 补出网兜底路由（拿到 IP 后必须做，否则打不开网页）
   dns            写 DNS（223.5.5.5 / 119.29.29.29）
-  secrets        把 psk-flags 改成 0，让 NM 自己保存密码（绕开缺失的密钥代理）
+  secrets        ★ 检查 WiFi 密码存放方式（只读+安全修正，不再做破坏性修改）
+                 · 文件里已有 psk 的连接 → 置 flags=0（NM 持有，最稳）
+                 · 文件里没有 psk 的连接 → 保持 flags 不动，提示走 wifi-connect
+                 ★ 历史教训：早先这里无条件把 flags 改成 0，而文件里并没有 psk，
+                   结果 NM 既不问代理、文件里也没有密码 ⇒ WiFi 彻底连不上，
+                   而且图形界面也不再提示输密码。改 flags 必须和"写入 psk"同时做。
   helper         只装触摸屏连 WiFi 入口（/usr/local/bin/wifi-connect + 桌面图标）
   egress         自证出网（ping / DNS / HTTP，不是"配置看起来对"）
   glibc-fix      修 glibc AI_ADDRCONFIG（容器没非环回 IPv4 时 apt 解析失败）
